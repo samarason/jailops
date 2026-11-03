@@ -4,7 +4,7 @@
 **Target Repository:** `jailops.net/jailops`  
 **Audit Type:** Comprehensive Static, Architectural, Dependency (SBOM), and Infrastructure/CI-CD Security Audit  
 **Primary Objective:** General Risk Reduction & Privilege Boundary Hardening  
-
+> *This document was written with the assistance of AI. All text has been human-reviewed and verified.*
 ---
 
 ## Executive Summary
