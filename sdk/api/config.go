@@ -27,7 +27,8 @@ type Profile struct {
 
 // ProfileSpec holds the keys of a profile.
 type ProfileSpec struct {
-	Description string `json:"description,omitempty"`
+	// Comment is what the profile is for.
+	Comment string `json:"comment,omitempty"`
 	// Config maps keys of the registry that are allowed in a profile to values.
 	Config map[string]string `json:"config,omitempty"`
 }
@@ -57,6 +58,8 @@ type ConfigKey struct {
 	Profile bool `json:"profile"`
 	// Admin marks keys that need the admin role (device nodes).
 	Admin bool `json:"admin,omitempty"`
+	// Global marks keys that need a global administrator: a published port takes traffic the host would otherwise get.
+	Global bool `json:"global,omitempty"`
 	// Path is the location in the typed spec, for example "resources.cpu".
 	Path string `json:"path"`
 }
@@ -69,12 +72,11 @@ type ckey struct {
 }
 
 var (
-	deviceNameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
-	macRE        = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
-	sizeRE       = regexp.MustCompile(`^[1-9][0-9]*[KMGTP]?$`)
-	hostRE       = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
-	envRE        = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
-	nameRE       = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	macRE  = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+	rateRE = regexp.MustCompile(`^[1-9][0-9]{0,8}[KMGkmg]?$`)            // a rate in bits per second: 10M is 10 Mbit/s (decimal units)
+	sizeRE = regexp.MustCompile(`^[1-9][0-9]*([KMGTPkmgtp](iB|B)?|B)?$`) // the sizes the server takes; it stores them as bytes
+	hostRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
+	envRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 )
 
 // DevfsAllowList lists the device nodes a jail may be given.
@@ -177,7 +179,7 @@ func nic(s *JailSpec, d string, create bool) *NetworkAttach {
 	return &s.Network[len(s.Network)-1]
 }
 
-func disk(s *JailSpec, d string, create bool) *VolumeMount {
+func disk(s *JailSpec, d string, create bool) *VolumeAttach {
 	for i := range s.Volumes {
 		if s.Volumes[i].Name == d {
 			return &s.Volumes[i]
@@ -186,7 +188,7 @@ func disk(s *JailSpec, d string, create bool) *VolumeMount {
 	if !create {
 		return nil
 	}
-	s.Volumes = append(s.Volumes, VolumeMount{Name: d})
+	s.Volumes = append(s.Volumes, VolumeAttach{Name: d})
 	return &s.Volumes[len(s.Volumes)-1]
 }
 
@@ -227,7 +229,7 @@ func deviceField[T any](dev string, find func(*JailSpec, string, bool) *T,
 			v := get(p)
 			return v, v != ""
 		}, func(s *JailSpec, d, v string) error {
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr(dev+"."+d, "%q is not a device name (lower case letters, digits and '-')", d)
 			}
 			set(find(s, d, true), v)
@@ -308,13 +310,13 @@ func buildRegistry() []ckey {
 			unset: func(s *JailSpec, _ string) { *get(s) = nil }})
 	}
 	nameCheck := func(v string) error {
-		if !nameRE.MatchString(v) {
+		if !IsName(v, MaxName) {
 			return fmt.Errorf("%q is not a name (lower case letters, digits and '-')", v)
 		}
 		return nil
 	}
 
-	str("image", "image", "Image reference: name, name@alias or name#gN. The image name cannot change on a living jail.", "freebsd-15@stable", true, false,
+	str("image", "image", "Image reference: name, name@alias or name#gN. The image name cannot change on a living jail.", "freebsd-15-1", true, false,
 		func(s *JailSpec) *string { return &s.Image }, func(v string) error {
 			if v == "" || strings.ContainsAny(v, " \t\n/") {
 				return fmt.Errorf("%q is not an image reference", v)
@@ -332,11 +334,12 @@ func buildRegistry() []ckey {
 		})
 	list("profiles", "profiles", "Profiles merged into this jail, in order; later ones override earlier ones.", "base,web", true, false,
 		func(s *JailSpec) *[]string { return &s.Profiles }, nameCheck)
-	num("limits.cpu", "resources.cpu", "CPU cores the jail may use.", "2", 0, 4096, true, func(s *JailSpec) *int { return &s.Resources.CPU })
-	size("limits.memory", "resources.memory", "Memory limit.", "2G", true, func(s *JailSpec) *string { return &s.Resources.Memory })
-	num("limits.pids", "resources.pids", "Process limit.", "500", 0, 4194304, true, func(s *JailSpec) *int { return &s.Resources.PIDs })
-	size("limits.disk", "resources.disk", "ZFS quota of the jail's root.", "20G", false, func(s *JailSpec) *string { return &s.Resources.Disk })
-	size("limits.disk_reservation", "resources.disk_reservation", "ZFS reservation of the jail's root.", "5G", false, func(s *JailSpec) *string { return &s.Resources.DiskReservation })
+	num("limits.cpu", "resources.cpu", "CPU cores the jail may use: more is slowed down to that share (rctl pcpu); needs kern.racct.enable=1.", "2", 0, 4096, true, func(s *JailSpec) *int { return &s.Resources.CPU })
+	size("limits.memory", "resources.memory", "Anonymous memory the jail may reserve in total (rctl swapuse): an allocation beyond it fails and nothing is killed; needs kern.racct.enable=1.", "2G", true, func(s *JailSpec) *string { return &s.Resources.Memory })
+	num("limits.pids", "resources.pids", "Processes the jail may have (rctl maxproc): fork fails beyond it; needs kern.racct.enable=1.", "500", 0, 4194304, true, func(s *JailSpec) *int { return &s.Resources.PIDs })
+	size("limits.disk", "resources.disk", "ZFS quota of the jail's container: its root, persistent datasets, volumes and snapshots together.", "20G", false, func(s *JailSpec) *string { return &s.Resources.Disk })
+	size("limits.disk_reservation", "resources.disk_reservation", "ZFS reservation of the jail's container.", "5G", false, func(s *JailSpec) *string { return &s.Resources.DiskReservation })
+	num("limits.states", "resources.states", "Pf states each rule of the jail's firewall may create, so that one jail cannot fill the host's state table; 0 is the host's default.", "20000", 0, 10000000, false, func(s *JailSpec) *int { return &s.Resources.States })
 	add(ckey{ConfigKey: ConfigKey{Name: "boot.autostart", Type: "bool", Description: "Start the jail when the host starts.", Example: "true", Profile: true, Path: "boot.autostart"},
 		get: func(s *JailSpec, _ string) (string, bool) { return "true", s.Boot.Autostart },
 		set: func(s *JailSpec, _, v string) error {
@@ -346,6 +349,7 @@ func buildRegistry() []ckey {
 		},
 		unset: func(s *JailSpec, _ string) { s.Boot.Autostart = false }})
 	num("boot.priority", "boot.priority", "Start order: lower starts first.", "10", -1000, 1000, false, func(s *JailSpec) *int { return &s.Boot.Priority })
+	num("boot.stop_timeout", "boot.stop_timeout", "Seconds the jail has to shut down by itself, after its stop command, before it is killed; 0 is the system's ten seconds. A database that needs a minute to close says 60. Written into the jail's configuration at its start.", "60", 0, MaxStopTimeout, true, func(s *JailSpec) *int { return &s.Boot.StopTimeout })
 	list("boot.depends", "boot.depends", "Jails of the project that must run first.", "db,cache", false, false,
 		func(s *JailSpec) *[]string { return &s.Boot.Depends }, nameCheck)
 	add(ckey{ConfigKey: ConfigKey{Name: "update.strategy", Type: "enum", Values: []string{string(UpdateRebase), string(UpdateInPlace), string(UpdateManual)},
@@ -363,13 +367,20 @@ func buildRegistry() []ckey {
 	str("update.window", "update.window", "Maintenance window of automatic updates.", "sun 03:00", false, true, func(s *JailSpec) *string { return &s.Update.Window }, nil)
 	str("update.healthcheck", "update.healthcheck", "Command run in the jail after an update.", "/usr/local/bin/check", false, true,
 		func(s *JailSpec) *string { return &s.Update.Healthcheck }, nil)
-	str("shell", "shell", "Shell that `jailops shell` starts: a path inside the jail (/bin/sh when empty). A management setting; /etc/passwd is not touched.", "/usr/local/bin/bash", false, true,
-		func(s *JailSpec) *string { return &s.Shell }, func(v string) error {
+	add(ckey{ConfigKey: ConfigKey{Name: "shell", Type: "string", Example: "bash", Profile: true, Path: "shell",
+		Description: "Shell that `jailops shell` and the console start: bash, sh or a path inside the jail (/bin/sh when empty). New FreeBSD jails get bash. A management setting; /etc/passwd is not touched. `jailops jail shell-setup` installs bash when it is missing."},
+		get: func(s *JailSpec, _ string) (string, bool) { return s.Shell, s.Shell != "" },
+		set: func(s *JailSpec, _, v string) error {
+			v = ShellPath(v)
 			if !strings.HasPrefix(v, "/") || len(v) > 255 || strings.ContainsAny(v, " \t\r\n\x00") || strings.Contains(v, "..") {
-				return fmt.Errorf("%q is not an absolute path without spaces inside the jail", v)
+				return cfgErr("shell", "shell: %q is not bash, sh or an absolute path without spaces inside the jail", v)
 			}
+			s.Shell = v
 			return nil
-		})
+		},
+		unset: func(s *JailSpec, _ string) { s.Shell = "" }})
+	str("prompt", "prompt", "Bash prompt of a FreeBSD jail, for every user: default (user@jail in colour, then in grey [project/host], then the directory), short (the same without the grey tag), none (no prompt, the variables stay), or a PS1 text such as \\u@\\h [{project}/{host}]:\\w\\$ with bash's escapes (no ', ` or $ other than \\$: nothing in it runs; \\e or \\033 start a colour) and the words {jail}, {project} and {host}, which read the variables JAILOPS_JAIL, JAILOPS_PROJECT and JAILOPS_HOST that every interactive bash of the jail has. A user's own ~/.bashrc wins. Written into "+PromptFile+" at once in a running jail, else at its next start.", "default", false, true,
+		func(s *JailSpec) *string { return &s.Prompt }, CheckPrompt)
 	add(ckey{ConfigKey: ConfigKey{Name: "updates.mode", Type: "enum", Values: []string{"manual", "notify", "managed"}, Profile: true, Path: "update.mode",
 		Description: "manual: nothing happens unless you run it. notify: check on the schedule and report. managed: check and apply on the schedule. Off (manual) by default.", Example: "notify"},
 		get: func(s *JailSpec, _ string) (string, bool) { return string(s.Update.Mode), s.Update.Mode != "" },
@@ -408,6 +419,15 @@ func buildRegistry() []ckey {
 			return err
 		},
 		unset: func(s *JailSpec, _ string) { s.SysVIPC = false }})
+	add(ckey{ConfigKey: ConfigKey{Name: "zfs.delegation", Type: "bool", Example: "true", RestartRequired: true, Path: "zfs_delegation",
+		Description: "Global administrators only. Hands the jail a ZFS dataset of its own, <container>/delegated: root in the jail can create datasets, snapshots and mounts below it, outside the rules JailOps applies to the jail's data. The host's priv.conf must allow it (admin-zfs-delegation)."},
+		get: func(s *JailSpec, _ string) (string, bool) { return "true", s.Delegate },
+		set: func(s *JailSpec, _, v string) error {
+			b, err := parseBool("zfs.delegation", v)
+			s.Delegate = b
+			return err
+		},
+		unset: func(s *JailSpec, _ string) { s.Delegate = false }})
 	boolKey("updates.packages", "update.packages", "Update the packages inside the jail (pkg or apk, from the host).", func(s *JailSpec) *bool { return &s.Update.Packages })
 	boolKey("updates.os", "update.os", "Move the jail to a newer image generation (root swap).", func(s *JailSpec) *bool { return &s.Update.OS })
 	add(ckey{ConfigKey: ConfigKey{Name: "updates.reboot", Type: "enum", Values: []string{"manual", "auto"}, Profile: true, Path: "update.reboot",
@@ -422,11 +442,11 @@ func buildRegistry() []ckey {
 			return cfgErr("updates.reboot", "updates.reboot: %q must be manual or auto", v)
 		},
 		unset: func(s *JailSpec, _ string) { s.Update.Reboot = "" }})
-	str("firewall.policy", "firewall.policy", "Firewall policy of the jail's anchor.", "web", false, true,
-		func(s *JailSpec) *string { return &s.Firewall.Policy }, func(v string) error { return nameCheck(v) })
+	list("firewall.policies", "firewall.policies", "Firewall policies of the jail's anchor, in the order they are rendered after the project's.", "postgres,ssh-office", false, true,
+		func(s *JailSpec) *[]string { return &s.Firewall.Policies }, nameCheck)
 	list("firewall.tags", "firewall.tags", "Tags that firewall rules refer to.", "web,public", false, true,
 		func(s *JailSpec) *[]string { return &s.Firewall.Tags }, nameCheck)
-	list("packages", "packages", "Not yet: creation is refused when set; use the provisioning packages step.", "nginx,curl", true, true, func(s *JailSpec) *[]string { return &s.Packages }, nil)
+	list("packages", "packages", "Cannot be set when a jail is created yet: a create that sets it is refused. Install packages with the provisioning packages step.", "nginx,curl", true, true, func(s *JailSpec) *[]string { return &s.Packages }, nil)
 	add(ckey{ConfigKey: ConfigKey{Name: "env.<var>", Type: "string", Description: "Environment variable of the jail's services.", Example: "env.TZ=UTC", RestartRequired: true, Profile: true, Path: "env.<var>"},
 		get: func(s *JailSpec, d string) (string, bool) { v, ok := s.Env[d]; return v, ok },
 		set: func(s *JailSpec, d, v string) error {
@@ -447,7 +467,7 @@ func buildRegistry() []ckey {
 	// nic devices
 	devKey := func(name, typ, desc, example string, restart, profile, admin bool, path string,
 		get func(*JailSpec, string) (string, bool), set func(*JailSpec, string, string) error, unset func(*JailSpec, string)) {
-		add(ckey{ConfigKey: ConfigKey{Name: name, Type: typ, Description: desc, Example: example, RestartRequired: restart, Profile: profile, Admin: admin, Path: path},
+		add(ckey{ConfigKey: ConfigKey{Name: name, Type: typ, Description: desc, Example: example, RestartRequired: restart, Profile: profile, Admin: admin, Global: strings.HasPrefix(name, "proxy."), Path: path},
 			get: get, set: set, unset: unset})
 	}
 	field := func(find func(*JailSpec, string, bool) *NetworkAttach, check func(string) error, get func(*NetworkAttach) *string, key string) (func(*JailSpec, string) (string, bool), func(*JailSpec, string, string) error, func(*JailSpec, string)) {
@@ -459,7 +479,7 @@ func buildRegistry() []ckey {
 				v := *get(p)
 				return v, v != ""
 			}, func(s *JailSpec, d, v string) error {
-				if !deviceNameRE.MatchString(d) {
+				if !IsName(d, 31) {
 					return cfgErr("nic."+d+"."+key, "%q is not a device name", d)
 				}
 				if check != nil {
@@ -482,7 +502,7 @@ func buildRegistry() []ckey {
 			}
 			return "", false
 		}, func(s *JailSpec, d, v string) error {
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("nic."+d, "%q is not a device name", d)
 			}
 			nic(s, d, true).Network = v
@@ -509,14 +529,14 @@ func buildRegistry() []ckey {
 		return nil
 	}, func(p *NetworkAttach) *string { return &p.MAC }, "mac")
 	devKey("nic.<device>.mac", "mac", "MAC address (derived from the jail UUID when empty).", "02:00:00:00:00:01", true, false, false, "network[<device>].mac", g, st, un)
-	devKey("nic.<device>.mtu", "int", "MTU of the interface; 0 keeps the network's.", "1400", true, true, false, "network[<device>].mtu",
+	devKey("nic.<device>.mtu", "int", "MTU of the interface; 0 takes the network's.", "1500", true, true, false, "network[<device>].mtu",
 		func(s *JailSpec, d string) (string, bool) {
 			if p := nic(s, d, false); p != nil && p.MTU != 0 {
 				return strconv.Itoa(p.MTU), true
 			}
 			return "", false
 		}, func(s *JailSpec, d, v string) error {
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("nic."+d+".mtu", "%q is not a device name", d)
 			}
 			n, err := atoiRange("nic."+d+".mtu", v, 576, 9216)
@@ -531,25 +551,25 @@ func buildRegistry() []ckey {
 			}
 		})
 	rate := func(v string) error {
-		if !sizeRE.MatchString(v) {
+		if !rateRE.MatchString(v) {
 			return fmt.Errorf("%q is not a rate in bits per second such as 10M", v)
 		}
 		return nil
 	}
-	g, st, un = field(nic, rate, func(p *NetworkAttach) *string { return &p.Ingress }, "ingress")
-	devKey("nic.<device>.ingress", "rate", "Rate limit of traffic into the jail, bits per second. UNVERIFIED: not enforced yet; the jail reports a RateLimit condition.", "10M", false, true, false, "network[<device>].ingress", g, st, un)
 	g, st, un = field(nic, rate, func(p *NetworkAttach) *string { return &p.Egress }, "egress")
-	devKey("nic.<device>.egress", "rate", "Rate limit of traffic out of the jail, bits per second. UNVERIFIED: not enforced yet; the jail reports a RateLimit condition.", "10M", false, true, false, "network[<device>].egress", g, st, un)
+	devKey("nic.<device>.egress", "rate", "Rate limit of what the jail sends through the device, in bits per second: 10M is 10 Mbit/s. Enforced by a dummynet pipe of the host.", "10M", false, true, false, "network[<device>].egress", g, st, un)
+	g, st, un = field(nic, rate, func(p *NetworkAttach) *string { return &p.Ingress }, "ingress")
+	devKey("nic.<device>.ingress", "rate", "Rate limit of what the jail receives through the device, in bits per second: 10M is 10 Mbit/s. Enforced by a dummynet pipe of the host.", "10M", false, true, false, "network[<device>].ingress", g, st, un)
 
 	// disk devices
-	devKey("disk.<device>", "device", "A data volume; set it to the mount path to add it, unset it to remove it.", "disk.data=/var/db", true, true, false, "volumes[<device>]",
+	devKey("disk.<device>", "device", "A volume of the project attached to the jail: <device> is the name of the volume; set it to the mount path to attach it, unset it to detach it.", "disk.data=/var/db", true, true, false, "volumes[<device>]",
 		func(s *JailSpec, d string) (string, bool) {
 			if p := disk(s, d, false); p != nil {
 				return p.Mount, true
 			}
 			return "", false
 		}, func(s *JailSpec, d, v string) error {
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("disk."+d, "%q is not a device name", d)
 			}
 			disk(s, d, true).Mount = v
@@ -562,7 +582,7 @@ func buildRegistry() []ckey {
 				}
 			}
 		})
-	dfield := func(key string, check func(string) error, get func(*VolumeMount) *string) (func(*JailSpec, string) (string, bool), func(*JailSpec, string, string) error, func(*JailSpec, string)) {
+	dfield := func(key string, check func(string) error, get func(*VolumeAttach) *string) (func(*JailSpec, string) (string, bool), func(*JailSpec, string, string) error, func(*JailSpec, string)) {
 		return func(s *JailSpec, d string) (string, bool) {
 				p := disk(s, d, false)
 				if p == nil {
@@ -571,7 +591,7 @@ func buildRegistry() []ckey {
 				v := *get(p)
 				return v, v != ""
 			}, func(s *JailSpec, d, v string) error {
-				if !deviceNameRE.MatchString(d) {
+				if !IsName(d, 31) {
 					return cfgErr("disk."+d+"."+key, "%q is not a device name", d)
 				}
 				if err := check(v); err != nil {
@@ -590,11 +610,9 @@ func buildRegistry() []ckey {
 			return fmt.Errorf("%q is not an absolute path inside the jail", v)
 		}
 		return nil
-	}, func(p *VolumeMount) *string { return &p.Mount })
-	devKey("disk.<device>.mount", "string", "Mount path inside the jail.", "/var/db", true, true, false, "volumes[<device>].mount", g, st, un)
-	g, st, un = dfield("quota", func(v string) error { return checkSize("quota", v) }, func(p *VolumeMount) *string { return &p.Quota })
-	devKey("disk.<device>.quota", "size", "ZFS quota of the volume.", "10G", true, true, false, "volumes[<device>].quota", g, st, un)
-	devKey("disk.<device>.read_only", "bool", "Mount the volume read-only.", "true", true, true, false, "volumes[<device>].read_only",
+	}, func(p *VolumeAttach) *string { return &p.Mount })
+	devKey("disk.<device>.mount", "string", "Where the volume is mounted inside the jail.", "/var/db", true, true, false, "volumes[<device>].mount", g, st, un)
+	devKey("disk.<device>.read_only", "bool", "Attach the volume read-only.", "true", true, true, false, "volumes[<device>].read_only",
 		func(s *JailSpec, d string) (string, bool) {
 			p := disk(s, d, false)
 			return "true", p != nil && p.ReadOnly
@@ -603,7 +621,7 @@ func buildRegistry() []ckey {
 			if err != nil {
 				return err
 			}
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("disk."+d+".read_only", "%q is not a device name", d)
 			}
 			disk(s, d, true).ReadOnly = b
@@ -623,7 +641,7 @@ func buildRegistry() []ckey {
 			}
 			return p.Device, p.Device != ""
 		}, func(s *JailSpec, d, v string) error {
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("devfs."+d+".device", "%q is not a device name", d)
 			}
 			for _, a := range DevfsAllowList {
@@ -644,7 +662,7 @@ func buildRegistry() []ckey {
 	r[len(r)-1].Values = DevfsAllowList
 
 	// proxy devices
-	devKey("proxy.<name>.listen", "listen", "Host address and port the jail's port is forwarded on.", ":8080", false, true, false, "proxy[<name>].listen",
+	devKey("proxy.<name>.listen", "listen", "Host address and port the jail's port is forwarded on.", ":8080", false, true, true, "proxy[<name>].listen",
 		func(s *JailSpec, d string) (string, bool) {
 			p := proxy(s, d, false)
 			if p == nil {
@@ -652,7 +670,7 @@ func buildRegistry() []ckey {
 			}
 			return p.Listen, p.Listen != ""
 		}, func(s *JailSpec, d, v string) error {
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("proxy."+d+".listen", "%q is not a device name", d)
 			}
 			if err := checkListen("proxy."+d+".listen", v); err != nil {
@@ -668,7 +686,7 @@ func buildRegistry() []ckey {
 				}
 			}
 		})
-	devKey("proxy.<name>.jail_port", "int", "Port inside the jail.", "80", false, true, false, "proxy[<name>].jail_port",
+	devKey("proxy.<name>.jail_port", "int", "Port inside the jail.", "80", false, true, true, "proxy[<name>].jail_port",
 		func(s *JailSpec, d string) (string, bool) {
 			p := proxy(s, d, false)
 			if p == nil || p.JailPort == 0 {
@@ -680,7 +698,7 @@ func buildRegistry() []ckey {
 			if err != nil {
 				return err
 			}
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("proxy."+d+".jail_port", "%q is not a device name", d)
 			}
 			proxy(s, d, true).JailPort = n
@@ -690,7 +708,7 @@ func buildRegistry() []ckey {
 				p.JailPort = 0
 			}
 		})
-	devKey("proxy.<name>.proto", "enum", "tcp or udp.", "tcp", false, true, false, "proxy[<name>].proto",
+	devKey("proxy.<name>.proto", "enum", "tcp or udp.", "tcp", false, true, true, "proxy[<name>].proto",
 		func(s *JailSpec, d string) (string, bool) {
 			p := proxy(s, d, false)
 			if p == nil {
@@ -701,7 +719,7 @@ func buildRegistry() []ckey {
 			if v != "tcp" && v != "udp" {
 				return cfgErr("proxy."+d+".proto", "proxy.%s.proto: %q must be tcp or udp", d, v)
 			}
-			if !deviceNameRE.MatchString(d) {
+			if !IsName(d, 31) {
 				return cfgErr("proxy."+d+".proto", "%q is not a device name", d)
 			}
 			proxy(s, d, true).Proto = v
@@ -726,18 +744,9 @@ func ConfigKeys() []ConfigKey {
 	return out
 }
 
-// aliasKey maps the older spelling network.<device>.<field> to nic.
-func aliasKey(k string) string {
-	if rest, ok := strings.CutPrefix(k, "network."); ok {
-		return "nic." + rest
-	}
-	return k
-}
-
 // lookup finds the registry entry of a concrete key and the device or
 // variable name it carries.
 func lookup(key string) (*ckey, string, bool) {
-	key = aliasKey(key)
 	parts := strings.Split(key, ".")
 	for i := range registry {
 		k := &registry[i]
@@ -784,7 +793,7 @@ func ConfigKeyFor(key string) (ConfigKey, string, bool) {
 func ApplyConfig(spec *JailSpec, set map[string]string, unset []string) (restartRequired []string, err error) {
 	work := *spec
 	work.Network = append([]NetworkAttach(nil), spec.Network...)
-	work.Volumes = append([]VolumeMount(nil), spec.Volumes...)
+	work.Volumes = append([]VolumeAttach(nil), spec.Volumes...)
 	work.Devfs = append([]DevfsDevice(nil), spec.Devfs...)
 	work.Proxy = append([]ProxyDevice(nil), spec.Proxy...)
 	work.Profiles = append([]string(nil), spec.Profiles...)
@@ -809,7 +818,7 @@ func ApplyConfig(spec *JailSpec, set map[string]string, unset []string) (restart
 			return err
 		}
 		if k.RestartRequired && !equalFlat(before, ConfigValues(work)) {
-			restart[aliasKey(key)] = true
+			restart[key] = true
 		}
 		return nil
 	}
@@ -970,7 +979,7 @@ func ExpandedConfig(spec JailSpec, profiles []Profile) (JailSpec, map[string]str
 	}
 	out := spec
 	out.Network = append([]NetworkAttach(nil), spec.Network...)
-	out.Volumes = append([]VolumeMount(nil), spec.Volumes...)
+	out.Volumes = append([]VolumeAttach(nil), spec.Volumes...)
 	out.Devfs = append([]DevfsDevice(nil), spec.Devfs...)
 	out.Proxy = append([]ProxyDevice(nil), spec.Proxy...)
 	out.Packages = append([]string(nil), spec.Packages...)

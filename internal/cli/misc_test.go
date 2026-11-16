@@ -99,7 +99,7 @@ func TestUnreachableSocket(t *testing.T) {
 	h.env["JAILOPS_PROJECT"] = "main"
 	h.env["JAILOPS_SOCKET"] = filepath.Join(h.dir, "missing.sock")
 	_, errs, code := h.run("", "jail", "list")
-	if code != 1 || !strings.HasPrefix(errs, "error: ") || !strings.Contains(errs, "hint: the socket does not exist") {
+	if code != 1 || !strings.HasPrefix(errs, "unavailable: cannot reach jailopsd at "+h.env["JAILOPS_SOCKET"]) || !strings.Contains(errs, "hint: is jailopsd running? Check with 'service jailopsd status'") {
 		t.Fatalf("%d %q", code, errs)
 	}
 }
@@ -121,7 +121,7 @@ func TestOutputFormats(t *testing.T) {
 	tr.ok("jail", "show", "web", "-o", "table") // the flag wins over the environment
 	h.env["JAILOPS_OUTPUT"] = ""
 	tr.ok("jail", "create", "x", "--image", "freebsd-15@stable", "--network", "lan", "--storage", "default", "-o", "json")
-	tr.ok("jail", "delete", "-y", "x", "-o", "json")
+	tr.ok("jail", "delete", "--confirm-data-loss", "x", "-o", "json")
 	tr.ok("jail", "start", "web", "-o", "name")
 	tr.golden("output_formats")
 }
@@ -302,7 +302,7 @@ func TestServerInfoVersionDoctor(t *testing.T) {
 		mux.HandleFunc("GET /api/v1/doctor", func(w http.ResponseWriter, r *http.Request) {
 			rep := api.DoctorReport{Status: api.DoctorWarn, Checks: []api.DoctorCheck{
 				{Name: "zfs.pool", Status: api.DoctorOK, Message: "pool tank is online"},
-				{Name: "kernel.module.if_bridge", Status: api.DoctorWarn, Message: "not loaded", Hint: "kldload if_bridge"},
+				{Name: "kernel.module.if_epair", Status: api.DoctorWarn, Message: "not loaded", Hint: "kldload if_epair"},
 				{Name: "pf.enabled", Status: api.DoctorUnknown, Message: "cannot tell without FreeBSD"},
 			}}
 			raw, _ := json.Marshal(rep)
@@ -360,18 +360,18 @@ func TestRemoteCommands(t *testing.T) {
 	url := ts.URL
 
 	// The fingerprint is shown and must be confirmed; -y is not an answer.
-	_, errs, code := tr.do("tok\n", "remote", "add", "lab", url, "--token-stdin", "-y")
+	_, errs, code := tr.do("tok\n", "remote", "add", "lab", url, "--token-file", "-", "-y")
 	if code != 2 || !strings.Contains(errs, colon) || !strings.Contains(errs, "Pin this certificate") {
 		t.Fatalf("-y must not answer the pin question: %d %s", code, errs)
 	}
 	if _, code := statFile(h.cfgFile); code == nil {
 		t.Fatal("config written without confirmation")
 	}
-	_, errs, code = tr.do("tok\nn\n", "remote", "add", "lab", url, "--token-stdin")
+	_, errs, code = tr.do("tok\nn\n", "remote", "add", "lab", url, "--token-file", "-")
 	if code != 1 || !strings.Contains(errs, "not trusted") {
 		t.Fatalf("refused pin: %d %s", code, errs)
 	}
-	out, errs, code := tr.do("tok\ny\n", "remote", "add", "lab", url, "--token-stdin")
+	out, errs, code := tr.do("tok\ny\n", "remote", "add", "lab", url, "--token-file", "-")
 	if code != 0 || !strings.Contains(out, "remote/lab added") || !strings.Contains(out, "connected to tls-host") || !strings.Contains(errs, colon) {
 		t.Fatalf("add: %d %s %s", code, out, errs)
 	}

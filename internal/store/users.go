@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"slices"
+	"strings"
 	"time"
 
 	"jailops.net/jailops/sdk/api"
@@ -129,6 +130,15 @@ func (r *Users) update(ctx context.Context, id, set string, args ...any) error {
 		}
 		return nil
 	})
+}
+
+// SetName gives the user a new name; the id, the password, the sessions and the second factor stay.
+func (r *Users) SetName(ctx context.Context, id, name string) error {
+	err := r.update(ctx, id, "name = ?", name)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
+		return api.Errorf(api.CodeAlreadyExists, "user %q already exists", name)
+	}
+	return err
 }
 
 // SetPasswordHash replaces the password hash and revokes the user's sessions.

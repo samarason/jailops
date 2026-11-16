@@ -15,6 +15,7 @@ import (
 	"jailops.net/jailops/internal/lifecycle"
 	"jailops.net/jailops/internal/schedule"
 	"jailops.net/jailops/internal/sys/jailos"
+	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/sdk/api"
 )
@@ -179,6 +180,21 @@ func parsePackageUpdates(out []byte, alpine bool) []api.PackageUpdate {
 
 func (s *Service) jailIsLinux(j api.Jail) bool { return j.Spec.OS == api.OSLinux }
 
+// managesPackages says whether JailOps drives the package tool of a jail: pkg for FreeBSD jails and apk for Alpine.
+// A Debian jail (or any other Linux jail) keeps its own packages, for instance with unattended-upgrades, and JailOps
+// never runs apt in it; the same goes for what a person runs in the jail on his own.
+func (s *Service) managesPackages(j api.Jail) bool {
+	if !s.jailIsLinux(j) {
+		return true
+	}
+	ref, err := validate.ParseImageRef(j.Spec.Image)
+	if err != nil {
+		return false
+	}
+	spec, err := s.imageSpec(context.Background(), ref.Name)
+	return err == nil && spec.Source.Type == "minirootfs"
+}
+
 func (s *Service) runInJail(ctx context.Context, key string, timeout time.Duration, argv ...string) ([]byte, error) {
 	if s.d.Jails == nil {
 		return nil, api.Errorf(api.CodeUnsupported, "this daemon cannot run commands in jails")
@@ -189,6 +205,65 @@ func (s *Service) runInJail(ctx context.Context, key string, timeout time.Durati
 		return out, fmt.Errorf("%s: %w: %s", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
 	}
 	return out, nil
+}
+
+// pkgExec runs a package command for a running jail and returns its output. A Linux jail runs apk inside itself. A
+// FreeBSD jail has no package tool of its own (a thin jail is a pkgbase userland without pkg), so the host's pkg runs
+// with -j: it enters the jail first, so what it writes and the scripts it runs stay in the jail, and it reads the
+// repositories the jail is configured for. argv is the command as it would be typed inside the jail ("pkg",
+// "upgrade", "-y") and -j JAIL is put after "pkg".
+func (s *Service) pkgExec(ctx context.Context, key string, linux bool, timeout time.Duration, argv ...string) ([]byte, error) {
+	if linux {
+		return s.runInJail(ctx, key, timeout, argv...)
+	}
+	host := append([]string{argv[0], "-j", key}, argv[1:]...)
+	res, err := s.d.Run.Run(ctx, run.Cmd{Name: host[0], Args: host[1:], Timeout: timeout})
+	out := append(append([]byte(nil), res.Stdout...), res.Stderr...)
+	if err != nil {
+		return out, fmt.Errorf("%s: %w: %s", strings.Join(host, " "), err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
+}
+
+// pkgUpgradeChunk is how many package names one pkg command takes (the helper allows 64 arguments).
+const pkgUpgradeChunk = 50
+
+// pkgUpgrade lists (apply false) or runs (apply true) the upgrade of the packages of a jail. A Linux jail upgrades
+// everything with apk. For a FreeBSD jail the host names the installed packages that are not part of the base
+// system: the base (FreeBSD-*) comes from the image generation and only moves with it, and a bare `pkg upgrade` on
+// the host would also take the base packages from the host's FreeBSD-base repository into the jail's root.
+func (s *Service) pkgUpgrade(ctx context.Context, key string, linux bool, timeout time.Duration, apply bool) ([]byte, error) {
+	if linux {
+		if apply {
+			return s.pkgExec(ctx, key, true, timeout, "apk", "upgrade", "--no-interactive")
+		}
+		return s.pkgExec(ctx, key, true, timeout, "apk", "upgrade", "--simulate", "--no-interactive")
+	}
+	out, err := s.pkgExec(ctx, key, false, timeout, "pkg", "query", "%n")
+	if err != nil {
+		return out, err
+	}
+	var names []string
+	for _, n := range strings.Fields(string(out)) {
+		if !strings.HasPrefix(n, "FreeBSD-") && n != "pkg" {
+			names = append(names, n)
+		}
+	}
+	flag := "-n"
+	if apply {
+		flag = "-y"
+	}
+	var all []byte
+	for len(names) > 0 {
+		n := min(len(names), pkgUpgradeChunk)
+		o, err := s.pkgExec(ctx, key, false, timeout, append([]string{"pkg", "upgrade", flag}, names[:n]...)...)
+		all = append(all, o...)
+		if err != nil {
+			return all, err
+		}
+		names = names[n:]
+	}
+	return all, nil
 }
 
 func (s *Service) jailRunning(ctx context.Context, key string) bool {
@@ -209,17 +284,25 @@ func (s *Service) checkJail(ctx context.Context, key string) api.UpdateReport {
 		return rep
 	}
 	var errs []string
-	if s.jailRunning(ctx, key) {
+	if !s.managesPackages(j) {
+		// nothing to check: the jail updates its own packages
+	} else if s.jailRunning(ctx, key) {
 		alpine := s.jailIsLinux(j)
-		var upd, dry []string
+		upd := []string{"pkg", "update", "-q"}
 		if alpine {
-			upd, dry = []string{"apk", "update", "--no-interactive"}, []string{"apk", "upgrade", "--simulate", "--no-interactive"}
-		} else {
-			upd, dry = []string{"pkg", "update", "-q"}, []string{"pkg", "upgrade", "-n"}
+			upd = []string{"apk", "update", "--no-interactive"}
 		}
-		if _, err := s.runInJail(ctx, key, 10*time.Minute, upd...); err != nil {
+		release := func() {}
+		var held error
+		if !alpine {
+			release, held = s.holdJailForPackages(key)
+		}
+		defer release()
+		if held != nil {
+			errs = append(errs, "package catalog: "+held.Error())
+		} else if _, err := s.pkgExec(ctx, key, alpine, 10*time.Minute, upd...); err != nil {
 			errs = append(errs, "package catalog: "+err.Error())
-		} else if out, err := s.runInJail(ctx, key, 10*time.Minute, dry...); err != nil {
+		} else if out, err := s.pkgUpgrade(ctx, key, alpine, 10*time.Minute, false); err != nil {
 			errs = append(errs, "package check: "+err.Error())
 		} else {
 			rep.Packages = parsePackageUpdates(out, alpine)
@@ -460,23 +543,34 @@ func (s *Service) applyJail(ctx context.Context, h *OpHandle, key string, w appl
 // health check. It never rolls data back on its own.
 func (s *Service) applyPackages(ctx context.Context, key string, j api.Jail, scheduled bool) api.UpdateRecord {
 	rec := api.UpdateRecord{Kind: api.UpdateKindPackages, Started: s.now().UTC()}
+	if !s.managesPackages(j) {
+		rec.Result, rec.Note = api.UpdateOK, "this jail keeps its own packages (JailOps drives pkg and apk only); nothing was run"
+		return rec
+	}
 	if !s.jailRunning(ctx, key) {
 		rec.Result, rec.Error = api.UpdateFailed, "the jail is not running; packages are updated inside it"
 		return rec
 	}
 	alpine := s.jailIsLinux(j)
-	// The packages that will change, from a dry run.
-	var dry, upd, up []string
-	if alpine {
-		upd, dry, up = []string{"apk", "update", "--no-interactive"}, []string{"apk", "upgrade", "--simulate", "--no-interactive"}, []string{"apk", "upgrade", "--no-interactive"}
-	} else {
-		upd, dry, up = []string{"pkg", "update", "-q"}, []string{"pkg", "upgrade", "-n"}, []string{"pkg", "upgrade", "-y"}
+	// No session may enter the jail while its packages change.
+	if !alpine {
+		release, err := s.holdJailForPackages(key)
+		if err != nil {
+			rec.Result, rec.Error = api.UpdateFailed, "package catalog: "+err.Error()
+			return rec
+		}
+		defer release()
 	}
-	if _, err := s.runInJail(ctx, key, 10*time.Minute, upd...); err != nil {
+	// The packages that will change, from a dry run.
+	upd := []string{"pkg", "update", "-q"}
+	if alpine {
+		upd = []string{"apk", "update", "--no-interactive"}
+	}
+	if _, err := s.pkgExec(ctx, key, alpine, 10*time.Minute, upd...); err != nil {
 		rec.Result, rec.Error = api.UpdateFailed, "package catalog: "+err.Error()
 		return rec
 	}
-	if out, err := s.runInJail(ctx, key, 10*time.Minute, dry...); err == nil {
+	if out, err := s.pkgUpgrade(ctx, key, alpine, 10*time.Minute, false); err == nil {
 		rec.Packages = parsePackageUpdates(out, alpine)
 		if len(rec.Packages) == 0 {
 			rec.Result, rec.Note = api.UpdateOK, "nothing to update"
@@ -489,10 +583,14 @@ func (s *Service) applyPackages(ctx context.Context, key string, j api.Jail, sch
 		return rec
 	}
 	rec.Snapshot = snap.Name
-	if _, err := s.runInJail(ctx, key, 60*time.Minute, up...); err != nil {
+	if _, err := s.pkgUpgrade(ctx, key, alpine, 60*time.Minute, true); err != nil {
 		rec.Result, rec.Error = api.UpdateFailed, err.Error()
 		rec.Note = "restore the snapshot with `jailops jail rollback " + j.Metadata.Name + " --all --snapshot " + snap.Name + "` to undo it; that discards what the jail wrote since"
 		return rec
+	}
+	if !alpine {
+		// a program would not find a new library before the library cache is rebuilt
+		_, _ = s.runInJail(ctx, key, 5*time.Minute, "/sbin/ldconfig", "-m", "/usr/local/lib")
 	}
 	if err := s.healthCheck(ctx, key, j); err != nil {
 		rec.Result, rec.Error = api.UpdateFailed, err.Error()

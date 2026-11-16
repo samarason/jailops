@@ -73,9 +73,9 @@ func TestFleetProjectIsAppliedToItsHosts(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := api.ProjectSpec{Hosts: []string{"h1", "h2"},
-		Networks: []api.ProjectNetwork{{Network: "br-web"}}, Storage: []api.ProjectStorage{{Storage: "default", Quota: "100G"}},
+		Networks: []api.ProjectNetwork{{Network: "web"}}, Storage: []api.ProjectStorage{{Storage: "default", Quota: "100G"}},
 		Quotas: api.ProjectQuotas{Jails: 5}}
-	// The hub itself does not need br-web: a hub that only manages hosts holds the definition.
+	// The hub itself does not need web: a hub that only manages hosts holds the definition.
 	if _, err := hub.Admin.Networks().Create(ctx, brWeb()); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestFleetProjectIsAppliedToItsHosts(t *testing.T) {
 	}
 	// h2 lacks the network: reported before anything is applied there.
 	c := hubCond(t, hub, "web", "h2")
-	if c.Status != api.ConditionFalse || c.Reason != service.FleetMissingNetwork || !strings.Contains(c.Message, "br-web") {
+	if c.Status != api.ConditionFalse || c.Reason != service.FleetMissingNetwork || !strings.Contains(c.Message, "web") {
 		t.Fatalf("%+v", c)
 	}
 	if _, err := h2.Admin.Projects().Get(ctx, "web"); !api.IsCode(err, api.CodeNotFound) {
@@ -158,7 +158,7 @@ func TestFleetOfflineHostCatchesUp(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	spec := api.ProjectSpec{Hosts: []string{"h1", "h2"}, Networks: []api.ProjectNetwork{{Network: "br-web"}}, Storage: []api.ProjectStorage{{Storage: "default"}}}
+	spec := api.ProjectSpec{Hosts: []string{"h1", "h2"}, Networks: []api.ProjectNetwork{{Network: "web"}}, Storage: []api.ProjectStorage{{Storage: "default"}}}
 	if _, err := hub.Admin.Projects().Create(ctx, api.Project{Metadata: api.ObjectMeta{Name: "web"}, Spec: spec}); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestFleetNeverTouchesAForeignProject(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	local := api.ProjectSpec{Description: "local", Quotas: api.ProjectQuotas{Jails: 1}}
+	local := api.ProjectSpec{Comment: "local", Quotas: api.ProjectQuotas{Jails: 1}}
 	if _, err := h1.Admin.Projects().Create(ctx, api.Project{Metadata: api.ObjectMeta{Name: "web"}, Spec: local}); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestFleetNeverTouchesAForeignProject(t *testing.T) {
 	if c := hubCond(t, hub, "web", "h1"); c.Reason != service.FleetConflict {
 		t.Fatalf("%+v", c)
 	}
-	if p, _ := h1.Admin.Projects().Get(ctx, "web"); p.Spec.Description != "local" || p.Metadata.ManagedBy != "" {
+	if p, _ := h1.Admin.Projects().Get(ctx, "web"); p.Spec.Comment != "local" || p.Metadata.ManagedBy != "" {
 		t.Fatalf("%+v", p)
 	}
 	if err := hub.Admin.Projects().Delete(ctx, "web"); err != nil {
@@ -249,7 +249,7 @@ func TestFleetNeverTouchesAForeignProject(t *testing.T) {
 }
 
 func brWeb() api.Network {
-	return api.Network{Metadata: api.ObjectMeta{Name: "br-web"}, Spec: api.NetworkSpec{
+	return api.Network{Metadata: api.ObjectMeta{Name: "web"}, Spec: api.NetworkSpec{
 		IPv4: &api.IPv4Net{Subnet: "10.50.0.0/24", Gateway: "10.50.0.1", Range: "10.50.0.10-10.50.0.100"}}}
 }
 
@@ -260,7 +260,7 @@ func webSpecOn(e *dtest.Env) api.JailSpec {
 		e.Seed()
 	}
 	sp := webSpec()
-	sp.Network = []api.NetworkAttach{{Network: "br-web"}} // the project "web" holds br-web
+	sp.Network = []api.NetworkAttach{{Network: "web"}} // the project "web" holds web
 	return sp
 }
 

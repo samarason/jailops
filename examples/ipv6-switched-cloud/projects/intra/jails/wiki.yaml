@@ -10,5 +10,5 @@ spec:
   storage: default
   network:
     - {name: eth0, network: intra, ipv4: auto, ipv6: auto}
-  firewall: {policy: lan-only}
+  firewall: {policies: [lan-only]}
   resources: {memory: 1G}

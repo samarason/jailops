@@ -152,7 +152,7 @@ $ jailops jail create x --image freebsd-15@stable --network lan --storage defaul
   }
 }
 
-$ jailops jail delete -y x -o json
+$ jailops jail delete --confirm-data-loss x -o json
 {
   "id": "<uuid>",
   "description": "Deleting jail x",

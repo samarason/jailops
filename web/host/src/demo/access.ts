@@ -25,7 +25,9 @@ function rulesOf(from: string[], ports: string[]): string[] {
 function pfOf(jail: string, from: string[], ports: string[]): string[] {
   const nums = ports.map((p) => p.split('/')[0])
   const port = nums.length > 1 ? `{ ${nums.join(' ')} }` : nums[0]
-  const src = from.length > 1 ? `{ ${from.join(' ')} }` : from[0]
+  const table = (x: string) => (x.startsWith('jail:') ? `<j_${x.slice(5).replace(/-/g, '_')}>` : x.startsWith('set:') ? `<s_${x.slice(4)}>` : x) // a reference is a table: it follows the jail or the set
+  const names = from.map(table)
+  const src = names.length > 1 ? `{ ${names.join(' ')} }` : names[0]
   return [`pass out quick on { jo1a${jail.length}b } inet proto tcp from ${src} to 10.20.0.0/32 port ${port}`]
 }
 
@@ -36,14 +38,14 @@ const password = () => {
   return Array.from(b, (x) => abc[x % abc.length]).join('')
 }
 
-export function demoAccess(jails: () => Jail[], sets: () => Array<{ metadata: { name: string }; spec: { addresses: string[] } }>, def: (app: string) => App | undefined) {
+export function demoAccess(jails: () => Jail[], sets: () => Array<{ metadata: { name: string }; spec: { addresses: Array<{ address: string }> } }>, def: (app: string) => App | undefined) {
   const state = new Map<string, State>()
   const web = '10.20.0.11'
   state.set('db', {
     closed: true, roles: { web: true },
     grants: [{
-      source: '@web', source_kind: 'jail', addresses: [`${web}/32`], ports: ['5432/tcp'], database: 'web', role: 'web', role_created: true, database_created: true,
-      rules: rulesOf([web], ['5432/tcp']), pf: pfOf('db', [web], ['5432/tcp']), hba: [`host web web ${web}/32 scram-sha-256`],
+      source: 'jail:web', source_kind: 'jail', addresses: [`${web}/32`], ports: ['5432/tcp'], database: 'web', role: 'web', role_created: true, database_created: true,
+      rules: rulesOf(['jail:web'], ['5432/tcp']), pf: pfOf('db', ['jail:web'], ['5432/tcp']), hba: [`host web web ${web}/32 scram-sha-256`],
       created_at: ago(86400 * 3), created_by: 'admin',
     }],
   })
@@ -79,16 +81,19 @@ export function demoAccess(jails: () => Jail[], sets: () => Array<{ metadata: { 
     if (b.source === 'host') {
       kind = 'host'; from = ['10.20.0.1']; prefixes = ['10.20.0.1/32']
     } else if (b.source.startsWith('@')) {
-      const n = b.source.slice(1)
+      return { status: 400, code: 'invalid', message: `source "${b.source}": @ is not used: write jail:${b.source.slice(1)} or set:${b.source.slice(1)}` }
+    } else if (b.source.startsWith('jail:')) {
+      const n = b.source.slice(5)
       const src = jails().find((x) => x.metadata.name === n && x.metadata.project === j.metadata.project)
+      if (!src) return { status: 404, code: 'not_found', message: `jail "${n}" not found in project ${j.metadata.project}`, hint: 'jailops list shows the names' }
+      if (n === name) return { status: 400, code: 'invalid', message: 'a jail always reaches itself; name another source' }
+      kind = 'jail'; const addrs = addrOf(src); from = [b.source]; prefixes = addrs.map((a) => `${a}/32`)
+      if (!addrs.length) return { status: 400, code: 'invalid', message: `jail "${n}" has no address to allow` }
+    } else if (b.source.startsWith('set:')) {
+      const n = b.source.slice(4)
       const set = sets().find((x) => x.metadata.name === n)
-      if (src) {
-        if (n === name) return { status: 400, code: 'invalid', message: 'a jail always reaches itself; name another source' }
-        kind = 'jail'; from = addrOf(src); prefixes = from.map((a) => `${a}/32`)
-        if (!from.length) return { status: 400, code: 'invalid', message: `jail "${n}" has no address to allow` }
-      } else if (set) {
-        kind = 'address-set'; from = [b.source]; prefixes = [...set.spec.addresses]
-      } else return { status: 404, code: 'not_found', message: `@${n} is neither a jail nor an address set of project ${j.metadata.project}`, hint: 'jailops list and jailops firewall address-set list show the names' }
+      if (!set) return { status: 404, code: 'not_found', message: `address set "${n}" not found in project ${j.metadata.project}`, hint: 'jailops firewall address-set list shows the names' }
+      kind = 'address-set'; from = [b.source]; prefixes = set.spec.addresses.map((e) => e.address)
     } else {
       canonical = b.source.replace(/\/(32|128)$/, '')
       from = [canonical]; prefixes = [b.source.includes('/') ? b.source : `${b.source}/${b.source.includes(':') ? 128 : 32}`]
@@ -103,7 +108,7 @@ export function demoAccess(jails: () => Jail[], sets: () => Array<{ metadata: { 
     const res: AppAllowResult = { jail: name, grant: g, changed: true, steps: [`firewall policy app-${name}: ${g.rules.join('; ')}`], dry_run: b.dry_run }
     let pw = ''
     if (d?.access) {
-      const db = b.database || (i >= 0 ? st.grants[i].database : '') || (kind === 'jail' ? canonical.slice(1).replace(/-/g, '_') : '')
+      const db = b.database || (i >= 0 ? st.grants[i].database : '') || (kind === 'jail' ? canonical.slice(5).replace(/-/g, '_') : '')
       if (!db) return { status: 400, code: 'invalid', message: 'name the database of this grant with --db NAME (a source that is not a jail has no default)' }
       if (i >= 0 && st.grants[i].database !== db) return { status: 409, code: 'conflict', message: `${canonical} already has access to database ${st.grants[i].database}`, hint: 'deny it first to give it another database' }
       if (j.status.power !== 'running') return { status: 409, code: 'busy', message: `jail "${name}" is stopped; the role and the database are made with psql in it`, hint: `start it with jailops start ${name}` }
@@ -132,7 +137,7 @@ export function demoAccess(jails: () => Jail[], sets: () => Array<{ metadata: { 
     const host = addrOf(j)[0] ?? '10.20.0.12'
     if (pw) {
       res.connection_string = `postgres://${g.role}:${pw}@${host}:5432/${g.database}?sslmode=disable`
-      notes.push(`the connection string is shown once and stored nowhere; jailops app allow ${name} from ${canonical} --rotate makes a new password`)
+      notes.push(`the connection string is shown once and stored nowhere; jailops app allow ${name} --from ${canonical} --rotate makes a new password`)
     } else if (g.role) notes.push(`role ${g.role} exists: its password was shown when it was made; --rotate makes a new one`)
     if (!res.changed) notes.push('nothing changed: the grant exists as it is')
     return { ok: res }

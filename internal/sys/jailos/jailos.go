@@ -1,6 +1,5 @@
 // Package jailos controls and observes FreeBSD jails: jail(8) for start and
-// stop, jexec(8) for commands inside, and jls(8) or jail_get(2) for the
-// running state.
+// stop, jexec(8) for commands inside, and jls(8) for the running state.
 package jailos
 
 import (

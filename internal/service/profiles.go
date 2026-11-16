@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sort"
 	"strconv"
 
 	"jailops.net/jailops/internal/validate"
@@ -108,6 +109,10 @@ func (s *Service) profileAdmin(ctx context.Context, spec api.ProfileSpec) error 
 	for k := range spec.Config {
 		if ck, _, ok := api.ConfigKeyFor(k); ok && ck.Admin && !ActorFrom(ctx).Perm.Satisfies(api.PermAdmin) {
 			return api.Errorf(api.CodeForbidden, "%s needs the admin role", k)
+		} else if ok && ck.Global {
+			if err := requireGlobalForForward(ctx, k); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -120,7 +125,7 @@ func (s *Service) UpdateProfile(ctx context.Context, name string, in api.Profile
 		return api.Profile{}, err
 	}
 	if in.Metadata.Name != "" && in.Metadata.Name != name {
-		return api.Profile{}, invalid("renaming is not supported")
+		return api.Profile{}, renameByAction("profile", "profiles")
 	}
 	if err := bodyProject(proj, in.Metadata.Project); err != nil {
 		return api.Profile{}, err
@@ -206,6 +211,7 @@ func (s *Service) readmitProfile(ctx context.Context, proj, name string, spec ap
 		}
 	}
 	s.mu.RUnlock()
+	newEff := map[string]api.JailSpec{} // what each jail would run with, for the checks that look at them together
 	for _, u := range users {
 		j := u.jail
 		var profs []api.Profile
@@ -233,13 +239,28 @@ func (s *Service) readmitProfile(ctx context.Context, proj, name string, spec ap
 		}
 		for _, nd := range eff.Network {
 			if _, ok := specGrantsNetwork(po.Spec, nd.Network); !ok && nd.Network != "" {
-				return api.Errorf(api.CodeForbidden, "jail %q would attach network %q, which project %q was not granted", who, nd.Network, j.Metadata.Project)
+				return api.Errorf(api.CodeForbidden, "jail %q would attach network %q, which project %q was not granted", who, nd.Network, j.Metadata.Project).
+					WithHint(fmt.Sprintf("a global admin grants it: jailops network grant %s --project %s", nd.Network, j.Metadata.Project))
 			}
 		}
 		if len(eff.Devfs) > 0 && len(j.Spec.Devfs) == 0 && !ActorFrom(ctx).Perm.Satisfies(api.PermAdmin) {
 			return api.Errorf(api.CodeForbidden, "jail %q would gain device nodes, which needs the admin role", who)
 		}
 		if len(eff.Proxy) > 0 {
+			// a published port that the edit adds or changes is a global administrator's to give
+			var before []api.ProxyDevice
+			if stored, err := s.resolveProfiles(j.Metadata.Project, j.Spec.Profiles); err == nil {
+				oldEff, _ := api.ExpandedConfig(j.Spec, stored)
+				before = oldEff.Proxy
+			}
+			if !slices.Equal(eff.Proxy, before) {
+				if err := requireGlobalForForward(ctx, "a profile that forwards a host port into a jail"); err != nil {
+					return err
+				}
+			}
+			if err := s.checkProxyDevices(ctx, "jail "+who, eff.Proxy); err != nil {
+				return err
+			}
 			up := false
 			for _, nd := range eff.Network {
 				if n, err := s.netKind.get(nd.Network); err == nil && n.Spec.Uplink != "" {
@@ -253,6 +274,59 @@ func (s *Service) readmitProfile(ctx context.Context, proj, name string, spec ap
 		if err := s.checkProxyConflicts(u.key, eff); err != nil {
 			return err
 		}
+		// the volumes the profile gives the jail pass what a volume attached to the jail itself passes
+		was := s.effective(j).Volumes
+		if err := s.hostDirAdmission(ctx, j.Metadata.Project, eff.Volumes, was); err != nil {
+			return err
+		}
+		for _, v := range eff.Volumes {
+			if slices.ContainsFunc(was, func(w api.VolumeAttach) bool { return w.Name == v.Name }) {
+				continue
+			}
+			if _, err := s.volKind.p(j.Metadata.Project).get(v.Name); err != nil {
+				return api.Errorf(api.CodeNotFound, "jail %q would attach volume %q, which does not exist in project %q", who, v.Name, j.Metadata.Project).
+					WithHint("jailops volume create " + v.Name)
+			}
+		}
+		newEff[u.key] = eff
+	}
+	return s.checkProfileTogether(newEff)
+}
+
+// checkProfileTogether runs the checks that depend on all the jails a profile edit changes at once: an encrypted
+// volume the profile gives to two jails is shared, and the limits it gives them together can pass the project's quotas.
+func (s *Service) checkProfileTogether(newEff map[string]api.JailSpec) error {
+	keys := make([]string, 0, len(newEff))
+	for k := range newEff {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
+	usages := map[string]usage{}
+	for _, k := range keys {
+		proj, _ := validate.SplitQualified(k)
+		eff := newEff[k]
+		for _, v := range eff.Volumes {
+			if o, err := s.volKind.p(proj).get(v.Name); err == nil && o.Spec.Encrypted {
+				if other := s.otherUserOfVolume(proj, k, v.Name, newEff); other != "" {
+					return encryptedSharedErr(v.Name, other)
+				}
+			}
+		}
+		po, err := s.projKind.get(proj)
+		if err != nil {
+			return err
+		}
+		u, ok := usages[proj]
+		if !ok {
+			u = s.usageWithoutLocked(proj, newEff)
+		}
+		if err := s.checkQuota(po, eff, u, false); err != nil {
+			return err
+		}
+		u.add(eff)
+		usages[proj] = u
 	}
 	return nil
 }
@@ -319,10 +393,21 @@ func proxyKey(listen, proto string) (string, error) {
 	return proto + "/" + host + "/" + strconv.Itoa(port), nil
 }
 
-// checkProxyConflicts rejects a proxy device whose host port another jail,
-// of any project, already forwards. A listener on every address conflicts
-// with one on a specific address.
+// checkProxyConflicts rejects a jail whose published host port another jail, of any project, already forwards: a proxy
+// device of the jail or a redirect rule of one of its policies, against the proxy devices and the redirect rules of
+// the others.
 func (s *Service) checkProxyConflicts(self string, eff api.JailSpec) error {
+	if err := s.checkProxyDeviceConflicts(self, eff); err != nil {
+		return err
+	}
+	project, _ := validate.SplitQualified(self)
+	return s.checkForwardClash(project, self, eff)
+}
+
+// checkProxyDeviceConflicts rejects two proxy devices of one jail that listen in the same place (the clash with another jail
+// is checkForwardClash, which also counts the redirect rules of policies). A listener on every address conflicts with one
+// on a specific address.
+func (s *Service) checkProxyDeviceConflicts(self string, eff api.JailSpec) error {
 	mine := map[string]string{}
 	for _, p := range eff.Proxy {
 		k, err := proxyKey(p.Listen, p.Proto)
@@ -333,32 +418,6 @@ func (s *Service) checkProxyConflicts(self string, eff api.JailSpec) error {
 			return api.Errorf(api.CodeAlreadyExists, "proxy %q listens where another proxy of the jail does", p.Name)
 		}
 		mine[k] = p.Name
-	}
-	if len(mine) == 0 {
-		return nil
-	}
-	s.mu.RLock()
-	jails := make(map[string]api.Jail, len(s.jails))
-	for k, e := range s.jails {
-		if k != self {
-			jails[k] = e.jail
-		}
-	}
-	s.mu.RUnlock()
-	for k, j := range jails {
-		for _, p := range s.effective(j).Proxy {
-			ok, err := proxyKey(p.Listen, p.Proto)
-			if err != nil {
-				continue
-			}
-			for mk, name := range mine {
-				if portClash(mk, ok) {
-					return api.Errorf(api.CodeAlreadyExists, "host port %s is already forwarded by another jail", mk).
-						WithDetail("proxy", name).WithDetail("listen", p.Listen)
-				}
-			}
-		}
-		_ = k
 	}
 	return nil
 }
@@ -439,6 +498,10 @@ func (s *Service) ConfigureJail(ctx context.Context, name string, ch api.ConfigC
 	for k := range ch.Set {
 		if ck, _, ok := api.ConfigKeyFor(k); ok && ck.Admin && !ActorFrom(ctx).Perm.Satisfies(api.PermAdmin) {
 			return api.Operation{}, api.Errorf(api.CodeForbidden, "%s needs the admin role", k)
+		} else if ok && ck.Global {
+			if err := requireGlobalForForward(ctx, k); err != nil {
+				return api.Operation{}, err
+			}
 		}
 	}
 	pre, err := s.jailSnapshot(key)

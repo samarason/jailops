@@ -7,35 +7,36 @@ A NAS: a small fast pool (`zroot`, the system and JailOps's `default` storage) a
 | What | In the example | Owner | Snapshots / backup by JailOps |
 |---|---|---|---|
 | A **storage** on `tank` | `hosts/nas1/storage/bulk.yaml` (`dataset: tank/bulk`), granted to the project with a 12 TB quota | JailOps | yes |
-| A **volume** | `scratch` has `work` (4T), `plex` has `metadata` (200G): datasets under the jail on `bulk` | JailOps | yes, with the jail |
-| A **host mount** | `plex` sees `/tank/archive/movies` and `/music` read-only | you | no |
+| A **volume** | `work` (4T) and `plexdata` (200G), made by `projects/media/volumes/`; the jails `scratch` and `plex` attach them | JailOps | its own snapshots; not deleted with a jail |
+| A **host directory** as a volume | `movies` and `music` (`projects/media/volumes/`); `plex` attaches them read-only | you | no |
 
 ## Prepare the host (once)
 
     zfs create tank/bulk                                  # JailOps data; must exist, must not overlap another storage
-    # The archive is yours: it is only mounted. Say where mounts may come from, as root, in priv.conf:
-    echo 'admin-host-mount = /tank/archive' >> /usr/local/etc/jailops/priv.conf
+    # The archive is yours: it is only attached. Its datasets are mounted below /mnt/archive (zfs set mountpoint=/mnt/archive tank/archive);
+    # say where such mounts may be, as root, in priv.conf:
+    echo 'admin-host-mount = /mnt/archive' >> /usr/local/etc/jailops/priv.conf
     service jailops_priv restart
 
-(`bootstrap.sh` of [provisioning](../provisioning) does the second step with `JAILOPS_HOST_MOUNTS=/tank/archive`.)
+(`bootstrap.sh` of [provisioning](../provisioning) does the second step with `JAILOPS_HOST_MOUNTS=/mnt/archive`.)
 
 Registering the storage (`sync` creates it) also registers it with the root helper, which then allows its operations below
 `tank/bulk` and nowhere else.
 
 ## What to know
 
-- **Host mounts need a global-admin identity**, so the token or certificate that `jailops-sync` uses must be a global
-  admin's. A project's operator cannot add one, and a **profile cannot carry one** (`validate` refuses it). The helper refuses
-  the jail's start when the source is not below an `admin-host-mount` directory; `validate` prints a RISK for every host mount and
-  for every read-write one. Use `read_only: true` where you can: a read-write mount lets the jail change or delete the
-  host's data.
+- **A volume that is a host directory needs a global-admin identity**, so the token or certificate that `jailops-sync` uses must be
+  a global admin's. A project's operator cannot make one. The helper refuses it unless the path is a real mount below an
+  `admin-host-mount` directory, and a jail whose directory is not mounted does not start. `watch: true` has the daemon
+  look at the mount and show `lost` when it is gone. Use `read_only: true` where you can: a read-write attachment lets the jail
+  change or delete the host's data.
 - The archive is **not backed up** by JailOps and not rolled back with the jail. Use ZFS itself (`zfs snapshot`, replication)
   for it.
 - Storage may be shared between projects, each with its own quota; a network belongs to one project. The jail's root can stay on
   the fast pool (`storage: default`) while its data is on `bulk`: here `plex` is wholly on `bulk`, because spinning disks are fine for a media
   server.
 - Image generations are built **per pool**: the first jail on `bulk` builds its copy there, so the first start takes longer.
-- Quotas are checked before anything is created: a jail's `resources.disk` and volumes against the project quota.
+- Quotas are checked before anything is created: a jail's `resources.disk` and the volumes of the project against the project quota.
 
 ## Run it
 

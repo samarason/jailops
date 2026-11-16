@@ -198,18 +198,19 @@ func (m *Manifest) CheckIndex(file []byte, idx *Index) error {
 // NewSnapshotID returns a sortable id: YYYYMMDDHHMMSS-xxxxxxxx (UTC). It only
 // uses [0-9a-f-], so it is safe in object keys and file names.
 //
-// With r == nil the suffix is the microsecond within the second followed by one
-// random byte, so ids created in the same second still sort in creation order.
+// With r == nil the suffix is the microsecond within the second (20 bits) followed by
+// 12 random bits, so ids created in the same second still sort in creation order and
+// two created in the same microsecond (a frozen clock in a test) differ in 4095 of 4096 cases.
 // With an explicit reader (tests) the suffix is 4 bytes read from it.
 func NewSnapshotID(t time.Time, r io.Reader) (string, error) {
 	t = t.UTC()
 	var b [4]byte
 	if r == nil {
-		var rb [1]byte
+		var rb [2]byte
 		if _, err := io.ReadFull(rand.Reader, rb[:]); err != nil {
 			return "", err
 		}
-		v := uint32(t.Nanosecond()/1000)<<8 | uint32(rb[0])
+		v := uint32(t.Nanosecond()/1000)<<12 | (uint32(rb[0])<<8|uint32(rb[1]))&0xfff
 		b = [4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
 	} else if _, err := io.ReadFull(r, b[:]); err != nil {
 		return "", err

@@ -23,7 +23,7 @@ type BackupAdmin interface {
 	CreateKey(ctx context.Context, recipients []string) (api.BackupKeyCreated, error)
 	EscrowKey(ctx context.Context, recipients []string) error
 	KeyStatus(ctx context.Context) (api.BackupKeyStatus, error)
-	RunPolicy(ctx context.Context, project, policy string) ([]api.BackupRun, error)
+	RunPolicy(ctx context.Context, project, policy string, noVolumes bool) ([]api.BackupRun, error)
 	Verify(ctx context.Context, backupID, depth string) (api.BackupRun, error)
 }
 
@@ -94,7 +94,7 @@ func (s *Service) RunBackups(ctx context.Context, req api.BackupRunRequest) (api
 	return s.Submit(ctx, OpSpec{Description: "Run backup policy " + req.Policy,
 		Resources: map[string][]string{"backup-policies": {"/api/v1/backup-policies/" + req.Policy}},
 		Run: func(ctx context.Context, h *OpHandle) (any, error) {
-			runs, err := a.RunPolicy(ctx, project, req.Policy)
+			runs, err := a.RunPolicy(ctx, project, req.Policy, req.NoVolumes)
 			return runs, err
 		}})
 }
@@ -136,6 +136,8 @@ type BackupJail struct {
 	Spec    api.JailSpec
 	Layout  lifecycle.JailLayout
 	Image   api.ImageGeneration
+	// VolumeIDs maps the name of each volume of the jail (its profiles' included) that has a dataset to its UUID.
+	VolumeIDs map[string]string
 }
 
 // BackupJails lists the jails of this host with their dataset layout.
@@ -156,6 +158,14 @@ func (s *Service) BackupJails(ctx context.Context) ([]BackupJail, error) {
 			continue
 		}
 		bj := BackupJail{Key: k, Name: j.Metadata.Name, UUID: j.Metadata.UUID, Project: j.Metadata.Project, Labels: j.Metadata.Labels, Spec: j.Spec, Layout: lay}
+		for _, v := range s.effective(j).Volumes {
+			if o, err := s.volKind.p(j.Metadata.Project).get(v.Name); err == nil && !o.Spec.IsHostDir() {
+				if bj.VolumeIDs == nil {
+					bj.VolumeIDs = map[string]string{}
+				}
+				bj.VolumeIDs[v.Name] = o.Meta.UUID
+			}
+		}
 		if lay.Image != "" && lay.Generation > 0 {
 			if si, ok := s.storageOfJail(k); ok {
 				if g, err := s.life.Images.Resolve(ctx, si.Root, genRef(lay.Image, lay.Generation)); err == nil {
@@ -166,6 +176,134 @@ func (s *Service) BackupJails(ctx context.Context) ([]BackupJail, error) {
 		out = append(out, bj)
 	}
 	return out, nil
+}
+
+// BackupVolume is one volume as the backup service sees it.
+type BackupVolume struct {
+	Name, UUID, Project string
+	Labels              map[string]string
+	Spec                api.VolumeSpec
+	Dataset, Mountpoint string
+	// Locked is true for an encrypted volume whose key is not loaded: its files cannot be read.
+	Locked bool
+}
+
+// BackupVolumes lists the volumes of every project for the backup service.
+func (s *Service) BackupVolumes(ctx context.Context) ([]BackupVolume, error) {
+	projs, err := s.projKind.list()
+	if err != nil {
+		return nil, err
+	}
+	var out []BackupVolume
+	for _, p := range projs {
+		objs, err := s.volKind.p(p.Meta.Name).list()
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range objs {
+			if o.Spec.IsHostDir() {
+				s.log.Info("backup: a volume of a host directory is not backed up: its files are the host's", "project", p.Meta.Name, "volume", o.Meta.Name, "path", o.Spec.Path)
+				continue
+			}
+			si, ok := s.storage(o.Spec.Storage)
+			if !ok || s.life == nil {
+				s.log.Warn("backup: the storage of a volume is not there; it is skipped", "project", p.Meta.Name, "volume", o.Meta.Name, "storage", o.Spec.Storage)
+				continue
+			}
+			st := si.lifecycle()
+			bv := BackupVolume{Name: o.Meta.Name, UUID: o.Meta.UUID, Project: p.Meta.Name, Labels: o.Meta.Labels, Spec: o.Spec,
+				Dataset: lifecycle.VolumeDS(st, p.Meta.Name, o.Meta.Name), Mountpoint: lifecycle.VolumeMP(st, p.Meta.Name, o.Meta.Name)}
+			if o.Spec.Encrypted {
+				if info, err := s.life.VolumeInfo(ctx, st, p.Meta.Name, o.Meta.Name); err == nil {
+					bv.Locked = info.Locked
+				}
+			}
+			out = append(out, bv)
+		}
+	}
+	return out, nil
+}
+
+// RestoreVolume makes an empty volume of the project from the spec of a volume backup, the way volume create does,
+// and registers it. The caller holds the lock of the volume. The returned undo removes it again. A storage the
+// backup names that this host does not grant to the project is replaced by the project's only storage.
+func (s *Service) RestoreVolume(ctx context.Context, projectName, name string, spec api.VolumeSpec, labels map[string]string, passphrase string) (string, func(context.Context) error, error) {
+	p, err := s.projKind.get(projectName)
+	if err != nil {
+		return "", nil, notFound("project", projectName)
+	}
+	if _, ok := s.storage(spec.Storage); !ok || !specGrantsStorage(p.Spec, spec.Storage) {
+		spec.Storage = ""
+	}
+	spec, si, mode, err := s.checkVolumeSpec(p, name, spec)
+	if err != nil {
+		return "", nil, err
+	}
+	if spec.Encrypted && (s.d.Keys == nil || passphrase == "") {
+		return "", nil, invalid("an encrypted volume needs its passphrase and the helper's key operations")
+	}
+	ks := s.volKind.p(projectName)
+	if err := ks.notTaken(name); err != nil {
+		return "", nil, err
+	}
+	var pass []byte
+	if spec.Encrypted {
+		pass = []byte(passphrase)
+		defer wipe(pass)
+	}
+	meta := api.ObjectMeta{Name: name, Project: projectName, Labels: labels}
+	if _, err := s.makeVolume(ctx, p, si, meta, spec, mode, pass, true); err != nil {
+		return "", nil, err
+	}
+	st := si.lifecycle()
+	return lifecycle.VolumeDS(st, projectName, name), func(ctx context.Context) error { return s.dropVolume(ctx, projectName, name) }, nil
+}
+
+// CompleteRestoredVolume ends the restore of a volume made by RestoreVolume: no file agent writes it from now on.
+func (s *Service) CompleteRestoredVolume(ctx context.Context, projectName, name string) error {
+	o, err := s.volKind.p(projectName).get(name)
+	if err != nil {
+		return err
+	}
+	si, ok := s.storage(o.Spec.Storage)
+	if !ok {
+		return notFound("storage", o.Spec.Storage)
+	}
+	return s.life.CompleteVolume(ctx, si.lifecycle(), projectName, name)
+}
+
+// restoreVolumeBackup is the restore of a volume backup, as an operation: the volume is made in the project with the
+// grants and the checks of volume create, then the backup is extracted into it.
+func (s *Service) restoreVolumeBackup(ctx context.Context, p project, b api.Backup, req api.RestoreRequest) (*api.RestorePreflight, *api.Operation, error) {
+	name := req.As
+	if name == "" {
+		name = b.Spec.Jail
+	}
+	if b.Spec.Volume == nil {
+		return nil, nil, invalid("backup %s holds no volume spec", req.Backup)
+	}
+	target := p.Meta.Name
+	if b.Spec.Volume.Encrypted {
+		if err := api.CheckPassphrase(req.Passphrase); err != nil {
+			return nil, nil, err
+		}
+	}
+	spec := *b.Spec.Volume
+	if _, ok := s.storage(spec.Storage); !ok || !specGrantsStorage(p.Spec, spec.Storage) {
+		spec.Storage = ""
+	}
+	if _, _, _, err := s.checkVolumeSpec(p, name, spec); err != nil {
+		return nil, nil, err
+	}
+	if err := s.volKind.p(target).notTaken(name); err != nil {
+		return nil, nil, err
+	}
+	op, err := s.Submit(ctx, OpSpec{Description: "Restore backup " + req.Backup + " as volume " + name, Locks: []string{volumeLock(target, name)}, Project: target,
+		Resources: map[string][]string{"volumes": {"/api/v1/volumes/" + name}},
+		Run: func(ctx context.Context, h *OpHandle) (any, error) {
+			return s.d.Backups.RestoreVolume(ctx, req)
+		}})
+	return nil, &op, err
 }
 
 func genRef(image string, n int) string { return image + "#g" + itoa(n) }
@@ -278,6 +416,14 @@ func (s *Service) RestoreState(ctx context.Context, project string) (backup.Host
 	for _, x := range sets {
 		st.AddressSets[x.Meta.Name] = x.Spec
 	}
+	vols, err := s.volKind.p(project).list()
+	if err != nil {
+		return st, err
+	}
+	st.Volumes = map[string]bool{}
+	for _, v := range vols {
+		st.Volumes[v.Meta.Name] = true
+	}
 	s.mu.RLock()
 	for _, k := range sortedKeys(s.jails) {
 		j := s.jails[k].jail
@@ -377,11 +523,6 @@ func (s *Service) RestoreEnsureObjects(ctx context.Context, project string, b ap
 // RestoreAdopt writes spec.json and bundle.json of a restored jail and
 // registers it. The undo forgets it again (the restore removes the datasets).
 func (s *Service) RestoreAdopt(ctx context.Context, key string, j api.Jail, gen api.ImageGeneration) (func(context.Context) error, error) {
-	// A restored volume is a plain dataset (the preflight says so): the spec must not claim otherwise.
-	j.Spec.Volumes = append([]api.VolumeMount(nil), j.Spec.Volumes...)
-	for i := range j.Spec.Volumes {
-		j.Spec.Volumes[i].Encrypted = false
-	}
 	if err := s.life.WriteRecords(ctx, key, j, gen); err != nil {
 		return nil, err
 	}

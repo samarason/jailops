@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -128,6 +129,7 @@ func (s *Service) view(ctx context.Context, e *jailEntry, running map[string]int
 	j := cloneJail(e.jail)
 	name := jailKey(j)
 	st := api.JailStatus{Power: api.PowerStopped, Generation: e.jail.Status.Generation}
+	st.FreeBSDVersion = s.generationFreeBSD(ctx, st.Generation)
 	jid, up := 0, false
 	if running != nil {
 		jid, up = running[name], false
@@ -147,17 +149,16 @@ func (s *Service) view(ctx context.Context, e *jailEntry, running map[string]int
 			st.Addresses = append(st.Addresses, a.String())
 		}
 	}
-	for _, nd := range s.effective(j).Network {
-		if nd.Ingress != "" || nd.Egress != "" {
-			st.Conditions = append(st.Conditions, api.Condition{Type: "RateLimit", Status: api.ConditionFalse, Reason: "NotEnforced",
-				Message: "rate limits are stored but no shaper enforces them yet (UNVERIFIED)", Since: s.now().UTC()})
-			st.Warnings = append(st.Warnings, rateLimitWarning)
-			break
+	if up {
+		if c, w, ok := s.limitsCondition(ctx, j); ok {
+			st.Conditions = append(st.Conditions, c)
+			st.Warnings = append(st.Warnings, w)
 		}
 	}
 	st.Drift = rt.drift
 	st.ProvisionedAt = s.provisionedAt(name)
 	st.Conditions = append(st.Conditions, rt.conditions...)
+	st.Conditions = append(st.Conditions, s.shellCondition(name)...)
 	if len(e.problems) > 0 {
 		st.Conditions = append(st.Conditions, api.Condition{Type: "Healthy", Status: api.ConditionFalse, Reason: "Degraded",
 			Message: strings.Join(e.problems, "; "), Since: s.now().UTC()})
@@ -257,7 +258,7 @@ func (s *Service) imageFor(spec api.JailSpec) (object[api.ImageSpec], validate.I
 	}
 	im, err := s.imgKind.get(ref.Name)
 	if err != nil {
-		return im, ref, api.Errorf(api.CodeNotFound, "image %q not found", ref.Name).WithHint("create or import the image first")
+		return im, ref, api.Errorf(api.CodeNotFound, "image %q not found", ref.Name).WithHint(api.ImageCreateHint("it", ref.Name, ref.Alias, s.hostBaseRelease()))
 	}
 	return im, ref, nil
 }
@@ -270,8 +271,23 @@ func (s *Service) checkJailRefs(project string, spec api.JailSpec) error {
 			return notFound("network", a.Network)
 		}
 	}
-	if p := spec.Firewall.Policy; p != "" && !s.polKind.p(project).exists(p) {
-		return notFound("firewall-policy", p)
+	pr, perr := s.projKind.get(project)
+	for _, p := range spec.Firewall.Policies {
+		o, err := s.polKind.p(project).get(p)
+		if err != nil {
+			if api.IsCode(err, api.CodeNotFound) {
+				return notFound("firewall-policy", p)
+			}
+			return err
+		}
+		if o.Meta.ManagedBy != "" {
+			return invalid("firewall policy %q is managed by %s: it belongs to its own jail and is not a policy to attach", p, o.Meta.ManagedBy).
+				WithHint("write a policy of your own (jailops firewall policy create); app access keeps app-JAIL")
+		}
+		if perr == nil && slices.Contains(pr.Spec.FirewallPolicies, p) {
+			return invalid("firewall policy %q is a mandatory policy of project %s: it is rendered for every jail already", p, project).
+				WithHint("name policies of the jail's own, which add to it")
+		}
 	}
 	return nil
 }
@@ -301,20 +317,10 @@ func (s *Service) imageLocks(ctx context.Context, ref validate.ImageRef, storage
 // result is the Jail. Grants, the image allow-list and the quotas are checked
 // before anything is created.
 func (s *Service) CreateJail(ctx context.Context, j api.Jail) (api.Operation, error) {
-	return s.CreateJailWith(ctx, api.JailCreate{Metadata: j.Metadata, Spec: j.Spec})
-}
-
-// CreateJailWith is CreateJail with the passphrase of the jail's encrypted volumes. The passphrase is handed to
-// the creation step and dropped; the operation, its journal and the jail never hold it.
-func (s *Service) CreateJailWith(ctx context.Context, in api.JailCreate) (api.Operation, error) {
-	j := api.Jail{Metadata: in.Metadata, Spec: in.Spec}
 	if err := s.requireHost("jails"); err != nil {
 		return api.Operation{}, err
 	}
-	pass, err := s.creationPassphrase(j.Spec, in.VolumePassphrase)
-	if err != nil {
-		return api.Operation{}, err
-	}
+	j.Spec.Shell = api.ShellPath(j.Spec.Shell) // the names bash and sh
 	p, err := s.access(ctx)
 	if err != nil {
 		return api.Operation{}, err
@@ -324,6 +330,9 @@ func (s *Service) CreateJailWith(ctx context.Context, in api.JailCreate) (api.Op
 	}
 	name, proj := j.Metadata.Name, p.Meta.Name
 	if err := s.validateJail(proj, name, j.Spec); err != nil {
+		return api.Operation{}, err
+	}
+	if err := api.ValidLabels(j.Metadata.Labels); err != nil {
 		return api.Operation{}, err
 	}
 	key, err := validate.QualifiedName(proj, name)
@@ -355,6 +364,15 @@ func (s *Service) CreateJailWith(ctx context.Context, in api.JailCreate) (api.Op
 	if err := s.validateJail(proj, name, spec); err != nil {
 		return api.Operation{}, err
 	}
+	if err := canonicalJailSizes(&spec); err != nil {
+		return api.Operation{}, err
+	}
+	if err := s.checkNewJail(proj, name, spec); err != nil {
+		return api.Operation{}, err
+	}
+	if spec.Volumes, err = s.checkAttachments(proj, key, spec.Volumes); err != nil {
+		return api.Operation{}, err
+	}
 	spec.OS = im.Spec.OS
 	if spec.Layout == "" {
 		spec.Layout = api.LayoutThin
@@ -362,6 +380,11 @@ func (s *Service) CreateJailWith(ctx context.Context, in api.JailCreate) (api.Op
 			spec.Layout = api.LayoutThick
 		}
 	}
+	if spec.OS == api.OSLinux && spec.Prompt != "" {
+		return api.Operation{}, invalid("the prompt key is for FreeBSD jails; a Linux jail keeps the prompt of its distribution")
+	}
+	profs, _ := s.resolveProfiles(proj, spec.Profiles)
+	shellSetup := s.shellDefaults(&spec, profs)
 	if spec.Hostname == "" {
 		spec.Hostname = name
 	}
@@ -393,10 +416,12 @@ func (s *Service) CreateJailWith(ctx context.Context, in api.JailCreate) (api.Op
 			if err := h.Bind("create/"+key, &opRequest{Kind: "create", Jail: key, Create: &nj}); err != nil {
 				return nil, err
 			}
-			_, err := s.life.CreateJailKeyed(ctx, nj, false, pass)
-			wipe(pass)
-			if err != nil {
+			if _, err := s.life.CreateJail(ctx, nj, false); err != nil {
 				return nil, err
+			}
+			if shellSetup {
+				// bash and the prompt are set up at the first start, when the root is mounted
+				s.setShellMark(key, shellMark{Pending: true})
 			}
 			if err := s.refreshJail(ctx, key); err != nil {
 				return nil, err
@@ -409,8 +434,6 @@ func (s *Service) CreateJailWith(ctx context.Context, in api.JailCreate) (api.Op
 	})
 	if err == nil {
 		submitted = true
-	} else {
-		wipe(pass)
 	}
 	return op, err
 }
@@ -464,7 +487,7 @@ func (s *Service) updateLocked(ctx context.Context, p project, key, name string,
 
 func (s *Service) updateJail(ctx context.Context, p project, key, name string, in api.Jail, expect int64, locked bool) (api.Jail, error) {
 	if in.Metadata.Name != "" && in.Metadata.Name != name {
-		return api.Jail{}, invalid("renaming is not supported")
+		return api.Jail{}, renameByAction("jail", "jails")
 	}
 	if err := bodyProject(p.Meta.Name, in.Metadata.Project); err != nil {
 		return api.Jail{}, err
@@ -475,6 +498,7 @@ func (s *Service) updateJail(ctx context.Context, p project, key, name string, i
 	}
 	spec := in.Spec
 	spec.Network = append([]api.NetworkAttach(nil), spec.Network...)
+	spec.Shell = api.ShellPath(spec.Shell) // the names bash and sh
 	if spec.OS == "" {
 		spec.OS = old.Spec.OS
 	}
@@ -490,6 +514,9 @@ func (s *Service) updateJail(ctx context.Context, p project, key, name string, i
 	if err := s.validateJail(p.Meta.Name, name, spec); err != nil {
 		return api.Jail{}, err
 	}
+	if err := canonicalJailSizes(&spec); err != nil {
+		return api.Jail{}, err
+	}
 	oref, _ := validate.ParseImageRef(old.Spec.Image)
 	nref, _ := validate.ParseImageRef(spec.Image)
 	switch {
@@ -501,13 +528,13 @@ func (s *Service) updateJail(ctx context.Context, p project, key, name string, i
 		return api.Jail{}, invalid("encryption cannot change")
 	case spec.Storage != old.Spec.Storage:
 		return api.Jail{}, invalid("the storage of a jail cannot change").WithHint("copy the jail to move it")
-	}
-	if v, changed := encryptionChanged(spec.Volumes, old.Spec.Volumes); changed {
-		return api.Jail{}, invalid("the encryption of volume %q cannot change", v).
-			WithHint("a volume is encrypted when it is created: create a new jail with --volume NAME:MOUNT:encrypted and copy the data into it")
+	case spec.OS == api.OSLinux && spec.Prompt != "":
+		return api.Jail{}, invalid("the prompt key is for FreeBSD jails; a Linux jail keeps the prompt of its distribution")
 	}
 	if !volumesEqual(spec.Volumes, old.Spec.Volumes) {
-		return api.Jail{}, api.Errorf(api.CodeUnsupported, "changing volumes of an existing jail is not implemented")
+		if spec.Volumes, err = s.attachmentsChanged(ctx, p.Meta.Name, key, spec.Volumes); err != nil {
+			return api.Jail{}, err
+		}
 	}
 	oldSpec := old.Spec
 	if _, err := s.admit(ctx, p, key, &spec, &oldSpec); err != nil {
@@ -551,6 +578,21 @@ func (s *Service) updateJail(ctx context.Context, p project, key, name string, i
 	if jsonEq(spec, old.Spec) && labelsEqual(in.Metadata.Labels, old.Metadata.Labels) && mb == old.Metadata.ManagedBy {
 		return s.getByKey(ctx, key)
 	}
+	if !labelsEqual(in.Metadata.Labels, old.Metadata.Labels) {
+		if err := api.ValidLabels(in.Metadata.Labels); err != nil {
+			return api.Jail{}, err
+		}
+	}
+	if err := s.applyDiskLimits(ctx, key, old.Spec, spec); err != nil {
+		return api.Jail{}, err
+	}
+	if spec.Delegate != old.Spec.Delegate {
+		// the dataset is made and given the jailed property (or the property cleared) in the request of the global
+		// administrator who changed it; the jail attaches it at its next start
+		if err := s.life.SetDelegation(ctx, key, spec.Delegate); err != nil {
+			return api.Jail{}, err
+		}
+	}
 	nj := old
 	nj.Spec, nj.Status = spec, api.JailStatus{}
 	nj.Metadata.Labels, nj.Metadata.ManagedBy = in.Metadata.Labels, mb
@@ -565,26 +607,13 @@ func (s *Service) updateJail(ctx context.Context, p project, key, name string, i
 		e.jail = nj
 	}
 	s.mu.Unlock()
+	s.promptChanged(ctx, key, old, nj)
 	s.emitIn(ctx, p.Meta.Name, "jail-updated", "/api/v1/jails/"+name)
 	s.kick()
 	return s.getByKey(ctx, key)
 }
 
-// encryptionChanged names a volume whose encryption a new spec changes.
-func encryptionChanged(spec, old []api.VolumeMount) (string, bool) {
-	was := map[string]bool{}
-	for _, v := range old {
-		was[v.Name] = v.Encrypted
-	}
-	for _, v := range spec {
-		if e, ok := was[v.Name]; ok && e != v.Encrypted {
-			return v.Name, true
-		}
-	}
-	return "", false
-}
-
-func volumesEqual(a, b []api.VolumeMount) bool {
+func volumesEqual(a, b []api.VolumeAttach) bool {
 	return jsonEq(a, b) || (len(a) == 0 && len(b) == 0)
 }
 
@@ -627,6 +656,12 @@ func (s *Service) DeleteJail(ctx context.Context, name string) (api.Operation, e
 	}
 	if j.Status.Power == api.PowerRunning {
 		return api.Operation{}, api.Errorf(api.CodeBusy, "jail %q is running", name).WithHint("stop it first")
+	}
+	if err := s.noRuleNamesJail(p.Meta.Name, name, true); err != nil {
+		return api.Operation{}, err
+	}
+	if err := s.backupRunning("jail", name, j.Metadata.UUID); err != nil {
+		return api.Operation{}, err
 	}
 	return s.Submit(ctx, OpSpec{
 		Description: "Delete jail " + name, Locks: []string{jailLock(key), anchorLock(key)}, Project: p.Meta.Name,
@@ -691,6 +726,7 @@ func (s *Service) JailAction(ctx context.Context, name string, a api.JailAction)
 			}
 			if a.Action != "stop" {
 				_ = h.Bind("start/"+key, &opRequest{Kind: "start", Jail: key})
+				_ = h.Timed("bash-from-the-host", func() error { s.installBashBeforeFirstStart(ctx, key); return nil })
 				if err := s.life.StartJail(ctx, key); err != nil {
 					if api.IsCode(err, api.CodeLocked) {
 						s.observeLocked(ctx, key)
@@ -699,8 +735,10 @@ func (s *Service) JailAction(ctx context.Context, name string, a api.JailAction)
 				}
 				s.setLocked(key, nil)
 				s.markStartDue(key, false)
+				// A new jail gets its shell and prompt at its first start, before its own provisioning.
+				_ = h.Timed("shell-setup", func() error { s.shellAtStart(ctx, key); return nil })
 				// A jail that declares provisioning is provisioned at its first start.
-				if err := s.provisionPending(ctx, key); err != nil {
+				if err := h.Timed("provisioning", func() error { return s.provisionPending(ctx, key) }); err != nil {
 					s.kick()
 					return nil, err
 				}
@@ -721,6 +759,7 @@ func (s *Service) StartJail(ctx context.Context, key string) error {
 	}
 	defer unlock()
 	project, name := validate.SplitQualified(key)
+	s.installBashBeforeFirstStart(ctx, key)
 	err = s.life.StartJail(ctx, key)
 	if api.IsCode(err, api.CodeLocked) {
 		// Skipped, not failed: the unlock starts it (volkeys.go).
@@ -730,6 +769,7 @@ func (s *Service) StartJail(ctx context.Context, key string) error {
 	}
 	if err == nil {
 		s.setLocked(key, nil)
+		s.shellAtStart(ctx, key)
 	}
 	res := "ok"
 	if err != nil {
@@ -785,6 +825,7 @@ func (s *Service) snapToAPI(ctx context.Context, project, key string, r lifecycl
 		Spec:     api.JailSnapshotSpec{Jail: jail},
 		Status:   api.JailSnapshotStatus{Written: r.TotalWritten},
 	}
+	sn.Metadata.CreatedAt = r.Created
 	if c, err := s.d.ZFS.Get(ctx, s.lcfg.ContainerDS(key)+"@"+r.Name, lifecycle.PropComment); err == nil {
 		sn.Spec.Comment = c
 	}
@@ -837,9 +878,15 @@ func (s *Service) CreateSnapshot(ctx context.Context, jail string, req api.JailS
 	if _, err := s.getByKey(ctx, key); err != nil {
 		return api.Operation{}, err
 	}
+	if err := api.ValidFreeText("comment", req.Spec.Comment, false); err != nil {
+		return api.Operation{}, err
+	}
 	name := req.Metadata.Name
 	if name != "" {
-		if err := ValidObjectName(name); err != nil {
+		if err := validate.SnapshotName("name", name); err != nil {
+			return api.Operation{}, err
+		}
+		if err := s.checkSnapshotBudget(key, name); err != nil {
 			return api.Operation{}, err
 		}
 		if _, err := s.GetSnapshot(ctx, jail, name); err == nil {
@@ -1046,6 +1093,9 @@ func (s *Service) CopyJail(ctx context.Context, src string, dst api.Jail) (api.O
 	if err := bodyProject(p.Meta.Name, dst.Metadata.Project); err != nil {
 		return api.Operation{}, err
 	}
+	if err := api.ValidLabels(dst.Metadata.Labels); err != nil {
+		return api.Operation{}, err
+	}
 	j, err := s.jailSnapshot(srcKey)
 	if err != nil {
 		return api.Operation{}, notFound("jail", src)
@@ -1065,6 +1115,9 @@ func (s *Service) CopyJail(ctx context.Context, src string, dst api.Jail) (api.O
 		return api.Operation{}, api.Errorf(api.CodeAlreadyExists, "jail %q already exists", name)
 	}
 	cspec := j.Spec
+	// A copy attaches no volume: a volume belongs to the jails it is attached to, and two jails writing one by
+	// accident is not what a copy is for.
+	cspec.Volumes = nil
 	cspec.Network = append([]api.NetworkAttach(nil), cspec.Network...)
 	for i := range cspec.Network {
 		if cspec.Network[i].IPv4 != "none" && cspec.Network[i].IPv4 != "" {
@@ -1076,6 +1129,10 @@ func (s *Service) CopyJail(ctx context.Context, src string, dst api.Jail) (api.O
 	}
 	release, err := s.admit(ctx, p, key, &cspec, nil)
 	if err != nil {
+		return api.Operation{}, err
+	}
+	if err := s.checkNewJail(p.Meta.Name, name, cspec); err != nil {
+		release()
 		return api.Operation{}, err
 	}
 	submitted := false

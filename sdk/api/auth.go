@@ -54,6 +54,8 @@ type Token struct {
 
 // TokenSpec describes a token.
 type TokenSpec struct {
+	// Comment is what the object is for: one line of free text.
+	Comment    string     `json:"comment,omitempty"`
 	Permission Permission `json:"permission"`
 	ExpiresAt  time.Time  `json:"expires_at,omitzero"`
 	// Remote restricts a token to a source network, optional.
@@ -72,6 +74,8 @@ type Certificate struct {
 
 // CertificateSpec pins a certificate by fingerprint.
 type CertificateSpec struct {
+	// Comment is what the object is for: one line of free text.
+	Comment     string     `json:"comment,omitempty"`
 	Fingerprint string     `json:"fingerprint"`
 	Permission  Permission `json:"permission"`
 	// Kind is "client", "host", "hub" or "backup". A "hub" certificate is
@@ -97,6 +101,8 @@ type User struct {
 
 // UserSpec describes a user. Password hashes are never serialised to clients.
 type UserSpec struct {
+	// Comment is what the object is for: one line of free text.
+	Comment    string     `json:"comment,omitempty"`
 	Permission Permission `json:"permission"`
 	Projects   []string   `json:"projects,omitempty"`
 	Global     bool       `json:"global,omitempty"`
@@ -113,6 +119,8 @@ type Remote struct {
 
 // RemoteSpec identifies a remote host.
 type RemoteSpec struct {
+	// Comment is what the object is for: one line of free text.
+	Comment     string `json:"comment,omitempty"`
 	Address     string `json:"address"`
 	Fingerprint string `json:"fingerprint"`
 	HostUUID    string `json:"host_uuid,omitempty"`

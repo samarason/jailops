@@ -144,9 +144,9 @@ func ClampSize(n *big.Int) int {
 	return int(n.Int64())
 }
 
-// Prefix length limits of IPv6 networks. The helper approves proxied prefixes between /48 and /120 only (a prefix
-// shorter than /48 would let the daemon answer for a whole site's worth of addresses); the subnet of a proxy-mode
-// network lies inside an approved prefix, so it can be anything from /48 to /126. A routed subnet is the operator's
+// Prefix length limits of IPv6 networks. The helper accepts proxied prefixes between /48 and /120 only (a prefix
+// shorter than /48 would let the daemon answer for a whole site's worth of addresses), so the subnet of a proxy-mode
+// network is between /48 and /120. A routed subnet is the operator's
 // own routed prefix, from the smallest RIR allocation (/32) down to a /126.
 const (
 	ProxyApproveMin6 = 48

@@ -5,6 +5,5 @@ metadata:
 spec:
   # Shared files apply to every host (or those in `hosts:`): the same network exists on each, and the project that
   # uses it is the only one that may.
-  bridge: jo20
   uplink: em0
   ipv4: {subnet: 10.70.0.0/24, gateway: 10.70.0.1, range: 10.70.0.10-10.70.0.250, nat: true}

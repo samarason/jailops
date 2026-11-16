@@ -18,6 +18,7 @@ import (
 	"jailops.net/jailops/internal/auth"
 	"jailops.net/jailops/internal/node"
 	"jailops.net/jailops/internal/node/ctl"
+	"jailops.net/jailops/internal/repo/format"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -32,7 +33,9 @@ type Mgmt struct {
 	ui   http.Handler
 	pp   auth.PasswordParams
 	lock *auth.Lockout
-	mux  *http.ServeMux
+	// ipLock limits the logins of one source address over all users, ten times looser than lock.
+	ipLock *auth.Lockout
+	mux    *http.ServeMux
 	// hashSem bounds the password hashes that run at once. Every login attempt, valid user or not, costs an argon2id hash
 	// (64 MiB, several passes), and the lockout only counts a failure after the hash is done: without a bound one client
 	// could start hundreds of hashes in parallel before it is locked out.
@@ -67,7 +70,7 @@ func newMgmt(s *Server, ui http.Handler, pp auth.PasswordParams) *Mgmt {
 	if err != nil {
 		panic(err) // a malformed static table is a programming error caught by tests
 	}
-	m := &Mgmt{s: s, reg: reg, ui: ui, pp: pp, lock: auth.NewLockout(auth.LockoutConfig{}), mux: http.NewServeMux(),
+	m := &Mgmt{s: s, reg: reg, ui: ui, pp: pp, lock: auth.NewLockout(auth.LockoutConfig{}), ipLock: auth.NewLockout(auth.LockoutConfig{Threshold: 50}), mux: http.NewServeMux(),
 		hashSem: make(chan struct{}, max(1, runtime.NumCPU()))}
 	var routes []string
 	h := func(method, pattern string, fn func(http.ResponseWriter, *http.Request, *identity)) {
@@ -104,6 +107,9 @@ func newMgmt(s *Server, ui http.Handler, pp auth.PasswordParams) *Mgmt {
 	h("PUT", "/api/v1/maintenance", m.setMaintenance)
 	h("GET", "/api/v1/quarantine", m.quarantine)
 	h("POST", "/api/v1/quarantine/purge", m.purgeQuarantine)
+	h("POST", "/api/v1/quarantine/{id}", m.quarantineChunk)
+	h("GET", "/api/v1/escrow", m.escrowList)
+	h("DELETE", "/api/v1/escrow/{domain}", m.deleteEscrow)
 	h("GET", "/api/v1/retention-policies", m.policies)
 	h("PUT", "/api/v1/retention-policies/{scope}", m.setPolicy)
 	h("DELETE", "/api/v1/retention-policies/{scope}", m.deletePolicy)
@@ -145,12 +151,19 @@ func (m *Mgmt) Handler() http.Handler {
 	return securityHeaders(m.mux)
 }
 
+// permissionsPolicy turns off the browser features the console does not use.
+const permissionsPolicy = "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), midi=(), " +
+	"accelerometer=(), gyroscope=(), magnetometer=(), display-capture=()"
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "same-origin")
+		// no Strict-Transport-Security: the node's certificate is self-signed and pinned by its clients, and a browser
+		// that remembered the header could no longer be told to accept it
+		h.Set("Permissions-Policy", permissionsPolicy)
 		h.Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
@@ -200,6 +213,12 @@ func (m *Mgmt) wrap(method, pattern string, fn func(http.ResponseWriter, *http.R
 	}
 }
 
+// loginKey is one limiter key of a login and the limiter that holds it.
+type loginKey struct {
+	lim *auth.Lockout
+	key string
+}
+
 func (m *Mgmt) identify(r *http.Request) (*identity, error) {
 	ctx := r.Context()
 	if h := r.Header.Get("Authorization"); h != "" {
@@ -207,13 +226,14 @@ func (m *Mgmt) identify(r *http.Request) (*identity, error) {
 		if !ok || !auth.TokenWellFormed(tok) {
 			return nil, api.Errorf(api.CodeUnauthorized, "malformed bearer token")
 		}
-		tokKey := "tok|" + remoteAddr(r).String()
-		if err := m.lock.Check(tokKey); err != nil {
-			return nil, api.Errorf(api.CodeRateLimited, "too many failed attempts")
-		}
+		// failures are counted per source (an IPv6 source is its /64); a token is not guessable, so a valid one is never
+		// refused for what others at the same address tried
+		tokKey := "tok|" + auth.SourceKey(remoteAddr(r).String())
 		t, err := m.s.DB.TokenByHash(ctx, auth.HashToken(tok))
 		if err != nil {
-			_ = m.lock.Fail(tokKey)
+			if lerr := m.lock.Fail(tokKey); lerr != nil {
+				return nil, api.Errorf(api.CodeRateLimited, "too many failed attempts")
+			}
 			return nil, api.Errorf(api.CodeUnauthorized, "unknown token")
 		}
 		var exp time.Time
@@ -311,10 +331,10 @@ func (m *Mgmt) login(w http.ResponseWriter, r *http.Request, _ *identity) {
 	}
 	// Two keys: the pair (one user from one place) and the source (a spray over many names). A key for the user
 	// from anywhere would let a stranger lock the administrator out.
-	ip := remoteAddr(r).String()
-	keys := []string{strings.ToLower(req.Username) + "|" + ip, "ip|" + ip}
-	for _, key := range keys {
-		if err := m.lock.Check(key); err != nil {
+	ip := auth.SourceKey(remoteAddr(r).String()) // an IPv6 source is its /64
+	keys := []loginKey{{m.lock, strings.ToLower(req.Username) + "|" + ip}, {m.ipLock, "ip|" + ip}}
+	for _, k := range keys {
+		if err := k.lim.Check(k.key); err != nil {
 			var le *auth.LockedError
 			if errors.As(err, &le) {
 				w.Header().Set("Retry-After", le.RetryAfterSeconds())
@@ -336,15 +356,15 @@ func (m *Mgmt) login(w http.ResponseWriter, r *http.Request, _ *identity) {
 	}
 	release()
 	if !valid {
-		for _, key := range keys {
-			_ = m.lock.Fail(key)
+		for _, k := range keys {
+			_ = k.lim.Fail(k.key)
 		}
 		_ = m.s.DB.Audit(r.Context(), "anonymous", "auth.login.failed", req.Username, nil, r.RemoteAddr)
 		writeError(w, api.Errorf(api.CodeUnauthorized, "wrong user name or password"))
 		return
 	}
-	for _, key := range keys {
-		m.lock.Success(key)
+	for _, k := range keys {
+		k.lim.Success(k.key)
 	}
 	sid, hash, err := auth.NewSessionID()
 	if err == nil {
@@ -462,8 +482,8 @@ type HostBody struct {
 
 // EnrollHost validates and stores a host. It is shared by the CLI and the API.
 func EnrollHost(ctx context.Context, db *ctl.DB, b HostBody) (ctl.Host, error) {
-	if b.Name == "" || len(b.Name) > 128 {
-		return ctl.Host{}, api.Errorf(api.CodeInvalid, "a host needs a name of up to 128 characters")
+	if !api.IsName(b.Name, api.MaxName) {
+		return ctl.Host{}, api.Errorf(api.CodeInvalid, "a host needs a name: lower case letters, digits and hyphens, starting with a letter, at most %d characters", api.MaxName)
 	}
 	fp := b.Fingerprint
 	if fp == "" && b.Certificate != "" {
@@ -841,6 +861,37 @@ func (m *Mgmt) purgeQuarantine(w http.ResponseWriter, r *http.Request, id *ident
 	writeJSON(w, 200, map[string]int{"removed": c})
 }
 
+func (m *Mgmt) quarantineChunk(w http.ResponseWriter, r *http.Request, id *identity) {
+	cid, err := format.ParseID(r.PathValue("id"))
+	if err != nil {
+		writeError(w, api.Errorf(api.CodeInvalid, "malformed chunk id"))
+		return
+	}
+	moved, err := m.s.Node.QuarantineChunk(r.Context(), cid, id.User, r.RemoteAddr)
+	if err != nil {
+		writeError(w, apiErr(err))
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"moved": moved})
+}
+
+func (m *Mgmt) escrowList(w http.ResponseWriter, r *http.Request, id *identity) {
+	d, err := m.s.Node.ListEscrow(r.Context())
+	if err != nil {
+		writeError(w, apiErr(err))
+		return
+	}
+	writeJSON(w, 200, map[string][]string{"domains": d})
+}
+
+func (m *Mgmt) deleteEscrow(w http.ResponseWriter, r *http.Request, id *identity) {
+	if err := m.s.Node.DeleteEscrow(r.Context(), r.PathValue("domain"), id.User, r.RemoteAddr); err != nil {
+		writeError(w, apiErr(err))
+		return
+	}
+	writeJSON(w, 200, nil)
+}
+
 func (m *Mgmt) policies(w http.ResponseWriter, r *http.Request, id *identity) {
 	p, err := m.s.DB.RetentionPolicies(r.Context())
 	if err != nil {
@@ -916,6 +967,9 @@ func (m *Mgmt) userList(w http.ResponseWriter, r *http.Request, id *identity) {
 
 // CreateUser adds a user with a checked password. It is shared by the CLI and the API.
 func CreateUser(ctx context.Context, db *ctl.DB, name, password, role string, pp auth.PasswordParams) error {
+	if !api.IsName(name, api.MaxName) {
+		return api.Errorf(api.CodeInvalid, "a user needs a name: lower case letters, digits and hyphens, starting with a letter, at most %d characters", api.MaxName)
+	}
 	if !validRole(role) {
 		return api.Errorf(api.CodeInvalid, "role must be readonly, backup-admin or admin")
 	}
@@ -1044,8 +1098,8 @@ func (m *Mgmt) tokenCreate(w http.ResponseWriter, r *http.Request, id *identity)
 		writeError(w, err)
 		return
 	}
-	if b.Name == "" || len(b.Name) > 128 || !validRole(b.Role) {
-		writeError(w, api.Errorf(api.CodeInvalid, "a token needs a name and a role (readonly, backup-admin or admin)"))
+	if !api.IsName(b.Name, api.MaxName) || !validRole(b.Role) {
+		writeError(w, api.Errorf(api.CodeInvalid, "a token needs a name (lower case letters, digits and hyphens, starting with a letter) and a role (readonly, backup-admin or admin)"))
 		return
 	}
 	if err := auth.ValidateAllowFrom(b.AllowFrom); err != nil {

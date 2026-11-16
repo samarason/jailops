@@ -7,7 +7,7 @@ is needed to use JailOps on one host: the default is the local socket and nothin
 
 | Listener | Default | What it is |
 |---|---|---|
-| unix socket `listen.unix.path` | `/var/run/jailops/jailops.sock`, mode `0666` | the local API, one identity system with the TLS listener. The only thing the **peer's uid** decides is root (uid 0): a global admin, the host's recovery access. Every other local user is anonymous, exactly like an unauthenticated remote client (it reaches `GET /api/v1`, `GET /healthz`, the login, trust-token redemption, `POST /api/v1/cluster/join` (501) and the static console, nothing else) and signs in with a token or a password login. No Unix user or group maps to a role. Mode `0666` is safe for that reason |
+| unix socket `listen.unix.path` | `/var/run/jailops/jailops.sock`, mode `0666` | the local API, one identity system with the TLS listener. The only thing the **peer's uid** decides is root (uid 0): a global admin, the host's recovery access. Every other local user is anonymous, exactly like an unauthenticated remote client (it reaches `GET /api/v1`, `GET /healthz`, `GET /readyz`, the login, trust-token redemption, `POST /api/v1/cluster/join` (501) and the static console, nothing else) and signs in with a token or a password login. No Unix user or group maps to a role. Mode `0666` is safe for that reason |
 | TCP `listen.https.address` | **empty: no network listener** | the same API over **TLS 1.3 only**, plus the web console |
 | TCP `listen.https.acme.challenge_address` | `:39080`, **only while ACME with http-01 is the source** | plain http that answers `/.well-known/acme-challenge/<token>` for the tokens of a running order, and 404 to everything else: no API, no console. The host redirects port 80 to it (below) |
 
@@ -31,7 +31,7 @@ package, and it is **off by default**: the daemon and `jailops-sync` do not use 
       web:
         enabled: true
 
-  Without it (the default, or `enabled: false`) every path outside `/api/v1` and `/healthz` answers 404 and the API is unchanged.
+  Without it (the default, or `enabled: false`) every path outside `/api/v1`, `/healthz` and `/readyz` answers 404 and the API is unchanged.
 - **From rc.conf**: `sysrc jailopsd_web="YES"` (then `service jailopsd restart`) starts the daemon with `-web`, whatever
   `web.enabled` says, and opens the TLS listener on port 39110 when `listen.https.address` is empty, because asking for the
   console is asking to see it in a browser. `jailopsd_web="NO"` forces it off over the configuration. Unset, the configuration decides.
@@ -52,16 +52,18 @@ ports are listed in [ports.md](ports.md).
 |---|---|---|
 | **Self-signed, pinned** (default) | nothing | on first start `jailopsd` generates an ECDSA P-256 certificate valid for **ten years**, with the host name and the entries of `listen.https.names` as names, into `<data_dir>/tls/server.{crt,key}` (key mode 0600). Clients **pin its SHA-256 fingerprint** (there is no trust on first use: a trust token carries it). It is not rotated by expiry |
 | **Your certificate** | `listen.https.cert` and `listen.https.key`, absolute paths, both or neither | served as given (a file with the chain is fine). If a file is missing or only one of the two exists the daemon **refuses to start**: it never generates or overwrites a certificate you configured. The console cannot replace these files |
-| **Uploaded** | the console's Host page (Certificates, Upload) or `PUT /api/v1/host/certificate` (global admin) | a PEM chain (leaf first) and its PEM key, checked before anything is written: every certificate parses and is signed by the next, the key belongs to the leaf and is not encrypted, the leaf is valid now, for server authentication, and for the host name you give. Written by the daemon to `<data_dir>/tls/uploaded.{crt,key}` (0600, each to a temporary file that is synced and renamed) and served from the next handshake on; replacing those two files by hand is picked up like a renewal. Nothing renews it: the doctor warns 14 days before it expires |
-| **ACME** | `listen.https.acme` in `jailopsd.yaml`, or the console (Request with ACME) / `POST /api/v1/host/certificate/acme` | the daemon obtains a certificate for your DNS names from a CA (Let's Encrypt production by default) and renews it, below |
+| **Uploaded** | the console's Host page (Certificates, Upload) or `jailops host certificate upload --cert FILE --key FILE` (`PUT /api/v1/host/certificate`, global admin) | a PEM chain (leaf first) and its PEM key, checked before anything is written: every certificate parses and is signed by the next, the key belongs to the leaf and is not encrypted, the leaf is valid now, for server authentication, and for the host name you give. Written by the daemon to `<data_dir>/tls/uploaded.{crt,key}` (0600, each to a temporary file that is synced and renamed) and served from the next handshake on; replacing those two files by hand is picked up like a renewal. Nothing renews it: the doctor warns 14 days before it expires |
+| **ACME** | `listen.https.acme` in `jailopsd.yaml`, or the console (Request with ACME) / `jailops host certificate acme` (`POST /api/v1/host/certificate/acme`) | the daemon obtains a certificate for your DNS names from a CA (Let's Encrypt production by default) and renews it, below |
 
-Going back: **Use self-signed again** in the console (`POST /api/v1/host/certificate/self-signed`) serves the generated
-certificate once more; browsers warn again and clients have to pin it. A choice made in the console or the API is kept in
+Going back: **Use self-signed again** in the console, or `jailops host certificate self-signed` (it asks you to type the
+name of the certificate it replaces; `--confirm-replace` for a script), serves the generated certificate once more; browsers warn again and clients have to pin it. A choice made in the console or the API is kept in
 `<data_dir>/tls/choice.json` and wins over `listen.https.acme` of the file (delete it and restart to let the file decide
 again); `listen.https.cert`/`key` win over both. Whatever is served, the generated pair stays the daemon's own identity,
 the client certificate a hub presents to its hosts.
 
-The fingerprint is in the start log line (`jailopsd started ... fingerprint=`) and can be read from the file:
+`jailops host certificate show` prints what is served: subject, names, issuer, expiry, fingerprint, where it comes from,
+the state of ACME, and the exact `jailops remote add` command for clients. The fingerprint is also in the start log line
+(`jailopsd started ... fingerprint=`) and can be read from the file:
 
     openssl x509 -in /var/db/jailops/tls/server.crt -noout -fingerprint -sha256
 
@@ -73,7 +75,7 @@ file must be readable by the daemon's user (`jailops`): for example `chown root:
 **Pinning and renewal do not mix.** A client pins the leaf certificate's fingerprint, so a certificate that renews every 60 to 90
 days breaks every pin. With a certificate a public CA signed, **do not pin**: leave `fingerprint` out of `jailops remote add`
 (the client trusts a certificate the system roots verify, and pins only when none does) and out of `host.yaml` of a fleet. The
-console's Host page shows the right command (`remote_add` of `GET /api/v1/host/certificate`): without a fingerprint when the
+console's Host page and `jailops host certificate show` show the right command (`remote_add` of `GET /api/v1/host/certificate`): without a fingerprint when the
 served chain verifies against the host's trusted roots, with it otherwise. With the self-signed default, replacing the
 certificate by hand (remove the two files, restart) changes the fingerprint and every client has to pin the new one. A trust
 token carries the fingerprint of the certificate served when it is issued, so it pins a renewed ACME certificate too: with a
@@ -97,19 +99,19 @@ The daemon is its own ACME client (RFC 8555). It needs:
 
 **The redirect.** With the host firewall module of [appliance.md](appliance.md) managing `/etc/pf.conf`, the daemon adds the
 redirect to the firewall's spec while ACME is the source (`acme` of `GET /api/v1/host/firewall`, filled in by the daemon;
-what a client sends is replaced), and the helper renders it, after the jails' translation anchors (a jail that forwards the
+what a client sends is replaced), and the helper renders it, after the jails' anchor (a jail that forwards the
 same port wins), with a pass rule for the redirected port:
 
-    rdr inet proto tcp from any to (self) port 80 -> 127.0.0.1 port 39080
-    rdr inet6 proto tcp from any to (self) port 80 -> ::1 port 39080
+    match in inet proto tcp from any to (self) port 80 rdr-to 127.0.0.1 port 39080
+    match in inet6 proto tcp from any to (self) port 80 rdr-to ::1 port 39080
     pass in proto tcp from any to { 127.0.0.1, ::1 } port 39080
 
 Apply the host firewall once after turning ACME on (the change waits for its confirmation like every firewall change);
 the certificate's status says `redirect.applied` and `jailops doctor` warns until then. Without the module JailOps never
-edits `pf.conf`: the status and the console print the two lines to add to its translation section, here for http-01:
+edits `pf.conf`: the status and the console print the two lines to add to it, after the line `anchor "jailops/*"`, here for http-01:
 
-    rdr pass inet proto tcp from any to (self) port 80 -> 127.0.0.1 port 39080
-    rdr pass inet6 proto tcp from any to (self) port 80 -> ::1 port 39080
+    pass in quick inet proto tcp from any to (self) port 80 rdr-to 127.0.0.1 port 39080
+    pass in quick inet6 proto tcp from any to (self) port 80 rdr-to ::1 port 39080
 
 The redirect targets the loopback addresses, so the challenge listener (and, with tls-alpn-01, the TLS listener) must
 listen on all addresses or on a loopback address; the configuration is refused otherwise. UNVERIFIED: these rules have
@@ -141,16 +143,15 @@ restart that serves the cached certificate, a refused validation with its backof
 limits, ports 80 and 443 behind pf. **UNVERIFIED: issuance by a real CA.** A person verifies it once against the staging
 directory, on a host whose DNS name points at it and whose port 80 reaches it:
 
-    # as root on the host, through the daemon's socket
-    curl -s --unix-socket /var/run/jailops/jailops.sock -H 'Content-Type: application/json' \
-      -d '{"domains":["console.example.com"],"directory_url":"https://acme-staging-v02.api.letsencrypt.org/directory","accept_tos":true}' \
-      http://jailops.local/api/v1/host/certificate/acme
-    curl -s --unix-socket /var/run/jailops/jailops.sock http://jailops.local/api/v1/host/certificate    # until "state":"valid"
+    # as root on the host
+    jailops host certificate acme --domain console.example.com --accept-tos --staging
+    jailops host certificate show                    # until the ACME state is valid
     openssl s_client -connect console.example.com:39110 -servername console.example.com </dev/null 2>/dev/null | openssl x509 -noout -issuer -dates
-    jailops doctor                                                                                         # tls.acme ok
+    jailops doctor                                   # tls.acme ok
 
-The issuer is the CA's staging intermediate. Then switch to production (the same request without `directory_url`) or back
-with `POST /api/v1/host/certificate/self-signed`.
+The issuer is the CA's staging intermediate. Then switch to production (the same command without `--staging`) or back
+with `jailops host certificate self-signed`. The same through the API, without the client (as root, on the socket):
+`curl -s --unix-socket /var/run/jailops/jailops.sock -H 'Content-Type: application/json' -d '{"domains":["console.example.com"],"directory_url":"https://acme-staging-v02.api.letsencrypt.org/directory","accept_tos":true}' http://jailops.local/api/v1/host/certificate/acme`.
 
 ## How a caller proves who it is
 
@@ -158,10 +159,10 @@ All of these work on the TLS listener at the same time; a credential that is pre
 
 1. **A pinned client certificate** (mTLS). The listener *requests* a client certificate; it never requires one. A presented
    certificate must be within its validity and be a client certificate, and is then looked up **by fingerprint** in the trust store
-   (`jailops cert add`, or the join flow below). It has a role and a scope (a project list or `global`; an empty list is never
+   (`jailops cert create`, or the join flow below). It has a role and a scope (a project list or `global`; an empty list is never
    "everything") and an optional expiry. An unknown certificate with no other credential is answered `unauthorized`.
 2. **An API token** in `Authorization: Bearer`: one role, a scope, `--expires` and `--allow-from` (source networks).
-   `jailops token create ci --permission operator --projects web --expires 720h --allow-from 203.0.113.0/24`. The secret is shown once.
+   `jailops token create ci --role operator --projects web --expires 720h --allow-from 203.0.113.0/24`. The secret is shown once.
 3. **A user and password** (optionally TOTP) for the web console, which gets a session cookie (`Secure` when the connection is TLS,
    `SameSite=Strict`) and a CSRF token; mutations also check the `Origin` against the `Host` header.
 
@@ -169,14 +170,21 @@ The same three work over the unix socket (a client certificate needs TLS, so the
 needs none of them: uid 0 on the socket is a global admin. See [security-model.md](security-model.md).
 
 Failed authentications from one source (a bad token, an untrusted certificate, a forged claim) are rate limited per source
-(`limits.auth_failure_threshold`, default 5) and audited. Creating networks, images, storage and projects needs a **global admin**
+(`limits.auth_failure_threshold`, default 5) and audited; while a source is locked out its valid tokens are refused as well.
+Logins are counted the same way, per user and source and per source, before the password is checked. A source is an
+IPv4 address or an IPv6 /64. Guesses for one account from many sources are slowed down (after 10 failures each attempt
+waits 1 s, 2 s, 4 s ... up to 30 s), never locked, so nobody can lock a real user out. At most four password checks run at
+once; the details are in [security-model.md](security-model.md#signing-in-and-what-an-unauthenticated-caller-costs). Creating networks, images, storage and projects needs a **global admin**
 identity, so the identity of `jailops-sync` is one.
 
 Join flow for a person or a machine, pinned in both directions:
 
-    jailops trust add --name laptop --role admin --global --ttl 15m --cert-expires 2160h   # on the host: prints a single-use token
-    jailops remote add myhost https://host.example.org:39110 --token-stdin                  # on the client: paste the token
+    jailops cert enroll laptop --role admin --global --expires 15m --cert-expires 2160h   # on the host: prints a single-use token
+    jailops remote add myhost host.example.org --token-file -                         # on the client: paste the token
 
+The client side is the one-argument form of `remote add`: the server's address (port 39110 unless given), the trust token
+on standard input. It pins the fingerprint the token carries, makes a key pair and is trusted with the token's role and
+scope. The two-argument form, `remote add NAME URL`, is for an API token and refuses a trust token.
 ## Recipe 1: local only (the default)
 
 Do nothing: leave `listen.https.address` empty. To administer from your laptop without opening a port, forward the socket over ssh:
@@ -221,7 +229,8 @@ What changes behind a proxy, all of it following from the code:
   console login). Keep tokens short-lived and scoped, and put an access control **in the proxy** (Cloudflare Access, an IP allow
   list, basic auth): that is the outer door, and the token is the inner one.
 - **The daemon sees the proxy's address**, not the caller's. The lockout counts failures per source, so one attacker behind the proxy can
-  lock the proxy's address out for everyone, and a token's `--allow-from` can only name the proxy. `X-Forwarded-For` is not
+  lock the proxy's address out for everyone (valid tokens included, for as long as the lock lasts), and a token's
+  `--allow-from` can only name the proxy. `X-Forwarded-For` is not
   used. Do not rely on `--allow-from` here.
 - **`exec`, `shell` and the console** use an HTTP `Upgrade` to a JailOps protocol (`jailops-exec/1`), not a WebSocket. A proxy that passes
   only WebSocket upgrades (a CDN, for instance) will not carry them; use ssh for shells and the proxy for the API. UNVERIFIED with any
@@ -262,17 +271,41 @@ The strongest setup JailOps has today: the listener on a public or private addre
    The connection refuses a server whose certificate does not match the fingerprint. With your own CA-signed certificate leave the
    fingerprint to the system roots instead (see "Pinning and renewal").
 4. **Take the tokens and passwords away.** The listener requests a client certificate but does not require one, so a token that
-   exists works from anywhere the firewall lets in: `jailops token list` and `jailops token delete`, no `jailops user create`, and
+   exists works from anywhere the firewall lets in: `jailops token list` and `jailops token revoke`, no `jailops user create`, and
    no `token_secret` in `host.yaml`. A client that presents no certificate and no token reaches only the public routes: `GET /api/v1` (the
-   version, the extensions, and whether it is trusted), `GET /healthz`, `POST /api/v1/auth/login` (which needs a valid user and
+   version, the extensions, and whether it is trusted), `GET /healthz`, `GET /readyz`, `POST /api/v1/auth/login` (which needs a valid user and
    password), `POST /api/v1/trust/clients` (which needs a valid single-use trust token), `POST /api/v1/cluster/join` (answers 501) and the
    static console files. A non-root local user of the unix socket is exactly such a client.
-5. Revoke by deleting the identity: `jailops trust revoke NAME|FINGERPRINT`. There is no CRL; the trust store is the list.
+5. Revoke by deleting the identity: `jailops cert revoke NAME|FINGERPRINT`. There is no CRL; the trust store is the list.
 
 **UNVERIFIED on a real network:** the whole recipe end to end on a public address, a CA-signed certificate with renewal on a real host,
 `jailops-sync` over the network with a CA-signed certificate. What the repository's tests do prove, with in-process daemons: TLS 1.3 only
 and no plain http, a served and a reloaded certificate, a broken renewal ignored, a configured certificate never generated over, pinned
 client certificates and the join flow, the web console switched off.
+
+## Load balancers and monitors
+
+Two routes answer without credentials, plain text, and are left out of the access log:
+
+| Route | Answers | Use it for |
+|---|---|---|
+| `GET /healthz` | `ok`, always 200 | **liveness**: the process runs and answers HTTP. It checks nothing else; restart the daemon when it stops answering |
+| `GET /readyz` | `ok` (200), or `not ready: CLASS` (503) | **readiness**: send traffic only while it is 200 |
+
+`/readyz` is 200 only when the daemon finished starting, the privileged helper answers a read-only call (whether the
+JailOps dataset exists) and the database answers a query; each check has 2 seconds. CLASS is one of `starting`,
+`stopping` (the daemon is shutting down), `helper`, `storage` (the helper answered, the dataset is missing) or `store`,
+and nothing else: no error text, no path, no version. The answer is cached for 2 seconds, so a flood of probes reaches
+the helper and the database at most once per period; a probe interval of 5 to 10 seconds is enough. Like every anonymous
+route it has no request limit of its own; a bad credential sent with it counts toward the lockout of its source, and a
+locked-out source gets 429. `?host=` is not forwarded to a hub's hosts: probe each host itself.
+
+    curl -ks -o /dev/null -w '%{http_code}\n' https://host.example.org:39110/readyz     # 200 or 503
+    curl -s --unix-socket /var/run/jailops/jailops.sock http://jailops.local/readyz     # any local user
+
+Behind a proxy, probe the daemon (`https://127.0.0.1:39110/readyz`), not the proxy. Readiness is not health: a ready
+daemon can still have a failing check (a pool that is degraded, a certificate about to expire). For those, see what to
+monitor in [operations.md](operations.md#what-to-monitor).
 
 ## Not yet
 

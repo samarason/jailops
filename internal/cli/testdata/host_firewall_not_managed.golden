@@ -27,5 +27,5 @@ then: service jailops_priv restart && service jailopsd restart
 $ jailops host firewall set --ssh-from 192.0.2.0/24
 ! not_managed: JailOps does not manage the host's firewall
 ! hint: add `host: {manage: {modules: [firewall]}}` to jailopsd.yaml and `host-manage = firewall` to priv.conf
-[exit 3]
+[exit 6]
 

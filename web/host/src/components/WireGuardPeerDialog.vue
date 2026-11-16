@@ -10,30 +10,32 @@ import ErrorPanel from '@jailops/shared/components/ErrorPanel.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
 import CopyField from '@jailops/shared/components/CopyField.vue'
 import { confFileName, splitList } from '@/lib/wireguard'
+import { useFormCheck } from '@jailops/shared/composables/form'
+import { nameHint } from '@jailops/shared/lib/names'
+import { nameError as nameRuleError } from '@/lib/nameField'
 import type { WireGuardPeerCreated } from '@jailops/shared/api/types'
 
 const props = defineProps<{ open: boolean; server: string }>()
 const emit = defineEmits<{ close: []; done: [] }>()
 const name = ref('')
 const address = ref('')
-const submitted = ref(false)
 const busy = ref(false)
 const error = ref<ApiError | null>(null)
 const created = ref<WireGuardPeerCreated | null>(null)
-const nameError = computed(() => (submitted.value && !name.value ? s.wireguard.required : name.value && !/^[a-z][a-z0-9-]{0,62}$/.test(name.value) ? 'Start with a letter; use lower-case letters, digits and dashes.' : ''))
+// a peer name follows the object rule of the server (shared lib/names.ts)
+const check = useFormCheck(() => ({ 'wgp-name': nameRuleError(name.value) }))
+const nameError = computed(() => check.err('wgp-name') || (name.value ? nameRuleError(name.value) : ''))
 
 function reset(): void {
   name.value = ''
   address.value = ''
-  submitted.value = false
+  check.reset()
   error.value = null
   created.value = null
 }
 watch(() => props.open, reset)
 
-async function save(): Promise<void> {
-  submitted.value = true
-  if (!name.value || nameError.value) return
+const save = () => check.submit(async () => {
   busy.value = true
   error.value = null
   try {
@@ -45,7 +47,7 @@ async function save(): Promise<void> {
   } finally {
     busy.value = false
   }
-}
+})
 
 function download(): void {
   if (!created.value) return
@@ -74,8 +76,9 @@ function close(): void {
     </template>
     <form v-else id="wgp" novalidate @submit.prevent="save">
       <div class="field">
-        <label for="wgp-name">{{ s.wireguard.peerName }}</label>
-        <input id="wgp-name" v-model="name" class="mono" type="text" autocomplete="off" required :aria-invalid="!!nameError" aria-describedby="wgp-name-e" />
+        <label for="wgp-name">{{ s.wireguard.peerName }} <span class="req" aria-hidden="true">*</span></label>
+        <input id="wgp-name" v-model="name" class="mono" type="text" autocomplete="off" required :aria-invalid="!!nameError" aria-describedby="wgp-name-h wgp-name-e" @input="check.touch('wgp-name')" />
+        <span id="wgp-name-h" class="hint">{{ nameHint() }}</span>
         <span id="wgp-name-e" class="field-error" role="alert">{{ nameError }}</span>
       </div>
       <div class="field">
@@ -88,8 +91,9 @@ function close(): void {
     <template #footer>
       <button v-if="created" class="btn btn-primary" type="button" data-test="wg-token-done" @click="close">{{ s.wireguard.done }}</button>
       <template v-else>
+        <span v-if="check.reason.value" class="why-disabled">{{ s.wireguard.fixFirst(s.wireguard.peerName, check.reason.value) }}</span>
         <button class="btn" type="button" @click="close">{{ s.app.cancel }}</button>
-        <button class="btn btn-primary" type="submit" form="wgp" :disabled="busy" data-test="wg-peer-go">{{ s.wireguard.addPeerGo }}</button>
+        <button class="btn btn-primary" type="submit" form="wgp" :disabled="busy" :aria-disabled="!check.ok.value" data-test="wg-peer-go">{{ s.wireguard.addPeerGo }}</button>
       </template>
     </template>
   </Modal>

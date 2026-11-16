@@ -32,16 +32,19 @@ describe('install form', () => {
   const ctx = { networks: ['lan', 'edge'], storage: ['default'], taken: ['web'] }
   const hints = { memory: '256M', disk: '2G', cpu: '1' }
   it('prefills the app name, the only grant and the hints', () => {
-    expect(initialForm('nginx', hints, ['lan', 'edge'], ['default'])).toEqual({ jail: 'nginx', network: '', storage: 'default', memory: '256M', disk: '2G', cpu: '1' })
+    expect(initialForm('nginx', hints, ['lan', 'edge'], ['default'])).toEqual({ jail: 'nginx', image: '', network: '', storage: 'default', memory: '256M', disk: '2G', cpu: '1' })
     expect(initialForm('nginx', undefined, ['lan'], []).network).toBe('lan')
   })
   it('validates like the server: names, grants, sizes and cpu', () => {
-    const ok = { jail: 'nginx', network: 'lan', storage: 'default', memory: '256M', disk: '2G', cpu: '1' }
+    const ok = { jail: 'nginx', image: '', network: 'lan', storage: 'default', memory: '256M', disk: '2G', cpu: '1' }
     expect(validateInstall(ok, ctx)).toEqual({})
     expect(validateInstall({ ...ok, jail: 'Nginx' }, ctx).jail).toBe('nameInvalid')
     expect(validateInstall({ ...ok, jail: '1web' }, ctx).jail).toBe('nameInvalid')
     expect(validateInstall({ ...ok, jail: 'web.1' }, ctx).jail).toBe('nameInvalid')
-    expect(validateInstall({ ...ok, jail: 'a'.repeat(64) }, ctx).jail).toBe('nameInvalid')
+    expect(validateInstall({ ...ok, jail: 'a'.repeat(33) }, ctx).jail).toBe('nameInvalid')
+    expect(validateInstall({ ...ok, jail: 'a'.repeat(32) }, ctx).jail).toBeUndefined()
+    expect(validateInstall({ ...ok, memory: '4GiB', disk: '512m' }, ctx)).toEqual({})
+    expect(validateInstall({ ...ok, memory: '1.5G' }, ctx).memory).toBe('sizeInvalid')
     expect(validateInstall({ ...ok, jail: 'web' }, ctx).jail).toBe('nameTaken')
     expect(validateInstall({ ...ok, network: '' }, ctx).network).toBe('needNetwork')
     expect(validateInstall({ ...ok, storage: 'fast' }, ctx).storage).toBe('needStorage')
@@ -50,8 +53,9 @@ describe('install form', () => {
     expect(validateInstall({ ...ok, network: '', storage: '' }, { networks: [], storage: [], taken: [] })).toEqual({})
   })
   it('sends limits only when they differ from the hints', () => {
-    const f = { jail: 'nginx', network: 'lan', storage: 'default', memory: '256M', disk: '2G', cpu: '1' }
+    const f = { jail: 'nginx', image: '', network: 'lan', storage: 'default', memory: '256M', disk: '2G', cpu: '1' }
     expect(installBody(f, hints)).toEqual({ jail: 'nginx', network: 'lan', storage: 'default' })
+    expect(installBody({ ...f, image: 'freebsd-15-2' }, hints)).toEqual({ jail: 'nginx', image: 'freebsd-15-2', network: 'lan', storage: 'default' })
     expect(installBody({ ...f, memory: '1G', cpu: '2' }, hints, true)).toEqual({ jail: 'nginx', network: 'lan', storage: 'default', limits: { memory: '1G', disk: '2G', cpu: 2 }, dry_run: true })
   })
   it('reads the grants of a project; "*" is every storage', () => {
@@ -98,7 +102,7 @@ describe('install steps', () => {
     expect(parsed.map((_, i) => stepState(i, parsed, 2, 'failure', 'health-check'))).toEqual(['done', 'done', 'done', 'failed', 'pending'])
     expect(parsed.map((_, i) => stepState(i, parsed, 1, 'failure'))).toEqual(['done', 'failed', 'pending', 'pending', 'pending'])
   })
-  it('names volumes after their path', () => {
+  it('names the volume of a path after the path (the jail name comes before it)', () => {
     expect(volumeName('/var/db/postgres')).toBe('var-db-postgres')
   })
 })

@@ -4,6 +4,7 @@ package pfctl
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -26,9 +27,10 @@ type Client interface {
 	// Load validates, loads in one operation, reads the anchor back and
 	// compares it with the validated rules.
 	Load(ctx context.Context, anchor, ruleset string) error
-	// Read returns the translation rules and filter rules of the anchor.
+	// Read returns the rules of the anchor: the filter rules and the translation options on them (match ... nat-to,
+	// rdr-to).
 	Read(ctx context.Context, anchor string) (string, error)
-	// Flush removes rules, translation rules and tables of the anchor.
+	// Flush removes the rules and the tables of the anchor.
 	Flush(ctx context.Context, anchor string) error
 	TableAdd(ctx context.Context, anchor, table string, addrs ...string) error
 	TableDelete(ctx context.Context, anchor, table string, addrs ...string) error
@@ -139,7 +141,7 @@ func validateRuleset(r string) error {
 	return nil
 }
 
-// ruleKeywords begin the lines that pfctl -sr and -sn print for rules.
+// ruleKeywords begin the lines that pfctl -sr prints for rules.
 var ruleKeywords = map[string]bool{
 	"pass": true, "block": true, "match": true, "nat": true, "rdr": true, "binat": true,
 	"anchor": true, "no": true, "nat-anchor": true, "rdr-anchor": true, "binat-anchor": true,
@@ -158,10 +160,31 @@ func RuleLines(out string) []string {
 		if len(f) == 0 || !ruleKeywords[f[0]] {
 			continue
 		}
-		ls = append(ls, strings.Join(f, " "))
+		ls = append(ls, adaptiveTimeouts.ReplaceAllString(strings.Join(f, " "), ""))
 	}
 	sort.Strings(ls)
 	return ls
+}
+
+// adaptiveTimeouts are the adaptive.start and adaptive.end values pf adds to a rule that has a state limit
+// ("keep state (max 10000, adaptive.start 6000, adaptive.end 12000)"). The verbose dry run prints them on FreeBSD
+// 15.1 and 15.2; the readback of the loaded rule prints them on 15.2 and leaves them out on 15.1. They are defaults
+// derived from the limit, so they are left out of both sides of a comparison.
+var adaptiveTimeouts = regexp.MustCompile(`, adaptive\.(start|end) [0-9]+`)
+
+// firstDifference names the first rule that the two sorted lists do not share, for an error message.
+func firstDifference(want, have []string) string {
+	for i := 0; i < len(want) || i < len(have); i++ {
+		switch {
+		case i >= len(want):
+			return fmt.Sprintf("read back but not expected: %q", have[i])
+		case i >= len(have):
+			return fmt.Sprintf("expected but not read back: %q", want[i])
+		case want[i] != have[i]:
+			return fmt.Sprintf("expected %q, read back %q", want[i], have[i])
+		}
+	}
+	return ""
 }
 
 func mapErr(what string, err error) error {
@@ -192,6 +215,13 @@ func NewCommand(r run.Runner) *Command { return &Command{R: r} }
 
 func (c *Command) pf(ctx context.Context, stdin string, args ...string) (run.Result, error) {
 	cmd := run.Cmd{Name: "pfctl", Args: args, Timeout: 30 * time.Second}
+	if mutates(args) {
+		unlock, err := lockPF(ctx)
+		if err != nil {
+			return run.Result{}, err
+		}
+		defer unlock()
+	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -234,7 +264,7 @@ func (c *Command) Load(ctx context.Context, anchor, ruleset string) error {
 	}
 	want, have := RuleLines(norm), RuleLines(got)
 	if strings.Join(want, "\n") != strings.Join(have, "\n") {
-		return api.Errorf(api.CodeInternal, "pf anchor %s: loaded rules differ from the validated ruleset (%d expected, %d read back)", anchor, len(want), len(have))
+		return api.Errorf(api.CodeInternal, "pf anchor %s: loaded rules differ from the validated ruleset (%d expected, %d read back): %s", anchor, len(want), len(have), firstDifference(want, have))
 	}
 	return nil
 }
@@ -244,17 +274,12 @@ func (c *Command) Read(ctx context.Context, anchor string) (string, error) {
 	if err := ValidateAnchor(anchor); err != nil {
 		return "", err
 	}
-	// Verified on FreeBSD 15.1: with "-sn -sr" in one call pfctl prints only
-	// the last listing, so the NAT and the filter rules are read separately.
-	var out strings.Builder
-	for _, what := range []string{"-sn", "-sr"} {
-		res, err := c.pf(ctx, "", "-a", anchor, what)
-		if err != nil {
-			return "", mapErr("read", err)
-		}
-		out.Write(res.Stdout)
+	// The translation options stand on match and pass rules, so -sr lists everything the anchor holds.
+	res, err := c.pf(ctx, "", "-a", anchor, "-sr")
+	if err != nil {
+		return "", mapErr("read", err)
 	}
-	return out.String(), nil
+	return string(res.Stdout), nil
 }
 
 // Flush implements Client.
@@ -266,7 +291,7 @@ func (c *Command) Flush(ctx context.Context, anchor string) error {
 	// exist any more, and flushing its tables then fails with "Operation not
 	// supported by device". Tables go first, while the anchor still exists, and
 	// that one error is the anchor being gone already.
-	for _, what := range []string{"Tables", "nat", "rules"} {
+	for _, what := range []string{"Tables", "rules"} {
 		_, err := c.pf(ctx, "", "-a", anchor, "-F", what)
 		if err != nil {
 			if ee, ok := run.IsExit(err); ok && what == "Tables" && strings.Contains(strings.ToLower(ee.Stderr), "not supported by device") {

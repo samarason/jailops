@@ -135,11 +135,17 @@ func dangers(kind api.Kind, live, want any) []string {
 		if l.Encrypted && !w.Encrypted {
 			out = append(out, "jail encryption would be turned off")
 		}
-		if l.Firewall.Policy != "" && w.Firewall.Policy == "" {
-			out = append(out, fmt.Sprintf("firewall policy %q would be detached", l.Firewall.Policy))
+		for _, pn := range l.Firewall.Policies {
+			if !slices.Contains(w.Firewall.Policies, pn) {
+				out = append(out, fmt.Sprintf("firewall policy %q would be detached", pn))
+			}
 		}
 		if li, wi := imageBase(l.Image), imageBase(w.Image); li != "" && wi != li {
 			out = append(out, fmt.Sprintf("image changes from %q to %q (a different base; use a rollout to move between generations)", li, wi))
+		}
+	case api.KindVolume:
+		if del {
+			return []string{"deleting a volume destroys its files and its snapshots"}
 		}
 	case api.KindFirewallPolicy:
 		l := live.(api.FirewallPolicySpec)
@@ -159,7 +165,7 @@ func dangers(kind api.Kind, live, want any) []string {
 			return []string{"deleting an address set silently empties every rule that references it"}
 		}
 		w := want.(api.AddressSetSpec)
-		if len(l.Addresses)+len(l.Includes) > 0 && len(w.Addresses)+len(w.Includes) == 0 {
+		if len(l.Addresses) > 0 && len(w.Addresses) == 0 {
 			out = append(out, "address set would become empty")
 		}
 	case api.KindNetwork:
@@ -197,8 +203,10 @@ func dangers(kind api.Kind, live, want any) []string {
 			return []string{"deleting a project removes its grants and quotas"}
 		}
 		w := want.(api.ProjectSpec)
-		if l.Firewall != "" && w.Firewall == "" {
-			out = append(out, fmt.Sprintf("the mandatory firewall policy %q would be removed", l.Firewall))
+		for _, pn := range l.FirewallPolicies {
+			if !slices.Contains(w.FirewallPolicies, pn) {
+				out = append(out, fmt.Sprintf("the mandatory firewall policy %q would be removed", pn))
+			}
 		}
 		for _, g := range l.Networks {
 			if !hasNetworkGrant(w, g.Network) {

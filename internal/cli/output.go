@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -109,7 +110,11 @@ func (a *app) emitList(v any, style styleFn, table func() ([]string, [][]string)
 		}
 		h, rows := table()
 		if len(rows) == 0 {
-			fprintln(a.env.Stderr, "No resources found.")
+			msg := "No resources found."
+			if a.empty != "" {
+				msg = a.empty
+			}
+			fprintln(a.env.Stderr, msg)
 			return nil
 		}
 		if a.pretty() {
@@ -130,6 +135,11 @@ func (a *app) printBoxed(w io.Writer, head []string, rows [][]string, style styl
 	for i := range rows {
 		for len(rows[i]) < len(head) {
 			rows[i] = append(rows[i], "")
+		}
+	}
+	for _, r := range rows {
+		for i, c := range r {
+			r[i] = termText(c, true)
 		}
 	}
 	lines := func(cell string) []string { return strings.Split(cell, "\n") }
@@ -210,7 +220,7 @@ func (a *app) printBoxed(w io.Writer, head []string, rows [][]string, style styl
 				}
 				b.WriteString(" " + text + strings.Repeat(" ", pad) + " │")
 			}
-			fprintln(w, b.String())
+			fprintln(w, colored(b.String()))
 		}
 	}
 	rule("┌", "┬", "┐")
@@ -224,6 +234,11 @@ func (a *app) printBoxed(w io.Writer, head []string, rows [][]string, style styl
 
 func (a *app) printTable(w io.Writer, head []string, rows [][]string, style styleFn) {
 	color := style != nil && a.colorOn(w)
+	for _, r := range rows {
+		for i, c := range r {
+			r[i] = termText(c, true)
+		}
+	}
 	width := make([]int, len(head))
 	for i, h := range head {
 		width[i] = utf8.RuneCountInString(h)
@@ -250,7 +265,7 @@ func (a *app) printTable(w io.Writer, head []string, rows [][]string, style styl
 				b.WriteString(strings.Repeat(" ", pad+3))
 			}
 		}
-		fprintln(w, b.String())
+		fprintln(w, colored(b.String()))
 	}
 	if !a.noHeaders {
 		line(head, true)
@@ -383,6 +398,21 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
+// sizeText shows a size the server stores as bytes ("4294967296") in the largest binary unit that divides it ("4G");
+// anything else is shown as it is.
+func sizeText(s string) string {
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || n == 0 {
+		return s
+	}
+	for i := 5; i >= 1; i-- {
+		if u := uint64(1) << (10 * i); n%u == 0 {
+			return strconv.FormatUint(n/u, 10) + string("KMGTP"[i-1])
+		}
+	}
+	return s
+}
+
 func age(now, t time.Time) string {
 	if t.IsZero() {
 		return "-"
@@ -413,22 +443,42 @@ func joinOrDash(s []string) string { return dash(strings.Join(s, ",")) }
 // linesOrDash puts each value on a line of its own, for a cell of a boxed table.
 func linesOrDash(s []string) string { return dash(strings.Join(s, "\n")) }
 
-// imageWithGen names an image reference with the generation a jail runs, "freebsd-15@stable (g3)";
-// a reference pinned to that generation is left alone.
-func imageWithGen(ref, gen string) string {
-	if gen == "" || strings.HasSuffix(ref, "#"+gen) {
+// imageWithGen names an image reference with the generation a jail runs and, for a release, the FreeBSD patch level
+// of that generation: "freebsd-15-1 (g3, p6)". A reference pinned to that generation shows only the patch level.
+func imageWithGen(ref, gen, freebsd string) string {
+	var extra []string
+	short := gen
+	if img, n, ok := strings.Cut(gen, "#"); ok && img == imageBase(ref) {
+		short = n
+	}
+	if gen != "" && ref != gen && !strings.HasSuffix(ref, "#"+short) {
+		extra = append(extra, short)
+	}
+	if p := patchLevel(freebsd); p != "" {
+		extra = append(extra, p)
+	}
+	if len(extra) == 0 {
 		return ref
 	}
-	return ref + " (" + gen + ")"
+	return ref + " (" + strings.Join(extra, ", ") + ")"
 }
 
-// paint wraps s in the colour of a table cell when colour is on for w.
-func (a *app) paint(w io.Writer, style styleFn, s string) string {
+// patchLevel is "p6" of "15.1-RELEASE-p6"; "" for a release without a patch, a snapshot or nothing.
+func patchLevel(freebsd string) string {
+	if _, p, ok := strings.Cut(freebsd, "-RELEASE-"); ok {
+		return p
+	}
+	return ""
+}
+
+// paint wraps s, cleaned, in the colour of a table cell when colour is on for w.
+func (a *app) paint(w io.Writer, style styleFn, s string) colored {
+	s = termText(s, false)
 	if !a.colorOn(w) {
-		return s
+		return colored(s)
 	}
 	if code := style(0, s); code != "" {
-		return "\x1b[" + code + "m" + s + "\x1b[0m"
+		return colored("\x1b[" + code + "m" + s + "\x1b[0m")
 	}
-	return s
+	return colored(s)
 }

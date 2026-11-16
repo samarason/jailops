@@ -9,7 +9,7 @@
 # in host-dir, pending.json) when the host boots was never confirmed. This script puts its snapshot back before the
 # network and pf start, so they start with the old configuration and a reboot never makes such a change permanent.
 # Only the files go back here; netif and pf, which come after, load them. Without a pending change it does nothing.
-# It runs whenever jailops_priv_enable is YES and needs no line of its own in rc.conf.
+# It runs whenever jailops_priv_enable is YES (which jailopsd_enable=YES implies) and needs no line of its own in rc.conf.
 #   service jailops_revert start   the same by hand (the running helper reverts on its own at the deadline)
 
 . /etc/rc.subr
@@ -26,7 +26,7 @@ jailops_revert_start()
 }
 
 load_rc_config $name
-: ${jailops_priv_enable:="NO"}
+: ${jailops_priv_enable:=${jailopsd_enable:-NO}}   # jailopsd_enable=YES is enough: the helper is part of it
 : ${jailops_priv_config:="/usr/local/etc/jailops/priv.conf"}
 
 run_rc_command "$1"

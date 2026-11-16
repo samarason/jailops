@@ -100,7 +100,6 @@ func (s *Server) jailConfig(w http.ResponseWriter, r *http.Request) {
 			}
 			if !jsonSame(spec, cur.Spec) {
 				cur.Spec = spec
-				cur.Status.Warnings = rateLimitWarnings(cur.Spec)
 				cur.Metadata.Generation++
 				cur.Metadata.UpdatedAt = s.now()
 				s.emit("jail-updated", "/api/v1/jails/"+name)

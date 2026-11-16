@@ -407,6 +407,8 @@ func (s *Store) applyPut(cmd Command) (Result, *Event, error) {
 		case cmd.Project == old.Metadata.Project:
 		case old.Metadata.Project == "" && cmd.UUID == old.Metadata.UUID:
 			// An object written before projects existed joins a project once.
+		case cmd.MoveProject && cmd.UUID == old.Metadata.UUID:
+			// a project rename moves the objects of the project
 		default:
 			return Result{}, nil, api.Errorf(api.CodeInvalid, "project of %s %q cannot change", cmd.Kind, cmd.Name)
 		}

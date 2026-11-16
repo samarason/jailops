@@ -9,8 +9,7 @@ spec:
   profiles: [small]
   storage: fast
   network:
-    - {name: eth0, network: br-db, ipv4: auto}
-  firewall: {policy: base}
+    - {name: eth0, network: db, ipv4: auto}
   resources: {memory: 4G, cpu: 2, disk: 100G}
   volumes:
-    - {name: data, mount: /var/db/postgres, quota: 80G}
+    - {volume: postgres-data, mount: /var/db/postgres}

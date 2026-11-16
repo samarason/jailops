@@ -3,7 +3,7 @@
 // api.ValidACMEEmail) and its message is shown as it comes.
 import type { ACMEChallenge, ACMESpec, HostFirewallSpec, NetworkSpec } from '@jailops/shared/api/types'
 import { validDNSName, hostAddr } from './host'
-import { suggestV4, parseV4Cidr } from './netform'
+import { parseV4Cidr } from './netform'
 
 export const MIN_PASSWORD = 12
 export const MAX_PASSWORD_BYTES = 256
@@ -102,7 +102,7 @@ export function pemProblems(cert: string, key: string, hostname: string): Record
 
 /** The command for a client when a public CA signed the certificate: an API token, nothing pinned. */
 export function publicRemoteAddCommand(name: string, host: string): string {
-  return `jailops remote add ${name} https://${host} --token-stdin`
+  return `jailops remote add ${name} https://${host} --token-file -`
 }
 
 /** The firewall the wizard proposes: the default template, ssh from the browser's address, the console from anywhere. */
@@ -110,15 +110,43 @@ export function setupFirewall(clientAddress: string): HostFirewallSpec {
   return { template: 'default', ssh: { ports: [22], ...(clientAddress ? { allow_from: [clientAddress] } : {}) }, console: {}, icmp: true }
 }
 
+/** The IPv4 prefix lengths the server accepts for a network (internal/validate/network.go). */
+export const V4_MIN_BITS = 8
+export const V4_MAX_BITS = 30
+
+const v4s = (n: number) => [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.')
+
+/** The gateway (first host) and the range (every other host) of an IPv4 subnet the server accepts: a prefix of /8 to
+ *  /30 without host bits set. Null otherwise. */
+export function v4Plan(subnet: string): { gateway: string; range: string } | null {
+  const c = parseV4Cidr(subnet)
+  if (!c || c.bits < V4_MIN_BITS || c.bits > V4_MAX_BITS) return null
+  const mask = (0xffffffff << (32 - c.bits)) >>> 0
+  const net = (c.base & mask) >>> 0
+  if (net !== c.base) return null
+  const size = 2 ** (32 - c.bits)
+  return { gateway: v4s(net + 1), range: `${v4s(net + 2)}-${v4s(net + size - 2)}` }
+}
+
 /** The network the wizard proposes for a subnet: the gateway is its first address, the rest is allocated. */
 export function setupNetwork(subnet: string, uplink: string): NetworkSpec | null {
-  const c = parseV4Cidr(subnet)
-  const g = suggestV4(subnet)
-  if (!c || c.bits !== 24 || !g) return null
+  const g = v4Plan(subnet)
+  if (!g) return null
   return { ...(uplink.trim() ? { uplink: uplink.trim() } : {}), ipv4: { subnet: subnet.trim(), gateway: g.gateway, range: g.range, nat: !!uplink.trim() } }
 }
 
-export const STEPS = ['account', 'identity', 'certificate', 'firewall', 'defaults', 'done'] as const
+/** The client command of the certificate panel for a host that was just renamed: the daemon builds it with the name
+ *  it started with, so the old name (short and full) is swapped for the new one. A command of another host (ACME
+ *  names its own domain) is left alone. */
+export function retargetRemoteAdd(cmd: string, oldName: string, newName: string): string {
+  if (!cmd || !oldName || !newName || oldName === newName) return cmd
+  const m = /^(jailops remote add )(\S+)( https:\/\/)([^:/\s]+)(.*)$/.exec(cmd)
+  if (!m || m[4] !== oldName) return cmd
+  const short = newName.split('.')[0]
+  return `${m[1]}${short}${m[3]}${newName}${m[5]}`
+}
+
+export const STEPS = ['account', 'identity', 'certificate', 'firewall', 'defaults', 'image', 'done'] as const
 export type Step = (typeof STEPS)[number]
 
 /** The step after one; the account cannot be skipped, so there is no way past it but creating it. */

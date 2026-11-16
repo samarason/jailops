@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"jailops.net/jailops/internal/supervise"
 	"time"
 
 	"jailops.net/jailops/internal/node/ctl"
@@ -72,7 +73,10 @@ func (n *Node) startAsync(kind, actor string, params any, fn func(ctx context.Co
 		n.cancels[job.ID] = cancel
 		n.bgMu.Unlock()
 		n.audit(ctx, actor, kind+".start", fmt.Sprint(job.ID), map[string]any{"params": params}, "")
-		res, err := fn(jctx)
+		var res any
+		if perr := supervise.Guard(nil, "node-job-"+kind, func() { res, err = fn(jctx) }); perr != nil {
+			res, err = nil, perr
+		}
 		cancel()
 		n.bgMu.Lock()
 		delete(n.cancels, job.ID)

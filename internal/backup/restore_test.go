@@ -39,21 +39,21 @@ func srcNet(subnet, gw string) api.NetworkSpec {
 func sourceObjects() objs {
 	return objs{
 		nets: map[string]api.NetworkSpec{"lan": srcNet("10.20.0.0/24", "10.20.0.1"), "dmz": srcNet("10.30.0.0/24", "10.30.0.1")},
-		pols: map[string]api.FirewallPolicySpec{"web": {DefaultIn: "deny", Rules: []api.FirewallRule{
-			{Action: "allow", Direction: "in", From: []string{"@office"}, Ports: []string{"443"}}}}},
-		sets: map[string]api.AddressSetSpec{"office": {Addresses: []string{"192.0.2.0/24"}, Includes: []string{"vpn"}},
-			"vpn": {Addresses: []string{"198.51.100.7"}}, "unused": {Addresses: []string{"1.1.1.1"}}},
+		pols: map[string]api.FirewallPolicySpec{"web": {DefaultIn: "deny", DefaultOut: "allow", Rules: []api.FirewallRule{
+			{Action: "allow", Direction: "in", From: []string{"set:office"}, Ports: []string{"443"}}}}},
+		sets: map[string]api.AddressSetSpec{"office": {Addresses: api.Entries("192.0.2.0/24", "set:vpn")},
+			"vpn": {Addresses: api.Entries("198.51.100.7")}, "unused": {Addresses: api.Entries("1.1.1.1")}},
 	}
 }
 
 func jailSpec() api.JailSpec {
-	return api.JailSpec{Image: "freebsd-15.0@stable",
+	return api.JailSpec{Image: "freebsd-15-0@stable",
 		Network:  []api.NetworkAttach{{Network: "lan", IPv4: "10.20.0.5", MAC: "02:aa"}, {Network: "dmz", IPv4: "auto"}, {Network: "lan", IPv4: "none"}},
-		Firewall: api.FirewallAttach{Policy: "web", Tags: []string{"tag:x"}},
-		Volumes:  []api.VolumeMount{{Name: "db", Mount: "/var/db/app"}}, Encrypted: true}
+		Firewall: api.FirewallAttach{Policies: []string{"web"}, Tags: []string{"tag:x"}},
+		Volumes:  []api.VolumeAttach{{Name: "db", Mount: "/var/db/app"}}, Encrypted: true}
 }
 
-var gen3 = api.ImageGeneration{Number: 3, Name: "freebsd-15.0#g3", Manifest: "mf3"}
+var gen3 = api.ImageGeneration{Number: 3, Name: "freebsd-15-0#g3", Manifest: "mf3"}
 
 func TestBuildBundle(t *testing.T) {
 	o := sourceObjects()
@@ -61,7 +61,7 @@ func TestBuildBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.ImageGeneration != "freebsd-15.0#g3" || b.ImageManifest != "mf3" || len(b.Networks) != 2 || len(b.Policies) != 1 {
+	if b.ImageGeneration != "freebsd-15-0#g3" || b.ImageManifest != "mf3" || len(b.Networks) != 2 || len(b.Policies) != 1 {
 		t.Fatalf("%+v", b)
 	}
 	if !reflect.DeepEqual(b.AddressSetNames, []string{"office", "vpn"}) || len(b.AddressSets) != 2 {
@@ -80,8 +80,8 @@ func TestBuildBundle(t *testing.T) {
 	// Frozen: changing the live objects later does not change the bundle.
 	o.pols["web"].Rules[0].Ports[0] = "22"
 	o.nets["lan"].IPv4.Gateway = "changed"
-	o.sets["office"].Addresses[0] = "changed"
-	if b.Policies[0].Rules[0].Ports[0] != "443" || b.Networks[1].IPv4.Gateway != "10.20.0.1" || b.AddressSets[0].Addresses[0] != "192.0.2.0/24" {
+	o.sets["office"].Addresses[0].Address = "changed"
+	if b.Policies[0].Rules[0].Ports[0] != "443" || b.Networks[1].IPv4.Gateway != "10.20.0.1" || b.AddressSets[0].Addresses[0].Address != "192.0.2.0/24" {
 		t.Fatal("bundle aliases live objects")
 	}
 	// Deterministic.
@@ -93,7 +93,7 @@ func TestBuildBundle(t *testing.T) {
 	// Missing references.
 	for name, mod := range map[string]func(objs){
 		"net": func(o objs) { delete(o.nets, "dmz") }, "policy": func(o objs) { delete(o.pols, "web") },
-		"set": func(o objs) { delete(o.sets, "vpn") },
+		"set": func(o objs) { delete(o.sets, "office") },
 	} {
 		o := sourceObjects()
 		mod(o)
@@ -135,7 +135,7 @@ func TestPreflightDifferentHostWithNetworkMap(t *testing.T) {
 	h := emptyHost()
 	h.Networks["office-lan"] = srcNet("172.16.0.0/24", "172.16.0.1")
 	h.Networks["dmz"] = srcNet("10.30.0.0/24", "10.30.0.1")
-	h.Generations["freebsd-15.0#g3"] = "mf3"
+	h.Generations["freebsd-15-0#g3"] = "mf3"
 	h.Secrets["db-pass"] = true
 	h.KeyDomains["d1"] = true
 	h.Leases = []api.Lease{{Address: "172.16.0.9", Jail: "other", Network: "office-lan"}}
@@ -192,7 +192,7 @@ func TestPreflightErrors(t *testing.T) {
 		h := emptyHost()
 		h.Networks["lan"] = srcNet("10.20.0.0/24", "10.20.0.1")
 		h.Networks["dmz"] = srcNet("10.30.0.0/24", "10.30.0.1")
-		h.Generations["freebsd-15.0#g3"] = "mf3"
+		h.Generations["freebsd-15-0#g3"] = "mf3"
 		h.Secrets["db-pass"] = true
 		h.KeyDomains["d1"] = true
 		return h
@@ -216,8 +216,8 @@ func TestPreflightErrors(t *testing.T) {
 			h.Jails["web"] = JailRef{Name: "web", UUID: "u-9"}
 			r.As = "web2"
 		}, "", ""},
-		{"manifest differs", func(h *HostState, r *api.RestoreRequest) { h.Generations["freebsd-15.0#g3"] = "other" }, "manifest", ""},
-		{"generation missing is creatable", func(h *HostState, r *api.RestoreRequest) { delete(h.Generations, "freebsd-15.0#g3") }, "", "image generation"},
+		{"manifest differs", func(h *HostState, r *api.RestoreRequest) { h.Generations["freebsd-15-0#g3"] = "other" }, "manifest", ""},
+		{"generation missing is creatable", func(h *HostState, r *api.RestoreRequest) { delete(h.Generations, "freebsd-15-0#g3") }, "", "image generation"},
 		{"secret missing", func(h *HostState, r *api.RestoreRequest) { delete(h.Secrets, "db-pass") }, "sealed secret", "secret db-pass"},
 		{"key missing", func(h *HostState, r *api.RestoreRequest) { delete(h.KeyDomains, "d1") }, "recovery key", "encryption key domain d1"},
 		{"network missing is creatable", func(h *HostState, r *api.RestoreRequest) { delete(h.Networks, "dmz") }, "", "network dmz"},
@@ -260,7 +260,7 @@ func TestPreflightErrors(t *testing.T) {
 	}
 	// Existing different policy: kept, reported.
 	h := good()
-	h.Policies["web"] = api.FirewallPolicySpec{DefaultIn: "allow"}
+	h.Policies["web"] = api.FirewallPolicySpec{DefaultIn: "allow", DefaultOut: "allow"}
 	r := Preflight(b, api.RestoreRequest{}, h)
 	if !r.OK || !has(r.Changes, "existing policy is used") {
 		t.Fatalf("%+v", r)
@@ -483,16 +483,19 @@ func TestReverter(t *testing.T) {
 	}
 }
 
-func TestPreflightSaysAnEncryptedVolumeComesBackPlain(t *testing.T) {
-	sp := jailSpec()
-	sp.Volumes[0].Encrypted = true
-	bd, err := BuildBundle(sp, gen3, sourceObjects(), []string{"db-pass"})
+func TestPreflightSaysAnAttachedVolumeIsNotInTheBackup(t *testing.T) {
+	bd, err := BuildBundle(jailSpec(), gen3, sourceObjects(), []string{"db-pass"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	b := api.Backup{Spec: api.BackupSpec{Jail: "web", JailUUID: "u-1", HostUUID: "h1", Snapshot: "20250101000000-aabbccdd", KeyDomain: "d1", Bundle: bd}}
-	r := Preflight(b, api.RestoreRequest{Backup: "web@20250101000000-aabbccdd"}, emptyHost())
-	if !has(r.Changes, `volume "db" was encrypted; it is restored as a plain volume`) {
-		t.Fatalf("%v", r.Changes)
+	req := api.RestoreRequest{Backup: "web@20250101000000-aabbccdd"}
+	h := emptyHost()
+	if r := Preflight(b, req, h); !has(r.Missing, "volume db (attached at /var/db/app)") {
+		t.Fatalf("missing: %v", r.Missing)
+	}
+	h.Volumes = map[string]bool{"db": true}
+	if r := Preflight(b, req, h); has(r.Missing, "volume db (attached at /var/db/app)") {
+		t.Fatalf("a volume that exists is reported missing: %v", r.Missing)
 	}
 }

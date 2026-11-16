@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -47,6 +48,7 @@ type Lockout struct {
 
 type lockEntry struct {
 	failures    int
+	inflight    int
 	lockedUntil time.Time
 	last        time.Time
 }
@@ -126,6 +128,61 @@ func (l *Lockout) Fail(key string) error {
 	return nil
 }
 
+// Begin counts an attempt before its credential is checked, so that attempts that run at once cannot pass the
+// threshold together: it returns a *LockedError while the key is locked, and also when the failures so far and the
+// attempts still in flight reach the threshold (after a lock has run out, one attempt at a time). Every Begin
+// that returns nil is followed by End or Abort.
+func (l *Lockout) Begin(key string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.cfg.Now()
+	e := l.m[key]
+	if e == nil {
+		if len(l.m) >= l.cfg.MaxEntries {
+			l.evict(now)
+		}
+		e = &lockEntry{last: now}
+		l.m[key] = e
+	}
+	if e.inflight == 0 && now.Sub(e.last) > l.cfg.ResetAfter && !now.Before(e.lockedUntil) {
+		e.failures = 0
+	}
+	if now.Before(e.lockedUntil) {
+		return &LockedError{RetryAfter: e.lockedUntil.Sub(now)}
+	}
+	if e.failures+e.inflight >= l.cfg.Threshold && (e.failures < l.cfg.Threshold || e.inflight > 0) {
+		// the attempts in flight decide first
+		return &LockedError{RetryAfter: time.Second}
+	}
+	e.inflight++
+	e.last = now
+	return nil
+}
+
+// End finishes an attempt begun with Begin: a success clears the key, a failure counts like Fail and returns the
+// lock now in force, if any.
+func (l *Lockout) End(key string, ok bool) error {
+	if ok {
+		l.Success(key)
+		return nil
+	}
+	l.mu.Lock()
+	if e := l.m[key]; e != nil && e.inflight > 0 {
+		e.inflight--
+	}
+	l.mu.Unlock()
+	return l.Fail(key)
+}
+
+// Abort finishes an attempt begun with Begin that was not decided (another key refused it).
+func (l *Lockout) Abort(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.m[key]; e != nil && e.inflight > 0 {
+		e.inflight--
+	}
+}
+
 // Success clears the key.
 func (l *Lockout) Success(key string) {
 	l.mu.Lock()
@@ -138,7 +195,7 @@ func (l *Lockout) evict(now time.Time) {
 	var oldestKey string
 	var oldest time.Time
 	for k, e := range l.m {
-		if now.Sub(e.last) > l.cfg.ResetAfter && !now.Before(e.lockedUntil) {
+		if e.inflight == 0 && now.Sub(e.last) > l.cfg.ResetAfter && !now.Before(e.lockedUntil) {
 			delete(l.m, k)
 			continue
 		}
@@ -149,4 +206,19 @@ func (l *Lockout) evict(now time.Time) {
 	if len(l.m) >= l.cfg.MaxEntries && oldestKey != "" {
 		delete(l.m, oldestKey)
 	}
+}
+
+// SourceKey is the source of a request as the limiters count it: the address itself for IPv4 and other peers
+// ("unix:<uid>"), and the /64 for IPv6, where one host usually holds a whole /64 and could otherwise try from
+// another address every time.
+func SourceKey(remote string) string {
+	a, err := netip.ParseAddr(remote)
+	if err != nil || !a.Is6() || a.Is4In6() {
+		return remote
+	}
+	p, err := a.WithZone("").Prefix(64)
+	if err != nil {
+		return remote
+	}
+	return p.String()
 }

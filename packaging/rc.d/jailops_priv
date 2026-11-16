@@ -1,12 +1,17 @@
 #!/bin/sh
 #
 # PROVIDE: jailops_priv
-# REQUIRE: zfs jailops_revert
+# REQUIRE: zfs jailops_revert syslogd
 # BEFORE: jailopsd
 # KEYWORD: shutdown
 #
+# "syslogd": the helper writes its audit lines (and, at the first start of an appliance, every command of
+# appliance-init) to syslog; before syslogd runs they would be lost. jailopsd REQUIRES this script and "shutdown"
+# stops the two in the reverse order: the daemon first, the helper last. The two are one service: `service jailopsd
+# start` starts this script first when it is not running and `service jailopsd stop` stops it after the daemon (see jailopsd).
+#
 # Add to /etc/rc.conf:
-#   jailops_priv_enable="YES"
+#   jailopsd_enable="YES"          (enough: the helper is enabled with the daemon; jailops_priv_enable="NO" is the way to say otherwise)
 #   jailops_appliance="YES"        (optional) appliance mode (docs/appliance.md): JailOps manages the host from the
 #                                  console. The helper manages the modules below besides host-manage of priv.conf,
 #                                  and at the first start, without priv.conf, it sets the host up (appliance-init).
@@ -19,6 +24,10 @@
 # /usr/local/etc/jailops/priv.d/storage.conf.
 #   service jailops_priv checkconfig   validate the configuration, print the effective roots and modules
 #   service jailops_priv reload        reread the storage file and verify every root (SIGHUP)
+#   service jailops_priv status        the helper's pid, and whether daemon(8) is restarting it
+# daemon(8) supervises the helper: when it exits on its own (a crash, kill -9) it is started again after 5 seconds;
+# the pending host change and the storage roots are read again at that start. stop ends the supervisor, which stops
+# the helper. jailopsd survives a helper that goes away: its calls fail until the helper is back, then it reconnects.
 # rc.conf is read at start only: a change of jailops_appliance needs a restart of both services.
 # Run on FreeBSD 15.1 (design 18.2).
 
@@ -28,15 +37,22 @@ name="jailops_priv"
 rcvar="jailops_priv_enable"
 desc="JailOps privileged helper"
 
-pidfile="/var/run/jailops/priv.pid"
-supervisor_pidfile="/var/run/jailops/priv-daemon.pid"
-procname="/usr/local/libexec/jailops-priv"
+# The pid files are written by daemon(8) as root: they live in /var/run, never in /var/run/jailops, which the daemon
+# (user jailops) may write to and could plant a symlink in. The socket is in /var/run/jailops-priv (root, 0710).
+# rc.subr acts on the supervisor (pidfile, procname "daemon"): with -R a signal to the helper itself would only make
+# daemon(8) start it again. The helper's own pid is in helper_pidfile (reload signals it).
+pidfile="/var/run/jailops-priv-daemon.pid"
+helper_pidfile="/var/run/jailops-priv.pid"
+helper="/usr/local/libexec/jailops-priv"
 command="/usr/sbin/daemon"
+procname="${command}"
 
 extra_commands="checkconfig reload"
-sig_reload="HUP"
 checkconfig_cmd="jailops_priv_checkconfig"
+reload_cmd="jailops_priv_reload"
+status_cmd="jailops_priv_status"
 start_precmd="jailops_priv_precmd"
+stop_precmd="jailops_priv_stop_precmd"
 
 # jailops_appliance_args prints the flag that passes jailops_appliance_modules on, nothing when appliance mode is off.
 jailops_appliance_args()
@@ -54,7 +70,7 @@ jailops_appliance_args()
 
 jailops_priv_checkconfig()
 {
-	${procname} -config ${jailops_priv_config} ${jailops_priv_appliance} check-config
+	${helper} -config ${jailops_priv_config} ${jailops_priv_appliance} check-config
 }
 
 jailops_priv_precmd()
@@ -63,28 +79,72 @@ jailops_priv_precmd()
 	# goes to syslog)
 	if [ -n "${jailops_priv_appliance}" ] && [ ! -f "${jailops_priv_config}" ]; then
 		case "${jailops_pool:-}" in
-		*[!A-Za-z0-9_.:-]*) echo "jailops_pool: \"${jailops_pool}\" is not a pool name" >&2; return 1 ;;
+		-*|*[!A-Za-z0-9_.:-]*) echo "jailops_pool: \"${jailops_pool}\" is not a pool name" >&2; return 1 ;;
 		esac
-		${procname} appliance-init -config ${jailops_priv_config} ${jailops_pool:+-pool ${jailops_pool}} || return 1
+		${helper} appliance-init -config ${jailops_priv_config} ${jailops_pool:+-pool ${jailops_pool}} || return 1
 	fi
-	# the daemon (user jailops) creates its socket here; the sticky bit keeps it from removing the helper's
-	install -d -m 1771 -o root -g jailops /var/run/jailops
+	# the helper's socket: a directory only root writes, which the group jailops may pass through (the daemon's own
+	# socket is in /var/run/jailops, which the daemon writes)
+	install -d -m 0710 -o root -g jailops /var/run/jailops-priv
 	install -d -m 0700 /usr/local/etc/jailops/priv.d
+	# the logs of the jails (exec.consolelog): the dataset <pool>/jailops/logs is mounted here when `jailops-priv init`
+	# made it; a jail does not start without the directory
+	install -d -m 0750 -o root -g jailops /var/log/jailops
 	# refuse to start with a configuration that does not validate
-	${procname} -config ${jailops_priv_config} ${jailops_priv_appliance} check-config >/dev/null || return 1
+	${helper} -config ${jailops_priv_config} ${jailops_priv_appliance} check-config >/dev/null || return 1
+}
+
+# the pid of the helper itself, empty while daemon(8) waits to start it again
+jailops_priv_pid()
+{
+	check_pidfile ${helper_pidfile} ${helper}
+}
+
+jailops_priv_status()
+{
+	if [ -z "${rc_pid}" ]; then
+		echo "${name} is not running."
+		return 1
+	fi
+	_pid=$(jailops_priv_pid)
+	if [ -n "${_pid}" ]; then
+		echo "${name} is running as pid ${_pid}."
+	else
+		echo "${name} is not running; daemon(8) (pid ${rc_pid}) starts it again within 5 seconds."
+	fi
+}
+
+# SIGHUP goes to the helper: daemon(8) does not pass it on
+jailops_priv_reload()
+{
+	_pid=$(jailops_priv_pid)
+	[ -n "${_pid}" ] || err 1 "${name} is not running"
+	kill -HUP ${_pid}
+}
+
+# Stopping the helper leaves jailopsd running: it answers /readyz with "not ready: helper", what it asks the helper
+# meanwhile fails, and it reconnects once the helper is back. Say so, and stop nothing else.
+jailops_priv_stop_precmd()
+{
+	[ -n "${rc_fast}" ] && return 0
+	if service jailopsd onestatus >/dev/null 2>&1; then
+		echo "${name}: jailopsd keeps running without the helper and reconnects when it is back."
+	fi
+	return 0
 }
 
 # rc.conf may set jailops_priv_config: read it before anything is derived from it
 load_rc_config $name
-: ${jailops_priv_enable:="NO"}
+: ${jailops_priv_enable:=${jailopsd_enable:-NO}}   # jailopsd_enable=YES is enough: the helper is part of it
 : ${jailops_priv_config:="/usr/local/etc/jailops/priv.conf"}
 
 jailops_priv_appliance=$(jailops_appliance_args) || err 1 "invalid jailops_appliance_modules"
 
-# -p: pid of the helper itself (rc status, stop and the reload signal use it);
-# -P: pid of the daemon(8) supervisor, which exits when the helper exits.
+# -p: pid of the helper itself (status and reload use it); -P: pid of the daemon(8) supervisor (rc start, stop and
+# status use it); -R 5: when the helper exits without being stopped, start it again after 5 seconds (no faster: a
+# helper that cannot start would otherwise fill syslog).
 # -log syslog: the audit lines of the helper (one per request of the daemon) go to syslog; under daemon(8) -f stderr is /dev/null.
-command_args="-f -p ${pidfile} -P ${supervisor_pidfile} ${procname} -log syslog -config ${jailops_priv_config} ${jailops_priv_appliance}"
+command_args="-f -R 5 -p ${helper_pidfile} -P ${pidfile} ${helper} -log syslog -config ${jailops_priv_config} ${jailops_priv_appliance}"
 # in appliance mode the first start writes priv.conf itself
 [ -n "${jailops_priv_appliance}" ] || required_files="${jailops_priv_config}"
 

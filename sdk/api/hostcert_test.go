@@ -54,10 +54,10 @@ func TestACMESpecValidate(t *testing.T) {
 
 func TestACMERedirectLines(t *testing.T) {
 	l := ACMERedirectLines(ACMEHTTP01, 39080)
-	if len(l) != 2 || l[0] != "rdr pass inet proto tcp from any to (self) port 80 -> 127.0.0.1 port 39080" || l[1] != "rdr pass inet6 proto tcp from any to (self) port 80 -> ::1 port 39080" {
+	if len(l) != 2 || l[0] != "pass in quick inet proto tcp from any to (self) port 80 rdr-to 127.0.0.1 port 39080" || l[1] != "pass in quick inet6 proto tcp from any to (self) port 80 rdr-to ::1 port 39080" {
 		t.Errorf("%q", l)
 	}
-	if l := ACMERedirectLines(ACMETLSALPN01, 39110); !strings.Contains(l[0], "port 443 -> 127.0.0.1 port 39110") {
+	if l := ACMERedirectLines(ACMETLSALPN01, 39110); !strings.Contains(l[0], "port 443 rdr-to 127.0.0.1 port 39110") {
 		t.Errorf("%q", l)
 	}
 }

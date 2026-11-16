@@ -21,18 +21,34 @@ name="jailops_backupd"
 rcvar="jailops_backupd_enable"
 desc="JailOps backup node"
 
-pidfile="/var/run/jailops-backupd/backupd.pid"
-supervisor_pidfile="/var/run/jailops-backupd/backupd-daemon.pid"
+# daemon(8) writes both pid files as root, before it runs the node as its user: they live in /var/run, not in
+# /var/run/jailops-backupd, which belongs to that user.
+pidfile="/var/run/jailops-backupd.pid"
+supervisor_pidfile="/var/run/jailops-backupd-daemon.pid"
 procname="/usr/local/sbin/jailops-backupd"
 command="/usr/sbin/daemon"
 
 extra_commands="checkconfig"
 checkconfig_cmd="jailops_backupd_checkconfig"
 start_precmd="jailops_backupd_precmd"
+stop_cmd="jailops_backupd_stop"
 
 jailops_backupd_checkconfig()
 {
 	su -m ${jailops_backupd_runas} -c "${procname} -c ${jailops_backupd_config} check-config"
+}
+
+jailops_backupd_stop()
+{
+	_sup=$(check_pidfile ${supervisor_pidfile} /usr/sbin/daemon)
+	_pid=$(check_pidfile ${pidfile} ${procname})
+	if [ -z "${_sup}${_pid}" ]; then
+		echo "${name} not running? (check ${pidfile})."
+		return 1
+	fi
+	[ -z "${_sup}" ] || kill -TERM ${_sup}
+	[ -z "${_pid}" ] || [ -n "${_sup}" ] || kill -TERM ${_pid}
+	wait_for_pids ${_sup} ${_pid}
 }
 
 jailops_backupd_precmd()
@@ -49,7 +65,9 @@ load_rc_config $name
 : ${jailops_backupd_config:="/usr/local/etc/jailops/backupd.yaml"}
 : ${jailops_backupd_runas:="jailops-backup"}
 
-command_args="-f -S -T jailops-backupd -u ${jailops_backupd_runas} -p ${pidfile} -P ${supervisor_pidfile} ${procname} -c ${jailops_backupd_config} serve"
+# -R 10: when the node exits without being stopped, the supervisor starts it again after 10 seconds. A stop goes to the
+# supervisor first (jailops_backupd_stop), which stops the node and exits without starting it again.
+command_args="-f -S -T jailops-backupd -R 10 -u ${jailops_backupd_runas} -p ${pidfile} -P ${supervisor_pidfile} ${procname} -c ${jailops_backupd_config} serve"
 required_files="${jailops_backupd_config}"
 
 run_rc_command "$1"

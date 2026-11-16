@@ -64,10 +64,10 @@ func TestEngineThroughTheNode(t *testing.T) {
 			if st, err := keys.StatusOf(ctx, key, repo); err != nil || st == keys.StatusEscrowed {
 				t.Fatalf("%v %v", st, err)
 			}
-			if err := hc.PutEscrow(ctx, key.DomainID(), []byte("age-encryption.org/v1 fake blob")); err != nil {
+			if err := hc.PutEscrow(ctx, key.DomainID(), []byte("age-encryption.org/v1\n-> X25519 stanza\nfake blob")); err != nil {
 				t.Fatal(err)
 			}
-			if err := hc.PutEscrow(ctx, key.DomainID(), []byte("another blob")); err == nil || !api.IsCode(err, api.CodeAlreadyExists) {
+			if err := hc.PutEscrow(ctx, key.DomainID(), []byte("age-encryption.org/v1\n-> X25519 stanza\nanother blob")); err == nil || !api.IsCode(err, api.CodeAlreadyExists) {
 				t.Fatalf("an escrow blob was replaced: %v", err)
 			}
 			if ok, err := repo.HasEscrow(ctx, key.DomainID()); err != nil || !ok {

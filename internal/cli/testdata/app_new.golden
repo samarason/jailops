@@ -21,10 +21,10 @@ $ jailops app validate <dir>/apps/memcached.yaml
 
 $ jailops app new memcached --dir <dir>/apps
 ! already_exists: <dir>/apps/memcached.yaml exists
-! hint: keep it, or write over it with --force
+! hint: keep it, or write over it with --overwrite
 [exit 5]
 
-$ jailops app new memcached --package memcached,libevent --port 11211 --port 11211/udp --dir <dir>/apps --force
+$ jailops app new memcached --package memcached,libevent --port 11211 --port 11211/udp --dir <dir>/apps --overwrite
 Wrote <dir>/apps/memcached.yaml with 11 line(s) marked TODO, and <dir>/apps/memcached.svg (there already).
 Next:
   1. Fill in each line marked TODO; 'jailops app validate <dir>/apps/memcached.yaml' lists the ones left.

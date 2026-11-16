@@ -47,12 +47,12 @@ func (d *DB) OpenSession(ctx context.Context, group, hostID, snapshot, previous 
 		return Session{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET state='expired', closed_at=now() WHERE group_id=$1 AND state='open' AND lease_expires_at < now()`, group); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET state='expired', closed_at=$2::timestamptz WHERE group_id=$1 AND state='open' AND lease_expires_at < $2::timestamptz`, group, d.now()); err != nil {
 		return Session{}, err
 	}
 	s, err := scanSession(tx.QueryRow(ctx, `INSERT INTO sessions (group_id, host_id, snapshot_id, previous_id, state, lease_expires_at)
-		VALUES ($1, $2::uuid, $3, $4, 'open', now() + $5 * interval '1 microsecond') RETURNING `+sessionCols,
-		group, hostID, snapshot, previous, lease.Microseconds()))
+		VALUES ($1, $2::uuid, $3, $4, 'open', $6::timestamptz + $5 * interval '1 microsecond') RETURNING `+sessionCols,
+		group, hostID, snapshot, previous, lease.Microseconds(), d.now()))
 	if isUnique(err) {
 		return Session{}, fmt.Errorf("%w: the group already has an open session", ErrConflict)
 	}
@@ -71,25 +71,26 @@ func (d *DB) Session(ctx context.Context, id string) (Session, error) {
 // chunks and bytes. It returns ErrNotFound when the session is not open or its
 // lease has run out (the lease is then closed as expired).
 func (d *DB) RenewSession(ctx context.Context, id string, lease time.Duration, chunks, bytes int64) (Session, error) {
-	s, err := scanSession(d.pool.QueryRow(ctx, `UPDATE sessions SET lease_expires_at = now() + $2 * interval '1 microsecond',
+	at := d.now()
+	s, err := scanSession(d.pool.QueryRow(ctx, `UPDATE sessions SET lease_expires_at = $5::timestamptz + $2 * interval '1 microsecond',
 			chunks_put = chunks_put + $3, bytes_put = bytes_put + $4
-		WHERE id = $1::uuid AND state = 'open' AND lease_expires_at >= now() RETURNING `+sessionCols,
-		id, lease.Microseconds(), chunks, bytes))
+		WHERE id = $1::uuid AND state = 'open' AND lease_expires_at >= $5::timestamptz RETURNING `+sessionCols,
+		id, lease.Microseconds(), chunks, bytes, at))
 	if err == ErrNotFound {
-		_, _ = d.pool.Exec(ctx, `UPDATE sessions SET state='expired', closed_at=now() WHERE id=$1::uuid AND state='open' AND lease_expires_at < now()`, id)
+		_, _ = d.pool.Exec(ctx, `UPDATE sessions SET state='expired', closed_at=$2::timestamptz WHERE id=$1::uuid AND state='open' AND lease_expires_at < $2::timestamptz`, id, at)
 	}
 	return s, err
 }
 
 // CloseSession ends an open session with the final state.
 func (d *DB) CloseSession(ctx context.Context, id, state string) error {
-	_, err := d.pool.Exec(ctx, `UPDATE sessions SET state=$2, closed_at=now() WHERE id=$1::uuid AND state='open'`, id, state)
+	_, err := d.pool.Exec(ctx, `UPDATE sessions SET state=$2, closed_at=$3::timestamptz WHERE id=$1::uuid AND state='open'`, id, state, d.now())
 	return err
 }
 
 // ExpireSessions closes every open session whose lease ran out and returns their ids.
 func (d *DB) ExpireSessions(ctx context.Context) ([]string, error) {
-	rows, err := d.pool.Query(ctx, `UPDATE sessions SET state='expired', closed_at=now() WHERE state='open' AND lease_expires_at < now() RETURNING id::text`)
+	rows, err := d.pool.Query(ctx, `UPDATE sessions SET state='expired', closed_at=$1::timestamptz WHERE state='open' AND lease_expires_at < $1::timestamptz RETURNING id::text`, d.now())
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +108,7 @@ func (d *DB) ExpireSessions(ctx context.Context) ([]string, error) {
 
 // OpenSessions lists the sessions that are open now.
 func (d *DB) OpenSessions(ctx context.Context) ([]Session, error) {
-	rows, err := d.pool.Query(ctx, `SELECT `+sessionCols+` FROM sessions WHERE state='open' AND lease_expires_at >= now() ORDER BY created_at`)
+	rows, err := d.pool.Query(ctx, `SELECT `+sessionCols+` FROM sessions WHERE state='open' AND lease_expires_at >= $1::timestamptz ORDER BY created_at`, d.now())
 	if err != nil {
 		return nil, err
 	}
@@ -125,13 +126,13 @@ func (d *DB) OpenSessions(ctx context.Context) ([]Session, error) {
 
 // SessionOpenFor returns the open session of a group, if any.
 func (d *DB) SessionOpenFor(ctx context.Context, group string) (Session, error) {
-	return scanSession(d.pool.QueryRow(ctx, `SELECT `+sessionCols+` FROM sessions WHERE group_id=$1 AND state='open' AND lease_expires_at >= now()`, group))
+	return scanSession(d.pool.QueryRow(ctx, `SELECT `+sessionCols+` FROM sessions WHERE group_id=$1 AND state='open' AND lease_expires_at >= $2::timestamptz`, group, d.now()))
 }
 
 // PinnedSnapshots returns the (group, snapshot) pairs that open sessions use
 // as their previous snapshot: retention must keep them.
 func (d *DB) PinnedSnapshots(ctx context.Context) (map[[2]string]bool, error) {
-	rows, err := d.pool.Query(ctx, `SELECT group_id, previous_id FROM sessions WHERE state='open' AND lease_expires_at >= now() AND previous_id <> ''`)
+	rows, err := d.pool.Query(ctx, `SELECT group_id, previous_id FROM sessions WHERE state='open' AND lease_expires_at >= $1::timestamptz AND previous_id <> ''`, d.now())
 	if err != nil {
 		return nil, err
 	}

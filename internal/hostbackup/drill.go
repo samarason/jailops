@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"jailops.net/jailops/internal/backup"
@@ -96,10 +97,31 @@ func (e *drillEnv) ExtractScratch(ctx context.Context, p backup.DrillPlan) error
 	if err := e.checkScratchDir(p.Scratch); err != nil {
 		return err
 	}
+	if err := ensurePrivateDir(filepath.Clean(e.s.cfg.ScratchDir)); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return err
 	}
 	return e.verify(ctx, engine.VerifyExtract, p.Scratch)
+}
+
+// ensurePrivateDir makes the directory a drill extracts decrypted files into, or checks the one that is there: it must be
+// a real directory of this user that nobody else can enter. /var/tmp is shared, so another user could have made the
+// directory (or a symlink) first and would read what a drill restores into it.
+func ensurePrivateDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return os.MkdirAll(dir, 0o700)
+	}
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() || !ok || int(st.Uid) != os.Geteuid() || fi.Mode().Perm()&0o077 != 0 {
+		return api.Errorf(api.CodeForbidden, "%s must be a directory of this user that nobody else can enter", dir)
+	}
+	return nil
 }
 
 func (e *drillEnv) checkScratchDir(dir string) error {
@@ -226,7 +248,7 @@ func (e *drillEnv) StopJail(ctx context.Context, p backup.DrillPlan) error {
 // interfaces. It is registered like any restored jail, which is what lets the daemon start it the usual way.
 func (e *drillEnv) restoreHidden(ctx context.Context, p backup.DrillPlan) error {
 	name := hiddenJailName(p)
-	res, err := e.s.RestoreWith(ctx, api.RestoreRequest{Backup: e.b.Metadata.Name, As: name}, RestoreOptions{NoNetwork: true})
+	res, err := e.s.RestoreWith(ctx, api.RestoreRequest{Backup: e.b.Metadata.Name, As: name, NoVolumes: true}, RestoreOptions{NoNetwork: true, DropVolumes: true})
 	if err != nil {
 		return fmt.Errorf("restoring the backup for the test: %w", err)
 	}
@@ -406,6 +428,9 @@ func (s *Service) drillJail(ctx context.Context, p api.BackupPolicy, j JailRecor
 	depth, err := backup.ParseDepth(p.Spec.VerifyMode)
 	if err != nil {
 		return Run{}, err
+	}
+	if j.IsVolume && depth == backup.DepthFull {
+		depth = backup.DepthExtract // a volume is no jail: there is nothing to start
 	}
 	bs, err := s.deps.Catalog.Backups(ctx)
 	if err != nil {

@@ -1,6 +1,7 @@
 package render
 
 import (
+	"fmt"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -19,6 +20,92 @@ func baseConf() JailConfInput {
 		Name: "alpha_web", Path: "/jailops/projects/alpha/jails/web/root", Hostname: "web.example.org", OS: api.OSFreeBSD,
 		Interfaces: []string{"jo0123456789a0b"}, EnforceStatfs: intp(2), SecureLevel: intp(2),
 		OSRelease: "15.0-RELEASE", Allow: []string{"sysvipc", "raw_sockets", "mount.zfs"},
+		Where: api.PromptContext{Jail: "web", Project: "alpha", Host: "babel"},
+	}
+}
+
+// The jail knows where it is: the parameters env.jail, env.project and env.host, only for what is known and only with
+// the characters a name holds.
+func TestJailConfWhere(t *testing.T) {
+	c := baseConf()
+	c.Where = api.PromptContext{Jail: "web", Project: "alpha", Host: ""}
+	s, err := JailConf(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s, "\tenv.jailops_jail = \"web\";\n\tenv.jailops_project = \"alpha\";\n\tvnet;") || strings.Contains(s, "env.jailops_host") {
+		t.Fatalf("a jail without a known host:\n%s", s)
+	}
+	c.Where = api.PromptContext{Jail: "we b;$(id)\"", Project: "Alpha", Host: "-babel.example.org-"}
+	s, err = JailConf(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s, "env.jailops_jail = \"webid\";") || !strings.Contains(s, "env.jailops_project = \"lpha\";") || !strings.Contains(s, "env.jailops_host = \"babelexample-org\";") && !strings.Contains(s, "env.jailops_host = \"babelexampleorg\";") {
+		t.Fatalf("odd characters:\n%s", s)
+	}
+	c.Where = api.PromptContext{}
+	if s, _ = JailConf(c); strings.Contains(s, "env.") {
+		t.Fatalf("nothing is known, so nothing is rendered:\n%s", s)
+	}
+}
+
+// A jail with delegation names its dataset for jail(8), which attaches it at the start; a plain jail has no such line.
+func TestJailConfZFSDataset(t *testing.T) {
+	c := baseConf()
+	one := 1
+	c.Allow, c.EnforceStatfs = []string{"mount", "mount.zfs"}, &one
+	c.ZFSDataset = "tank/jailops/projects/alpha/jails/web/delegated"
+	s, err := JailConf(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"\tenforce_statfs = 1;\n", "\tallow.mount;\n", "\tallow.mount.zfs;\n", "\tzfs.dataset = \"tank/jailops/projects/alpha/jails/web/delegated\";\n"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %q in\n%s", want, s)
+		}
+	}
+	c.ZFSDataset = "tank/x\";}\n\texec.start = \"x"
+	if _, err := JailConf(c); err == nil {
+		t.Error("a dataset name with a quote was accepted")
+	}
+	c.ZFSDataset = ""
+	if s, _ = JailConf(c); strings.Contains(s, "zfs.dataset") {
+		t.Errorf("a plain jail names a dataset:\n%s", s)
+	}
+}
+
+// A jail with zfs_delegation gets /dev/zfs in its own ruleset: a number nobody else shares, never a Linux jail's.
+func TestDelegatedJailDevfsRuleset(t *testing.T) {
+	devs := SpecDevfsDevices(api.JailSpec{Delegate: true})
+	if len(devs) != 1 || devs[0] != "zfs" {
+		t.Fatalf("devices %v", devs)
+	}
+	n, rules, err := DevfsRuleset(devs)
+	if err != nil || n < DevfsRulesetBase || n >= DevfsRulesetBase+DevfsLinuxOffset {
+		t.Fatalf("ruleset %d %v", n, err)
+	}
+	want := fmt.Sprintf("devfs rule -s %d add path zfs unhide", n)
+	found := false
+	for _, r := range rules {
+		found = found || strings.Join(r, " ") == want
+	}
+	if !found {
+		t.Errorf("no %q in %v", want, rules)
+	}
+	other, _, _ := DevfsRuleset([]string{"tun"})
+	linux, _, _ := LinuxDevfsRuleset([]string{"tun"})
+	if n == other || n == linux || other == linux {
+		t.Errorf("numbers collide: %d %d %d", n, other, linux)
+	}
+	if got := SpecDevfsDevices(api.JailSpec{Devfs: []api.DevfsDevice{{Device: "tun"}}}); len(got) != 1 {
+		t.Errorf("a jail without delegation: %v", got)
+	}
+	// a user cannot name zfs: it is not on the allow-list of the spec
+	for _, d := range api.DevfsAllowList {
+		if d == "zfs" {
+			t.Error("zfs is on the allow-list a user can name")
+		}
 	}
 }
 
@@ -31,6 +118,7 @@ func TestJailConfGolden(t *testing.T) {
 	l := baseConf()
 	l.Name, l.OS, l.Allow, l.OSRelease, l.SecureLevel = "alpha_alpine1", api.OSLinux, []string{"socket_af"}, "", nil
 	l.FstabPath = "/jailops/projects/alpha/jails/alpine1/fstab"
+	l.Where.Jail = "alpine1"
 	s, err = JailConf(l)
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +132,7 @@ func TestJailConfGolden(t *testing.T) {
 	}
 	golden(t, "jailconf_sysvipc", s)
 	// separate namespaces, never the host's
-	for _, want := range []string{"\tsysvmsg = new;\n", "\tsysvsem = new;\n", "\tsysvshm = new;\n", "\texec.consolelog = \"/var/log/jail_${name}_console.log\";\n"} {
+	for _, want := range []string{"\tsysvmsg = new;\n", "\tsysvsem = new;\n", "\tsysvshm = new;\n", "\texec.consolelog = \"/var/log/jailops/jail_${name}_console.log\";\n"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %q", want)
 		}
@@ -276,7 +364,7 @@ func TestGuestErrors(t *testing.T) {
 var (
 	rcLineRE    = regexp.MustCompile(`^(#.*|[a-z0-9_]+="[A-Za-z0-9 .:/%_-]*")$`)
 	ifaceLineRE = regexp.MustCompile(`^(# Managed.*|auto [a-z0-9]+|auto lo|iface lo inet loopback|iface [a-z0-9]+ inet6? (static|manual)|\t(address|gateway) [0-9a-f:./]+|\tmtu [0-9]+|)$`)
-	resolvRE    = regexp.MustCompile(`^(# Managed.*|search [A-Za-z0-9. -]+|nameserver [0-9a-f:.]+)$`)
+	resolvRE    = regexp.MustCompile(`^(# (Managed|written by JailOps).*|search [A-Za-z0-9. -]+|nameserver [0-9a-f:.]+)$`)
 )
 
 func FuzzGuest(f *testing.F) {
@@ -317,28 +405,28 @@ func TestPlansGolden(t *testing.T) {
 	n := api.NetworkSpec{
 		Uplink: "em0", MTU: 1500,
 		IPv4: &api.IPv4Net{Subnet: "10.20.0.0/24", Gateway: "10.20.0.1", Range: "10.20.0.10-10.20.0.200", NAT: true},
-		IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:1::/64", Gateway: "2001:db8:1::1", Range: "2001:db8:1::100-2001:db8:1::ffff"},
+		IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:1::/64", Range: "2001:db8:1::100-2001:db8:1::ffff"},
 	}
-	steps, err := NetworkPlan(NetworkInput{ID: "n-123", Name: "lan", Bridge: "jo0", Spec: n})
+	steps, err := NetworkPlan(NetworkInput{ID: "n-123", Name: "lan", Spec: n})
 	if err != nil {
 		t.Fatal(err)
 	}
 	golden(t, "plan_network_routed", DescribePlan(steps))
 	golden(t, "plan_network_routed_rollback", DescribePlan(Rollback(steps)))
 
-	p := api.NetworkSpec{Uplink: "em0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:2::/64", Gateway: "fe80::1", Range: "2001:db8:2::100-2001:db8:2::200"}}
-	steps, err = NetworkPlan(NetworkInput{ID: "n-456", Name: "wan6", Bridge: "jo1", Spec: p})
+	p := api.NetworkSpec{Uplink: "em0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:2::/64", Range: "2001:db8:2::100-2001:db8:2::200"}}
+	steps, err = NetworkPlan(NetworkInput{ID: "n-456", Name: "wan6", Spec: p})
 	if err != nil {
 		t.Fatal(err)
 	}
 	golden(t, "plan_network_proxy", DescribePlan(steps))
 	for _, s := range steps {
-		if s.Op == OpAddAddr && strings.HasPrefix(s.Arg, "2001:") {
-			t.Fatalf("proxy bridge got an on-link copy: %s", s.Arg)
+		if s.Op == OpAddRejectRoute && strings.HasPrefix(s.Arg, "2001:") {
+			t.Fatalf("a proxy-mode network got a reject route for its on-link prefix: %s", s.Arg)
 		}
 	}
 
-	a := AttachInput{JailID: "j-1", JailUUID: "0b0e7f3e-5c4b-4f6e-9d3e-111111111111", Index: 0, Project: "web", Jail: "nginx", Network: "lan", Bridge: "jo0", MTU: 1500, Private: true,
+	a := AttachInput{JailID: "j-1", JailUUID: "0b0e7f3e-5c4b-4f6e-9d3e-111111111111", Index: 0, Project: "web", Jail: "nginx", Network: "lan", MTU: 1500,
 		IPv4: pfx("10.20.0.10/24"), IPv6: pfx("2001:db8:1::100/64"), Gateway4: ip("10.20.0.1"), Gateway6: ip("fe80::1")}
 	steps, err = AttachPlan(a)
 	if err != nil {
@@ -360,24 +448,21 @@ func TestPlansGolden(t *testing.T) {
 func TestPlanErrors(t *testing.T) {
 	good := api.NetworkSpec{IPv4: &api.IPv4Net{Subnet: "10.20.0.0/24", Gateway: "10.20.0.1", Range: "10.20.0.10-10.20.0.20"}}
 	for _, in := range []NetworkInput{
-		{ID: "x", Name: "Bad Name", Bridge: "jo0", Spec: good},
-		{ID: "", Name: "lan", Bridge: "jo0", Spec: good},
-		{ID: "a b", Name: "lan", Bridge: "jo0", Spec: good},
-		{ID: "x", Name: "lan", Bridge: "", Spec: good},
-		{ID: "x", Name: "lan", Bridge: "jo0;", Spec: good},
-		{ID: "x", Name: "lan", Bridge: "jo0", Spec: api.NetworkSpec{}},
+		{ID: "x", Name: "Bad Name", Spec: good},
+		{ID: "", Name: "lan", Spec: good},
+		{ID: "a b", Name: "lan", Spec: good},
+		{ID: "x", Name: "lan", Spec: api.NetworkSpec{}},
 	} {
 		if _, err := NetworkPlan(in); err == nil {
 			t.Errorf("accepted %+v", in)
 		}
 	}
-	ok := AttachInput{JailID: "j", JailUUID: "u", Bridge: "jo0"}
+	ok := AttachInput{JailID: "j", JailUUID: "u"}
 	if _, err := AttachPlan(ok); err != nil {
 		t.Fatal(err)
 	}
 	for _, mut := range []func(*AttachInput){
 		func(a *AttachInput) { a.JailID = "" },
-		func(a *AttachInput) { a.Bridge = "x y" },
 		func(a *AttachInput) { a.Index = -1 },
 		func(a *AttachInput) { a.JailUUID = "" },
 		func(a *AttachInput) { a.MAC = "ZZ" },
@@ -399,7 +484,7 @@ func TestJSONCanonical(t *testing.T) {
 		Metadata: api.ObjectMeta{Name: "web", UUID: "u-1", Scope: api.ScopeHost, Generation: 3,
 			Labels:    map[string]string{"z": "1", "a": "<2>"},
 			CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("x", 3600))},
-		Spec: api.JailSpec{Image: "freebsd-15.0@stable", Env: map[string]string{"B": "2", "A": "1"},
+		Spec: api.JailSpec{Image: "freebsd-15-0@stable", Env: map[string]string{"B": "2", "A": "1"},
 			Network: []api.NetworkAttach{{Network: "lan", IPv4: "10.20.0.10"}}},
 		Status: api.JailStatus{Power: api.PowerRunning, JID: 7},
 	}
@@ -418,7 +503,7 @@ func TestJSONCanonical(t *testing.T) {
 		t.Fatal("html escaped")
 	}
 	golden(t, "spec_json", string(a))
-	bj, err := BundleJSON(api.RestoreBundle{Spec: j.Spec, ImageGeneration: "freebsd-15.0#g3", ImageManifest: "sha256:abc",
+	bj, err := BundleJSON(api.RestoreBundle{Spec: j.Spec, ImageGeneration: "freebsd-15-0#g3", ImageManifest: "sha256:abc",
 		Networks: []api.NetworkSpec{{Uplink: "em0"}}, Volumes: []string{"data"}, SecretRefs: []string{"s1"}})
 	if err != nil {
 		t.Fatal(err)
@@ -431,13 +516,13 @@ func TestJSONCanonical(t *testing.T) {
 }
 
 func TestLinuxDevfsRuleset(t *testing.T) {
-	n, text, err := LinuxDevfsRuleset(nil)
-	if err != nil || n < 5000 || n >= 55000 {
+	n, rules, err := LinuxDevfsRuleset(nil)
+	if err != nil || n < DevfsRulesetBase || n >= 55000 {
 		t.Fatalf("%d %v", n, err)
 	}
-	golden(t, "devfs_linux", text)
-	n2, text2, _ := LinuxDevfsRuleset([]string{"tun", "tun"})
-	if n2 == n || !strings.Contains(text2, "add path 'tun*' unhide") {
+	golden(t, "devfs_linux", devfsRuleLines(rules))
+	n2, rules2, _ := LinuxDevfsRuleset([]string{"tun", "tun"})
+	if text2 := devfsRuleLines(rules2); n2 == n || !strings.Contains(text2, "add path tun* unhide") {
 		t.Fatal(n2, text2)
 	}
 	if n3, _, _ := LinuxDevfsRuleset([]string{"tun"}); n3 != n2 {

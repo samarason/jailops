@@ -59,7 +59,8 @@ func loadOrCreateCert(certPath, keyPath string, explicit bool, hostname string, 
 	if err := os.MkdirAll(filepath.Dir(certPath), 0o750); err != nil {
 		return tls.Certificate{}, err
 	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+	// the key: a new file of mode 0600 renamed into place, never written through what is at its name
+	if err := writeAtomic0600(keyPath, keyPEM); err != nil {
 		return tls.Certificate{}, err
 	}
 	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {

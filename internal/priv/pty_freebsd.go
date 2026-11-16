@@ -10,6 +10,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// fionread is FIONREAD, _IOR('f', 127, int): the bytes waiting to be read.
+const fionread = 0x4004667f
+
 // fiodgname is FIODGNAME, _IOW('f', 120, struct fiodgname_arg) on LP64: the
 // ioctl that returns the devfs name of a descriptor's device.
 const fiodgname = 0x80106678

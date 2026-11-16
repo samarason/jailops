@@ -210,8 +210,7 @@ func TestHostileHost(t *testing.T) {
 }
 
 func TestLeaseExpiry(t *testing.T) {
-	// The lease runs on the wall clock: it has to leave room for a slow, loaded CI machine to stall between two
-	// heartbeats (150ms did not: a heartbeat came back lease_expired on a FreeBSD VM).
+	// The lease runs on the clock of the node (Config.Now), which the test moves by hand: nothing here waits for time.
 	var lease = 600 * time.Millisecond
 	e := nodetest.NewEnv(t, nodetest.Options{Configure: func(c *node.Config) { c.Lease = lease }})
 	h := e.Host(t, "h")
@@ -223,12 +222,12 @@ func TestLeaseExpiry(t *testing.T) {
 	}
 	// activity renews
 	for range 4 { // 800ms in all: longer than one lease, so only the renewals keep the session alive
-		time.Sleep(lease / 3)
+		e.Clock.Advance(lease / 3)
 		if _, err := e.Node.Heartbeat(ctx, h, si.ID); err != nil {
 			t.Fatalf("heartbeat: %v", err)
 		}
 	}
-	time.Sleep(lease + 100*time.Millisecond)
+	e.Clock.Advance(lease + 100*time.Millisecond)
 	c := f.NewChunk(t)
 	if _, err := e.Node.PutChunk(ctx, h, si.ID, c.ID, bytes.NewReader(c.Blob), int64(len(c.Blob))); code(err) != api.CodeLeaseExpired {
 		t.Fatalf("a chunk after the lease ran out: %v", err)
@@ -457,14 +456,14 @@ func TestKeyDomainAndEscrow(t *testing.T) {
 		t.Fatal("the key domain is not reported")
 	}
 	// escrow: create-only, same bytes again is fine, other bytes are refused, other domains are refused
-	blob := []byte("age-encryption.org/v1 wrapped key")
+	blob := []byte("age-encryption.org/v1\n-> X25519 stanza\nwrapped key")
 	if err := e.Node.PutEscrow(ctx, h, "0123456789abcdef", bytes.NewReader(blob), int64(len(blob))); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.Node.PutEscrow(ctx, h, "0123456789abcdef", bytes.NewReader(blob), int64(len(blob))); err != nil {
 		t.Fatalf("the same bytes again: %v", err)
 	}
-	other := []byte("a different wrapped key")
+	other := []byte("age-encryption.org/v1\n-> X25519 stanza\na different wrapped key")
 	if err := e.Node.PutEscrow(ctx, h, "0123456789abcdef", bytes.NewReader(other), int64(len(other))); code(err) != api.CodeAlreadyExists {
 		t.Fatalf("replacing an escrow blob: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -323,7 +324,10 @@ func (c *Client) Begin(ctx context.Context, group, snapshot, previous string) (U
 		return nil, err
 	}
 	s := &Session{c: c, info: info, stop: make(chan struct{})}
-	go s.heartbeat()
+	go func() {
+		defer func() { supervise.Report(nil, "upload-heartbeat", recover()) }()
+		s.heartbeat()
+	}()
 	return s, nil
 }
 

@@ -5,7 +5,8 @@ import { api } from '@/api/endpoints'
 import { useLoad } from '@jailops/shared/composables/load'
 import { session, can, isHub } from '@jailops/shared/composables/session'
 import { attention } from '@/composables/attention'
-import { bytes, percent, ago } from '@jailops/shared/lib/format'
+import { bytes, percent, sentence } from '@jailops/shared/lib/format'
+import TimeStamp from '@jailops/shared/components/TimeStamp.vue'
 import StatePill from '@/components/StatePill.vue'
 import Meter from '@jailops/shared/components/Meter.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
@@ -14,7 +15,11 @@ import type { PowerState, Jail } from '@jailops/shared/api/types'
 import { projectState } from '@/composables/project'
 import Icon from '@jailops/shared/components/Icon.vue'
 import { isLocked } from '@/composables/jailActions'
+import { isGlobalAdmin } from '@/composables/project'
+import { useRouter } from 'vue-router'
+import NewReleaseNotice from '@/components/NewReleaseNotice.vue'
 
+const router = useRouter()
 const safe = <T,>(p: Promise<T>): Promise<T | undefined> => p.catch(() => undefined)
 
 const l = useLoad(async () => {
@@ -43,7 +48,7 @@ const steps = computed(() => {
   const list = [
     { key: 'storage', done: hasStorage, to: '/storage', title: s.start.storage, text: s.start.storageText },
     { key: 'project', done: hasProject, to: '/projects', title: s.start.project, text: s.start.projectText },
-    { key: 'image', done: hasImage, to: '/images', title: s.start.image, text: s.start.imageText },
+    { key: 'image', done: hasImage, to: hasImage ? '/images' : '/images?create=1', title: s.start.image, text: s.start.imageText },
     { key: 'jail', done: hasJail, to: '/jails', title: s.start.jail, text: s.start.jailText },
   ]
   return list.every((x) => x.done) ? [] : list
@@ -85,6 +90,7 @@ const poolPct = computed(() => (pool.value ? percent(pool.value.allocated, pool.
             </ol>
           </div>
         </section>
+        <NewReleaseNotice :images="l.data.value?.images" :may-create="can('images') && isGlobalAdmin()" @create="router.push('/images?create=1')" />
         <Callout v-if="!projectState.current && can('projects') && projectState.projects.length" tone="info" data-test="overview-no-project">{{ s.project.noneChosenText }} <router-link to="/projects">{{ s.project.goProjects }}</router-link></Callout>
         <Callout v-if="locked.length" tone="warn" data-test="locked-banner">
           <strong>{{ s.keys.banner(locked.length) }}.</strong> {{ s.keys.bannerLead }}
@@ -118,8 +124,8 @@ const poolPct = computed(() => (pool.value ? percent(pool.value.allocated, pool.
             <div class="body">
               <template v-if="pool">
                 <Meter :value="poolPct" :label="s.overview.pool" :warn-at="75" :danger-at="90" />
-                <p class="muted" style="margin-top: 6px">
-                  {{ bytes(pool.allocated) }} {{ s.overview.used }} · {{ bytes(pool.free) }} {{ s.overview.free }} · {{ bytes(pool.size) }} · {{ Math.round(poolPct) }}%
+                <p class="muted pool-figures" style="margin-top: 6px">
+                  <span>{{ bytes(pool.allocated) }} {{ s.overview.used }}</span> · <span>{{ bytes(pool.free) }} {{ s.overview.free }}</span> · <span>{{ bytes(pool.size) }}</span> · <span>{{ Math.round(poolPct) }}%</span>
                 </p>
               </template>
               <p v-else class="muted">{{ s.overview.poolUnknown }}</p>
@@ -134,8 +140,8 @@ const poolPct = computed(() => (pool.value ? percent(pool.value.allocated, pool.
                 <tbody>
                   <tr v-for="o in recent" :key="o.id">
                     <td>{{ o.description }}</td>
-                    <td><span class="pill" :class="{ ok: o.status === 'success', danger: o.status === 'failure', info: o.status === 'running', warn: o.status === 'cancelled' }">{{ o.status }}</span></td>
-                    <td class="faint nowrap">{{ ago(o.created_at) }}</td>
+                    <td><span class="pill" :class="{ ok: o.status === 'success', danger: o.status === 'failure', info: o.status === 'running', warn: o.status === 'cancelled' }">{{ sentence(o.status) }}</span></td>
+                    <td class="faint nowrap"><TimeStamp :ts="o.created_at" /></td>
                   </tr>
                 </tbody>
               </table>
@@ -158,5 +164,6 @@ const poolPct = computed(() => (pool.value ? percent(pool.value.allocated, pool.
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
 .tile { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; text-decoration: none; color: var(--text); align-items: flex-start; }
 .tile:hover { background: var(--surface-2); }
+.pool-figures span { white-space: nowrap; }
 .tile-n { font-size: 28px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
 </style>

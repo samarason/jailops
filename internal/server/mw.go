@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,8 @@ type route struct {
 	h               func(*rc) error
 	// long routes (events, operation wait, hub streams) have no request deadline.
 	long bool
+	// local routes answer for this daemon only: ?host= is never forwarded (GET /readyz).
+	local bool
 }
 
 // rc is the per-request context handed to handlers.
@@ -115,6 +118,10 @@ func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, errors.New("hijacking is not supported")
 }
 
+// PermissionsPolicy turns off the browser features neither console uses.
+const PermissionsPolicy = "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), midi=(), " +
+	"accelerometer=(), gyroscope=(), magnetometer=(), display-capture=()"
+
 // outer is the guard around everything: request id, headers, panic recovery,
 // access log.
 func (s *Server) outer(next http.Handler) http.Handler {
@@ -129,12 +136,17 @@ func (s *Server) outer(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
-		if len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api/v1" {
+		if isAPIPath(r.URL.Path) {
+			// API answers carry secrets (a new token, a generated password, recovery codes): never cached.
 			h.Set("Cache-Control", "no-store")
+			h.Set("Pragma", "no-cache")
+			h.Set("Expires", "0")
 		} else {
 			h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		}
-		if r.TLS != nil {
+		// the consoles use no camera, microphone, location, payment or sensors
+		h.Set("Permissions-Policy", PermissionsPolicy)
+		if r.TLS != nil && s.cfg.HSTS != nil && s.cfg.HSTS() {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		info := &reqInfo{}
@@ -149,20 +161,23 @@ func (s *Server) outer(next http.Handler) http.Handler {
 						Error: api.Errorf(api.CodeInternal, "internal error").WithHint("see the daemon log for request " + rid)})
 				}
 			}
-			if r.URL.Path == "/healthz" {
-				return
+			if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+				return // probes, every few seconds
 			}
 			st := sw.status
 			if st == 0 {
 				st = 200
 			}
 			_, remote := remoteString(r)
-			s.log.Info("request", "rid", rid, "method", r.Method, "path", r.URL.Path, "query", redactQuery(r.URL.Query()),
+			s.log.Info("request", "rid", rid, "method", r.Method, "path", redactConsolePath(r.URL.Path), "query", redactQuery(r.URL.Query()),
 				"status", st, "ms", time.Since(start).Milliseconds(), "bytes", sw.bytes, "actor", info.actor, "route", info.route, "remote", remote)
 		}()
 		next.ServeHTTP(sw, r)
 	})
 }
+
+// isAPIPath reports a path of the API (/api/v1 and below), as opposed to the console's static files.
+func isAPIPath(p string) bool { return p == "/api/v1" || strings.HasPrefix(p, "/api/v1/") }
 
 func remoteString(r *http.Request) (string, string) {
 	h, _ := remoteAddr(r)
@@ -220,8 +235,8 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 		}
 		if ar.unknownCert && !ent.Public {
 			var err error = api.Errorf(api.CodeUnauthorized, "the client certificate is not trusted").
-				WithHint("ask a global administrator for a trust token (jailops trust add)")
-			if lerr := s.tokLim.Fail("cert|" + c.remote()); lerr != nil {
+				WithHint("ask a global administrator for a trust token (jailops cert enroll)")
+			if lerr := s.tokLim.Fail("cert|" + auth.SourceKey(c.remote())); lerr != nil {
 				err = lerr
 			}
 			c.fail(err)
@@ -288,7 +303,7 @@ func (s *Server) wrap(rt route) http.HandlerFunc {
 				return
 			}
 		}
-		if host := r.URL.Query().Get("host"); host != "" {
+		if host := r.URL.Query().Get("host"); host != "" && !rt.local {
 			if host == "all" {
 				if rt.method == "GET" && rt.pattern == "/api/v1/projects/{name}" {
 					if err := s.aggregateProject(c); err != nil {
@@ -382,8 +397,26 @@ func (s *Server) auditAuthFailure(c *rc, err error) {
 		code = string(ae.Code)
 	}
 	remote := c.remote()
-	s.svc.Audit(context.WithoutCancel(c.r.Context()), store.AuditEntry{Actor: "-", ActorKind: "anonymous", Method: c.rt.method, Route: c.rt.pattern,
-		Object: c.r.URL.Path, Result: "denied", Status: c.status, Remote: remote, Detail: "authentication failed: " + code})
+	s.writeAudit(context.WithoutCancel(c.r.Context()), store.AuditEntry{Actor: "-", ActorKind: "anonymous", Method: c.rt.method, Route: c.rt.pattern,
+		Object: redactConsolePath(c.r.URL.Path), Result: "denied", Status: c.status, Remote: remote, Detail: "authentication failed: " + code})
+}
+
+// maxAuditValue bounds one value a client sent in an audit detail.
+const maxAuditValue = 200
+
+// auditValue makes text a client sent safe for an audit detail: quoted with Go's escapes (no line break, and no
+// space or "=" that could pass for another key=value) and cut at maxAuditValue bytes. Every value of a request
+// body that goes into a detail goes through it, also when the request is refused later.
+func auditValue(s string) string {
+	cut := len(s) > maxAuditValue
+	if cut {
+		s = strings.ToValidUTF8(s[:maxAuditValue], "")
+	}
+	q := strconv.Quote(s)
+	if cut {
+		q += "..."
+	}
+	return q
 }
 
 // audit records a state-changing request. It never contains bodies or secrets.
@@ -394,7 +427,7 @@ func (s *Server) audit(c *rc, result string) {
 	}
 	obj := c.object
 	if obj == "" {
-		obj = c.r.URL.Path
+		obj = redactConsolePath(c.r.URL.Path)
 	}
 	e := store.AuditEntry{Actor: name, ActorKind: kind, Method: c.rt.method, Route: c.rt.pattern, Object: obj, Project: c.project,
 		Result: result, Status: c.status, Remote: c.actor.Remote}
@@ -408,9 +441,9 @@ func (s *Server) audit(c *rc, result string) {
 		e.Detail = strings.TrimSpace(e.Detail + " " + c.detail)
 	}
 	if c.r.URL.Query().Get("host") != "" {
-		e.Detail = "host=" + c.r.URL.Query().Get("host") + " " + e.Detail
+		e.Detail = "host=" + auditValue(c.r.URL.Query().Get("host")) + " " + e.Detail
 	}
-	s.svc.Audit(context.WithoutCancel(c.r.Context()), e)
+	s.writeAudit(context.WithoutCancel(c.r.Context()), e)
 }
 
 // withActor returns the request context carrying the caller, for service calls

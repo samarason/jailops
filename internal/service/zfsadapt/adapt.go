@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,6 +132,25 @@ func (a *Adapter) Snapshots(ctx context.Context, dataset string) ([]string, erro
 	return out, nil
 }
 
+// SnapshotTimes gives the creation time of each snapshot of a dataset, by short name.
+func (a *Adapter) SnapshotTimes(ctx context.Context, dataset string) (map[string]time.Time, error) {
+	l, err := a.C.List(ctx, zfs.ListOpts{Root: dataset, Types: []string{"snapshot"}, Depth: 1, Props: []string{"creation"}})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]time.Time{}
+	for _, d := range l {
+		ds, sn := zfs.SplitSnapshot(d.Name)
+		if ds != dataset || sn == "" {
+			continue
+		}
+		if sec, err := strconv.ParseInt(d.Props["creation"], 10, 64); err == nil && sec > 0 {
+			out[sn] = time.Unix(sec, 0).UTC()
+		}
+	}
+	return out, nil
+}
+
 // Written is the bytes written to the snapshot's dataset since the snapshot.
 func (a *Adapter) Written(ctx context.Context, snapshot string) (int64, error) {
 	ds, _ := zfs.SplitSnapshot(snapshot)
@@ -177,7 +197,9 @@ func (a *Adapter) Unmount(ctx context.Context, dataset string) error {
 }
 
 var (
-	unmountTries = 20
+	// a jail that was just stopped is torn down by the kernel (its processes, its vnet, its mounts), which on a slow
+	// or busy host takes longer than a few seconds: a dataset still busy after a minute has a holder
+	unmountTries = 120
 	unmountWait  = 500 * time.Millisecond
 )
 

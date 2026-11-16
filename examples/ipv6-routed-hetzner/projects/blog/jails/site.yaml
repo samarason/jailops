@@ -9,7 +9,7 @@ spec:
   storage: default
   network:
     - {name: eth0, network: blog, ipv4: auto, ipv6: "2001:db8:abcd:1:1::80"}
-  firewall: {policy: web}
+  firewall: {policies: [web]}
   resources: {cpu: 1, memory: 1G}
   proxy:
     - {name: http, listen: ":80", jail_port: 80}

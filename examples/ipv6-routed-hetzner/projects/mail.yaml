@@ -7,4 +7,4 @@ spec:
   networks: [{network: mail}]
   storage: [{storage: default, quota: 100G}]
   quotas: {jails: 5, memory: 4G}
-  firewall: floor
+  firewall_policies: [floor]

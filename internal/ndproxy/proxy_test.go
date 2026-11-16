@@ -272,7 +272,7 @@ func TestUnicastNUDAnswered(t *testing.T) {
 }
 
 // Another host of the uplink running DAD for an address of a running jail is told it is taken. (The jail's own DAD runs
-// on its epair, behind the bridge, and never reaches the capture of the uplink.)
+// on its epair, and never reaches the capture of the uplink.)
 func TestDADOfAnotherHostForAProxiedAddressIsDefended(t *testing.T) {
 	r := newRig(t, Config{})
 	r.add(t, jailA)

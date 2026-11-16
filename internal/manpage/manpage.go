@@ -129,6 +129,10 @@ func Page(c *cobra.Command, date string, seeAlso ...string) string {
 	}
 	flags(p, "OPTIONS", c.NonInheritedFlags())
 	flags(p, "GLOBAL OPTIONS", c.InheritedFlags())
+	// every page has the environment and the exit status of the tool, which the root command carries
+	ann := c.Root().Annotations
+	list(p, "ENVIRONMENT", ann[Environment], "Ev")
+	list(p, "EXIT STATUS", ann[ExitStatus], "")
 	if c.Example != "" {
 		p.line(".Sh EXAMPLES")
 		p.line(".Bd -literal -offset indent")
@@ -241,6 +245,32 @@ func flags(p *page, title string, fs *pflag.FlagSet) {
 	p.line(".Bl -tag -width Ds")
 	for _, it := range items {
 		p.lines(it)
+	}
+	p.line(".El")
+}
+
+// The annotations of the root command that hold the ENVIRONMENT and EXIT STATUS sections: one entry per line, the
+// name (a variable, an exit status), a tab, the text.
+const (
+	Environment = "manpage:environment"
+	ExitStatus  = "manpage:exit-status"
+)
+
+// list writes a section of name-tab-text lines as a tag list; macro marks up the names (Ev for variables).
+func list(p *page, title, entries, macro string) {
+	if strings.TrimSpace(entries) == "" {
+		return
+	}
+	p.line(".Sh %s", title)
+	p.line(".Bl -tag -width Ds")
+	for _, l := range strings.Split(strings.TrimSpace(entries), "\n") {
+		name, text, _ := strings.Cut(l, "\t")
+		if macro != "" {
+			p.line(".It %s %s", macro, arg(name))
+		} else {
+			p.line(".It %s", arg(name))
+		}
+		p.lines(textLines(strings.TrimSpace(text)))
 	}
 	p.line(".El")
 }

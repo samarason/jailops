@@ -1,0 +1,88 @@
+$ jailops firewall policy create web
+firewall policy/web created
+
+$ jailops firewall rule add web in --action allow --proto tcp --port 80 --name site --comment the site
+firewall policy/web: rule 1 added: allow in tcp port 80
+
+$ jailops firewall rule add web in
+firewall policy/web: rule 2 added: allow in
+! note: the rule has no comment; say why it is there with: jailops firewall rule edit web 2 --comment TEXT
+
+$ jailops firewall rule add web sideways --action allow
+! usage: the direction is in (to the jail) or out (from the jail), not "sideways"
+! hint: run 'jailops firewall rule add --help' for usage
+[exit 2]
+
+$ jailops firewall rule add web in --action allow --to 192.0.2.5
+! invalid: an inbound rule is always to the jail itself: leave out to, and say who may connect with from
+[exit 2]
+
+$ jailops firewall rule add web out --action allow --from 192.0.2.5
+! invalid: an outbound rule is always from the jail itself: leave out from, and say where it may go with to
+[exit 2]
+
+$ jailops firewall rule add web in --action allow --name site --port 81 --proto tcp
+! usage: the name "site" is used by rule 1 and rule 3: a name addresses one rule
+! hint: run 'jailops firewall rule add --help' for usage
+[exit 2]
+
+$ jailops firewall rule add nothing in --action allow
+! not_found: firewall-policy "nothing" not found
+! hint: list them with 'jailops firewall policy list'; check --project, --host and --remote too
+[exit 4]
+
+$ jailops firewall rule add web in --action allow --at 9
+! usage: --at 9: the policy has 2 rules, so the new rule goes at 1 to 3
+! hint: run 'jailops firewall rule add --help' for usage
+[exit 2]
+
+$ jailops firewall rule add web in --action allow --from @office
+! usage: "@office": @ is not used: write jail:office, set:office or tag:office
+! hint: run 'jailops firewall rule add --help' for usage
+[exit 2]
+
+$ jailops firewall rule add web in --action allow --redirect eighty
+! usage: --redirect "eighty" must be HOSTPORT:JAILPORT, for example 8080:80
+! hint: run 'jailops firewall rule add --help' for usage
+[exit 2]
+
+$ jailops firewall rule remove web 7
+! usage: policy web has 2 rules; there is no rule 7
+! hint: run 'jailops firewall rule remove --help' for usage
+[exit 2]
+
+$ jailops firewall rule remove web ghost
+! usage: policy web has no rule named "ghost" (list them with 'jailops firewall rule list web')
+! hint: run 'jailops firewall rule remove --help' for usage
+[exit 2]
+
+$ jailops firewall rule remove web
+! usage: say which rule: a number or a name (jailops firewall rule list web)
+! hint: run 'jailops firewall rule remove --help' for usage
+[exit 2]
+
+$ jailops firewall rule edit web 1
+! usage: nothing to change: give at least one of --action, --direction, --proto, --from, --to, --port, --name, --comment, --log, --redirect
+! hint: run 'jailops firewall rule edit --help' for usage
+[exit 2]
+
+$ jailops firewall rule move web 1
+! usage: say where: exactly one of --to N, --before RULE or --after RULE
+! hint: run 'jailops firewall rule move --help' for usage
+[exit 2]
+
+$ jailops firewall rule move web 1 --to 1 --after 1
+! usage: say where: exactly one of --to N, --before RULE or --after RULE
+! hint: run 'jailops firewall rule move --help' for usage
+[exit 2]
+
+$ jailops firewall rule add app-db in --action allow --proto tcp --port 5432 --comment x
+! usage: firewall policy "app-db" is managed by app-access: its rules are not changed here
+! hint: run 'jailops firewall rule add --help' for usage
+[exit 2]
+
+$ jailops firewall rule remove app-db 1
+! usage: firewall policy "app-db" is managed by app-access: its rules are not changed here
+! hint: run 'jailops firewall rule remove --help' for usage
+[exit 2]
+

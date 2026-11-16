@@ -3,12 +3,10 @@ kind: Network
 metadata:
   name: intra
 spec:
-  bridge: jo31
   uplink: vtnet0
   ipv4: {subnet: 10.95.0.0/24, gateway: 10.95.0.1, range: 10.95.0.2-10.95.0.254, nat: true}
   ipv6:
     mode: proxy
     subnet: "2001:db8:1:2:101::/80"      # the next /80: a network belongs to exactly one project
-    gateway: "fe80::1"
     range: "2001:db8:1:2:101::10-2001:db8:1:2:101::ffff"
   dns: [1.1.1.1, 2606:4700:4700::1111]

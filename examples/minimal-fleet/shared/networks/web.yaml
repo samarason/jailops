@@ -1,0 +1,10 @@
+apiVersion: jailops/v1
+kind: Network
+metadata:
+  name: web
+spec:
+  # A network for the web project alone: a network belongs to one project.
+  ipv4:
+    subnet: 10.50.0.0/24
+    gateway: 10.50.0.1
+    range: 10.50.0.10-10.50.0.250

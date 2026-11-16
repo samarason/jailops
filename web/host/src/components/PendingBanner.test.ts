@@ -19,6 +19,9 @@ describe('PendingBanner', () => {
     const w = mount(PendingBanner)
     await flushPromises()
     expect(w.get('[data-test="pending-banner"]').text()).toContain('firewall change reverts in 1:30')
+    // the countdown is in the sentence once, not repeated after it
+    expect(w.get('[data-test="pending-countdown"]').text().match(/1:30/g)).toHaveLength(1)
+    expect(w.get('[data-test="pending-banner"]').text().match(/\d+:\d\d/g)).toHaveLength(1)
     expect(w.get('[role="status"]').attributes('aria-live')).toBe('polite')
     // a second change waits for the first
     await expect(api.host.applyFirewall({ spec: fw.spec })).rejects.toMatchObject({ code: 'busy' })

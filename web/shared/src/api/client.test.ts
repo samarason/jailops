@@ -68,3 +68,37 @@ describe('SSE and protocol helpers', () => {
     expect(seen[1]['X-CSRF-Token']).toBe('tok-1')
   })
 })
+
+import { storeToken, storedToken } from './client'
+import { boot, session, demoBuild } from '../composables/session'
+
+describe('credentials in the browser', () => {
+  it('forgets an API token the server answers 401 to', async () => {
+    storeToken('jot_revoked')
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ type: 'error', error: { code: 'unauthorized', message: 'no' } }), { status: 401 }))
+    await new HttpTransport().request({ method: 'GET', path: '/jails' })
+    expect(storedToken()).toBe('')
+    vi.unstubAllGlobals()
+  })
+  it('a console without the demo ignores ?demo', async () => {
+    expect(demoBuild).toBe(false)
+    history.replaceState(null, '', '/?demo')
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ type: 'sync', metadata: { api_version: '1.0', api_extensions: [], role: 'host', auth: 'untrusted' } }), { status: 200 }))
+    await boot({ role: 'host' })
+    expect(session.demo).toBe(false)
+    expect(session.demoAvailable).toBe(false)
+    expect(sessionStorage.getItem('jailops.demo')).toBeNull()
+    vi.unstubAllGlobals()
+    history.replaceState(null, '', '/')
+  })
+})
+
+describe('streams', () => {
+  it('a stream path goes through the request filter, the project included', () => {
+    const paths: string[] = []
+    const c = new Client({ request: async () => sync(null), stream: (p) => (paths.push(p), { close() {} }) })
+    c.setRequestFilter((p) => p + '?project=web')
+    c.stream('/jails/a/console/x/output', { onEvent() {} })
+    expect(paths).toEqual(['/jails/a/console/x/output?project=web'])
+  })
+})

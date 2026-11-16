@@ -215,6 +215,15 @@ func (s *Service) planSwitch(ctx context.Context, st *jailState, rec Record, tar
 		}, UndoOnFail: true})
 
 	mergeDS := s.mergeDatasets(st)
+	dataMerge := map[string]bool{} // the merge datasets that hold data, not configuration
+	for _, d := range st.Persist {
+		if d.Merge && d.Class != ClassSystem {
+			dataMerge[d.DS] = true
+		}
+	}
+	startIdx := -1 // the index of the step that starts the jail on the new generation (set where it is added)
+	// the jail has been started on the new generation (or was being): it may have written to its data
+	jailRan := func(ctx context.Context) bool { return startIdx >= 0 && plan.BegunSteps(ctx) > startIdx }
 	rootMP, newMP := s.Cfg.at(name).rootMP(), s.Cfg.at(name).rootNewMP()
 	newDS := s.Cfg.at(name).rootNewDS()
 
@@ -279,6 +288,12 @@ func (s *Service) planSwitch(ctx context.Context, st *jailState, rec Record, tar
 				if ok, _ := z.Exists(ctx, d+"@"+mergeSnap); !ok {
 					continue
 				}
+				// Once the jail has run on the new generation, a dataset of data (/var/db: the databases of the
+				// packages) holds what the jail wrote since the snapshot, and a rollback would drop it while /home
+				// and the rest keep theirs. Only the configuration is put back then.
+				if dataMerge[d] && jailRan(ctx) {
+					continue
+				}
 				if err := z.Rollback(ctx, d+"@"+mergeSnap, false); err != nil {
 					errs = append(errs, err)
 				}
@@ -310,6 +325,7 @@ func (s *Service) planSwitch(ctx context.Context, st *jailState, rec Record, tar
 	pl.Add(s.bundleStep(name, oldBundle, newBundle))
 
 	// 8. start and health check; failure swaps back (the undo chain)
+	startIdx = len(pl.Steps)
 	pl.Add(plan.Step{Name: "start", Describe: "mount, render and jail -c " + name + " on " + target.Name,
 		Do:   func(ctx context.Context) error { return s.doStart(ctx, name) },
 		Undo: func(ctx context.Context) error { return s.doStop(ctx, name) }, UndoOnFail: true})
@@ -366,9 +382,6 @@ func (s *Service) cloneNewRoot(st *jailState, rec Record, target api.ImageGenera
 	props := map[string]string{PropManaged: "on", PropID: st.ID, PropKind: KindRoot, PropName: st.Name,
 		"mountpoint": s.Cfg.at(st.Name).rootNewMP(), "canmount": "noauto", PropGen: strconv.Itoa(target.Number),
 		PropImage: st.Image, PropManifest: target.Manifest, PropPrevGen: strconv.Itoa(st.Gen)}
-	if q := rec.Spec.Resources.Disk; q != "" {
-		props["quota"] = q
-	}
 	snap := target.Dataset + "@" + roSnap
 	return plan.Step{Name: "clone-new-root", Describe: fmt.Sprintf("zfs clone %s %s", snap, newDS),
 		Do:   func(ctx context.Context) error { return s.ZFS.Clone(ctx, snap, newDS, props) },

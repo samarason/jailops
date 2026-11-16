@@ -17,7 +17,7 @@ const (
 
 // DoctorCheck is one diagnostic of GET /api/v1/doctor.
 type DoctorCheck struct {
-	// Name is a stable identifier such as "kernel.module.if_bridge".
+	// Name is a stable identifier such as "kernel.module.if_epair".
 	Name    string       `json:"name"`
 	Status  DoctorStatus `json:"status"`
 	Message string       `json:"message,omitempty"`
@@ -60,4 +60,25 @@ type PoolUsage struct {
 	Allocated uint64 `json:"allocated"`
 	Free      uint64 `json:"free"`
 	Health    string `json:"health,omitempty"`
+}
+
+// DoctorFixRequest is the body of POST /api/v1/doctor/fix: the safe cleanups the diagnostics report, with DryRun only
+// listing them.
+type DoctorFixRequest struct {
+	DryRun bool `json:"dry_run,omitempty"`
+}
+
+// DoctorFixAction is one cleanup of POST /api/v1/doctor/fix: what it is for (the check), what it does, and whether it
+// was done.
+type DoctorFixAction struct {
+	Check string `json:"check"`
+	What  string `json:"what"`
+	Done  bool   `json:"done,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// DoctorFixResult is the reply of POST /api/v1/doctor/fix.
+type DoctorFixResult struct {
+	DryRun  bool              `json:"dry_run,omitempty"`
+	Actions []DoctorFixAction `json:"actions"`
 }

@@ -64,6 +64,15 @@ func TestManPages(t *testing.T) {
 			}
 		}
 	}
+	// every page has the environment and the exit status
+	for _, name := range []string{"jailops.1", "jailops-jail-delete.1"} {
+		b, _ := os.ReadFile(filepath.Join(dir, name))
+		for _, want := range []string{".Sh ENVIRONMENT\n", ".It Ev JAILOPS_PROJECT\n", ".Sh EXIT STATUS\n", ".It 4\nnot found\n"} {
+			if !strings.Contains(string(b), want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
 	if _, err := os.Stat(filepath.Join(dir, "jailops-man.1")); err == nil {
 		t.Error("the man command documented itself")
 	}

@@ -47,7 +47,7 @@ var batch = []Entry{
 
 func send(t *testing.T, k api.LogSink, env *Env, b []Entry) error {
 	t.Helper()
-	snd, err := newSender(k, env)
+	snd, err := newSender(k, env, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestSyslogTCP(t *testing.T) {
 	}()
 	env, _ := testEnv(t)
 	k := api.LogSink{Name: "t", Type: api.LogSinkSyslog, To: "tcp://" + ln.Addr().String()}
-	snd, err := newSender(k, env)
+	snd, err := newSender(k, env, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestSyslogTLS(t *testing.T) {
 	// a CA file the check refuses is never read
 	env.CheckFile = func(string, bool) error { return io.ErrUnexpectedEOF }
 	k.CAFile = caFile
-	if _, err := newSender(k, env); err == nil || !strings.Contains(err.Error(), "ca_file") {
+	if _, err := newSender(k, env, false); err == nil || !strings.Contains(err.Error(), "ca_file") {
 		t.Fatalf("%v", err)
 	}
 }
@@ -267,7 +267,7 @@ func TestWebhook(t *testing.T) {
 	status = 503
 	mu.Unlock()
 	err := send(t, k, env, batch[:1])
-	if err == nil || err.Error() != `HTTP 503: busy\x1b[2J` {
+	if err == nil || err.Error() != "HTTP 503" {
 		t.Fatalf("%v", err)
 	}
 	if !strings.Contains(strings.Join(*checked, ","), tokFile+":true") {
@@ -275,7 +275,7 @@ func TestWebhook(t *testing.T) {
 	}
 	// a token file whose first line is empty is refused
 	_ = os.WriteFile(tokFile, []byte("\nx\n"), 0o600)
-	if _, err := newSender(k, env); err == nil || !strings.Contains(err.Error(), "token_file") {
+	if _, err := newSender(k, env, false); err == nil || !strings.Contains(err.Error(), "token_file") {
 		t.Fatalf("%v", err)
 	}
 }
@@ -311,5 +311,36 @@ func TestWebhookErrorHidesQuery(t *testing.T) {
 	err = send(t, api.LogSink{Name: "w", Type: api.LogSinkWebhook, To: "https://" + addr + "/in?key=s3cret"}, env, batch[:1])
 	if err == nil || strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "POST https://"+addr+"/in:") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// A webhook that answers with a redirect is a failure: the batch and the token are never sent on to where it points.
+func TestWebhookDoesNotFollowRedirects(t *testing.T) {
+	var mu sync.Mutex
+	var hits []string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.URL.Path == "/ingest" {
+			http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer ts.Close()
+	dir := t.TempDir()
+	caFile, tokFile := filepath.Join(dir, "ca.pem"), filepath.Join(dir, "token")
+	_ = os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw}), 0o644)
+	_ = os.WriteFile(tokFile, []byte("s3cret-token\n"), 0o600)
+	env, _ := testEnv(t)
+	err := send(t, api.LogSink{Name: "w", Type: api.LogSinkWebhook, To: ts.URL + "/ingest", CAFile: caFile, TokenFile: tokFile}, env, batch)
+	if err == nil || !strings.HasPrefix(err.Error(), "HTTP 307") {
+		t.Fatalf("a redirect: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 1 || hits[0] != "/ingest Bearer s3cret-token" {
+		t.Fatalf("followed: %q", hits)
 	}
 }

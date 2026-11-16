@@ -103,8 +103,7 @@ func TestAppDraft(t *testing.T) {
 		t.Errorf("%+v", d)
 	}
 	// the host command is the one the helper allows; the in-jail ones are the builders'
-	root := "/jailops/projects/alpha/jails/web/root"
-	if !slices.Contains(e.Run.Argv(), strings.Join(apps.PkgLeavesArgv(root), " ")) {
+	if !slices.Contains(e.Run.Argv(), strings.Join(apps.PkgLeavesArgv("alpha_web"), " ")) {
 		t.Errorf("host commands %q", e.Run.Argv())
 	}
 	want := [][]string{apps.SockstatArgv(), apps.FindNewerArgv("/usr/local/etc"), apps.FindNewerArgv("/var/log"),
@@ -158,7 +157,7 @@ func TestAppsLocalDir(t *testing.T) {
 	}
 	write(cat, "demo", appDemo)
 	write(loc, "demo", strings.Replace(appDemo, "title: Demo", "title: Our demo", 1))
-	write(loc, "mine", strings.ReplaceAll(appDemo, "name: demo", "name: mine"))
+	write(loc, "mine", strings.ReplaceAll(strings.ReplaceAll(appDemo, "name: demo", "name: mine"), `release_min: "15.1"`, `release_min: "15.2"`))
 	write(loc, "broken", "version: 1\nname: broken\n")
 	e := dtest.New(t, dtest.Options{Mutate: func(c *daemon.Config) { c.Apps.CatalogDir, c.Apps.LocalDir = cat, loc }})
 	e.Seed()
@@ -204,7 +203,7 @@ func TestAppsLocalDir(t *testing.T) {
 	if err == nil {
 		_, err = op.Wait(c)
 	}
-	// the seeded image is 15.0, which the definition refuses: the refusal shows the local definition was the one read
+	// the seeded image is 15.1, which this definition (15.2 or later) refuses: the refusal shows the local definition was the one read
 	if err == nil || !strings.Contains(err.Error(), "mine") {
 		t.Fatalf("%v", err)
 	}

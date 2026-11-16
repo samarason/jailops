@@ -20,30 +20,38 @@ func Invalid(field, format string, args ...any) *api.Error {
 }
 
 var (
-	nameRE     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	labelRE    = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 	ifnameRE   = regexp.MustCompile(`^[a-z][a-z0-9]{0,14}$`)
-	setNameRE  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,23}$`)
-	tagRE      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,23}$`)
+	kindWordRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 	ruleNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`)
 	pkgRE      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$`)
 	envKeyRE   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 	macRE      = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
-	imageNmRE  = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
-	aliasRE    = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,62}$`)
 	osrelRE    = regexp.MustCompile(`^[0-9]{1,3}\.[0-9]{1,3}(-[A-Za-z0-9]{1,16}(-p[0-9]{1,4})?)?$`)
 )
 
-// Name validates a jail, network or policy name: DNS-label-like, lower case.
-func Name(field, s string) error {
-	if !nameRE.MatchString(s) {
-		return Invalid(field, "%s %q must match ^[a-z][a-z0-9-]{0,62}$", field, s)
+// Name validates a name a user chooses (jail, network, storage, volume, policy, profile, ...): api.NamePattern, at
+// most 63 characters.
+func Name(field, s string) error { return NameMax(field, s, api.MaxName) }
+
+// NameMax validates a name by api.NamePattern with a limit of its own (a derived name sets it).
+func NameMax(field, s string, max int) error {
+	if !api.IsName(s, max) {
+		return Invalid(field, "%s %q must be lower case letters, digits and hyphens, start with a letter, not end in a hyphen, at most %d characters", field, s, max)
 	}
 	return nil
 }
 
 // JailName validates a jail name.
-func JailName(s string) error { return Name("name", s) }
+func JailName(s string) error {
+	if err := Name("name", s); err != nil {
+		return err
+	}
+	if s == "host" { // host.PROJECT.internal is the host as the jails see it
+		return Invalid("name", "name %q is the name of the host in the names of the jails; choose another", s)
+	}
+	return nil
+}
 
 // Hostname validates a DNS hostname of at most 253 characters.
 func Hostname(field, s string) error {
@@ -62,26 +70,23 @@ func Hostname(field, s string) error {
 // (lower case letters and digits, at most 15 characters).
 func IfName(field, s string) error {
 	if !ifnameRE.MatchString(s) {
-		return Invalid(field, "%s %q is not a valid interface name", field, s)
+		return Invalid(field, "%s %q is not a valid interface name (a lowercase letter, then lowercase letters and digits, 15 at most)", field, s)
 	}
 	return nil
 }
 
-// SetName validates an address set name (a PF table name component).
-func SetName(field, s string) error {
-	if !setNameRE.MatchString(s) {
-		return Invalid(field, "%s %q must match ^[a-z][a-z0-9_]{0,23}$", field, s)
-	}
-	return nil
-}
+// SetName validates the name of a new address set: lower case letters, digits and hyphens, at most 29 characters (its
+// table in pf is "s_" and the name with the hyphens written as underscores, see SetTable).
+func SetName(field, s string) error { return NameMax(field, s, MaxSetName) }
+
+// MaxSetName is the longest name of an address set: its table in pf, "s_" and the name, has at most 31 characters.
+const MaxSetName = 29
+
+// SetTable is the name of the pf table of an address set: pf names have no hyphen.
+func SetTable(name string) string { return "s_" + strings.ReplaceAll(name, "-", "_") }
 
 // Tag validates a firewall tag.
-func Tag(field, s string) error {
-	if !tagRE.MatchString(s) || strings.HasSuffix(s, "-") {
-		return Invalid(field, "%s %q must match ^[a-z0-9][a-z0-9-]{0,23}$", field, s)
-	}
-	return nil
-}
+func Tag(field, s string) error { return NameMax(field, s, 24) }
 
 // RuleName validates a free-form rule label.
 func RuleName(field, s string) error {
@@ -149,9 +154,12 @@ type ImageRef struct {
 // ParseImageRef parses "name", "name@alias" or "name#g<N>".
 func ParseImageRef(s string) (ImageRef, error) {
 	const f = "image"
+	if s == "" {
+		return ImageRef{}, Invalid(f, "an image is required: name one with --image NAME")
+	}
 	if i := strings.IndexByte(s, '#'); i >= 0 {
 		name, gen := s[:i], s[i+1:]
-		if !imageNmRE.MatchString(name) {
+		if !api.IsName(name, api.MaxName) {
 			return ImageRef{}, Invalid(f, "image name %q is invalid", name)
 		}
 		if len(gen) < 2 || gen[0] != 'g' || len(gen) > 10 || (gen[1] == '0') {
@@ -164,10 +172,10 @@ func ParseImageRef(s string) (ImageRef, error) {
 		return ImageRef{Name: name, Generation: n, Pinned: true}, nil
 	}
 	name, alias, has := strings.Cut(s, "@")
-	if !imageNmRE.MatchString(name) {
-		return ImageRef{}, Invalid(f, "image reference %q is invalid", s)
+	if !api.IsName(name, api.MaxName) {
+		return ImageRef{}, Invalid(f, "image reference %q is invalid (--image NAME, NAME@alias or NAME#gN)", s)
 	}
-	if has && !aliasRE.MatchString(alias) {
+	if has && !api.IsName(alias, 32) {
 		return ImageRef{}, Invalid(f, "image alias %q is invalid", alias)
 	}
 	return ImageRef{Name: name, Alias: alias}, nil
@@ -182,6 +190,35 @@ func (r ImageRef) String() string {
 		return r.Name + "@" + r.Alias
 	}
 	return r.Name
+}
+
+// ParseRate parses a rate in bits per second: "10M" is 10 Mbit/s, "1G" 1 Gbit/s, "500K" 500 kbit/s, "64000" 64 kbit/s.
+// Units are decimal (K=1000), as network rates are. Zero is rejected.
+func ParseRate(s string) (uint64, error) {
+	t, mult := s, uint64(1)
+	if t != "" {
+		switch t[len(t)-1] {
+		case 'K', 'k':
+			mult = 1000
+		case 'M', 'm':
+			mult = 1000 * 1000
+		case 'G', 'g':
+			mult = 1000 * 1000 * 1000
+		}
+		if mult != 1 {
+			t = t[:len(t)-1]
+		}
+	}
+	if t == "" || len(t) > 9 || t[0] == '0' {
+		return 0, Invalid("rate", "rate %q is not a rate in bits per second such as 10M", s)
+	}
+	for i := 0; i < len(t); i++ {
+		if t[i] < '0' || t[i] > '9' {
+			return 0, Invalid("rate", "rate %q is not a rate in bits per second such as 10M", s)
+		}
+	}
+	n, _ := strconv.ParseUint(t, 10, 64)
+	return n * mult, nil
 }
 
 // ParseSize parses "512M", "2G", "100" (bytes), optionally with a trailing
@@ -231,6 +268,24 @@ func ParseSize(s string) (uint64, error) {
 		return 0, Invalid("size", "size %q is too large", s)
 	}
 	return n * mult, nil
+}
+
+// MaxSizeBytes is the largest quota, reservation or volume size the privileged helper sets (16 TiB, its fixed limit).
+const MaxSizeBytes = 16 << 40
+
+// CanonicalSize parses a size the way ParseSize does and returns it as decimal bytes, the one form ZFS, the helper and
+// the jail lifecycle all accept and the form `zfs get -p` reports, so a stored value compares equal to what is
+// observed. A size above MaxSizeBytes is refused here and not when the helper sees it.
+func CanonicalSize(field, s string) (string, error) {
+	n, err := ParseSize(s)
+	if err != nil {
+		return "", Invalid(field, "%s %q is not a size such as 512M, 4G or 4GiB", field, s).
+			WithHint("a size is a whole number of bytes with an optional unit K, M, G, T or P (binary, 1K = 1024)")
+	}
+	if n > MaxSizeBytes {
+		return "", Invalid(field, "%s %q is larger than 16T, the largest size the helper sets", field, s)
+	}
+	return strconv.FormatUint(n, 10), nil
 }
 
 // addr parses an IP address without zone.

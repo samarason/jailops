@@ -210,7 +210,7 @@ func (objects) Network(n string) (api.NetworkSpec, bool) {
 }
 func (objects) Policy(n string) (api.FirewallPolicySpec, bool) {
 	if n == "web" {
-		return api.FirewallPolicySpec{DefaultIn: "deny"}, true
+		return api.FirewallPolicySpec{DefaultIn: "deny", DefaultOut: "allow"}, true
 	}
 	return api.FirewallPolicySpec{}, false
 }
@@ -220,7 +220,7 @@ var testGen = api.ImageGeneration{Number: 1, Name: "fbsd#g1", Manifest: "mf1", D
 
 // makeJail creates the datasets and files of a thin jail in w and returns its
 // record. Layout: container (spec.json, bundle.json), root (not captured),
-// etc, local, and the volume data/db (a few MiB so it has several chunks).
+// etc, local and db (a few MiB so it has several chunks).
 func makeJail(t *testing.T, w *world, name, uuid string, labels map[string]string) JailRecord {
 	t.Helper()
 	c := "tank/jailops/projects/src/jails/" + name
@@ -228,8 +228,7 @@ func makeJail(t *testing.T, w *world, name, uuid string, labels map[string]strin
 	j := JailRecord{Name: name, Project: "alpha", UUID: uuid, Labels: labels, Container: c, Image: testGen,
 		Spec: api.JailSpec{Image: "fbsd@stable", Layout: api.LayoutThin, Hostname: name,
 			Network:  []api.NetworkAttach{{Network: "lan", IPv4: "10.20.0.5", MAC: "02:aa:bb"}},
-			Firewall: api.FirewallAttach{Policy: "web"},
-			Volumes:  []api.VolumeMount{{Name: "db", Mount: "/var/db/app"}}}}
+			Firewall: api.FirewallAttach{Policies: []string{"web"}}}}
 	mk := func(rel, kind, mount string, props map[string]string) {
 		ds := c
 		if rel != "" {
@@ -244,8 +243,7 @@ func makeJail(t *testing.T, w *world, name, uuid string, labels map[string]strin
 	mk("root", KindRoot, mp+"/root", nil)
 	mk("etc", KindPersistent, mp+"/root/etc", map[string]string{"jailops:path": "/etc", "jailops:class": "system"})
 	mk("local", KindPersistent, mp+"/root/usr/local", map[string]string{"jailops:path": "/usr/local", "jailops:class": "data"})
-	mk("data", KindVolumes, "none", nil)
-	mk("data/db", KindVolume, mp+"/root/var/db/app", map[string]string{"jailops:path": "/var/db/app", "quota": "1G", "jailops:class": "data"})
+	mk("db", KindPersistent, mp+"/root/var/db/app", map[string]string{"jailops:path": "/var/db/app", "quota": "1G", "jailops:class": "data"})
 
 	rnd := rand.New(rand.NewSource(int64(len(name))*7 + 1))
 	write := func(ds, rel string, size int) {
@@ -266,10 +264,10 @@ func makeJail(t *testing.T, w *world, name, uuid string, labels map[string]strin
 	write(c+"/etc", "rc.conf", 400)
 	write(c+"/etc", "ssh/sshd_config", 900)
 	write(c+"/local", "etc/app.conf", 100)
-	write(c+"/data/db", "main.db", 5<<20)
-	write(c+"/data/db", "wal/001", 70<<10)
+	write(c+"/db", "main.db", 5<<20)
+	write(c+"/db", "wal/001", 70<<10)
 	for i := 0; i < 20; i++ {
-		write(c+"/data/db", fmt.Sprintf("small/f%02d", i), 1000+i)
+		write(c+"/db", fmt.Sprintf("small/f%02d", i), 1000+i)
 	}
 	return j
 }

@@ -1,6 +1,0 @@
-apiVersion: jailops/v1
-kind: AddressSet
-metadata:
-  name: web_tier
-spec:
-  addresses: ["2001:db8:1:2:100::80", 10.94.0.10]

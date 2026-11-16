@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,7 +19,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 	"jailops.net/jailops/internal/apps"
-	"jailops.net/jailops/internal/service"
+	"jailops.net/jailops/internal/priv"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -37,7 +38,7 @@ type Config struct {
 	Pool string `yaml:"pool"`
 	// Dataset is the JailOps dataset; default "<pool>/jailops".
 	Dataset string `yaml:"dataset"`
-	// MountBase is where the dataset is mounted; default "/jailops".
+	// MountBase is where the dataset is mounted; default "/usr/local/jailops".
 	MountBase string `yaml:"mount_base"`
 	// StateDir defaults to <data_dir>/state, which is where jailops-priv init mounts the state dataset. It must lie
 	// outside the storage root: the root is owned by the helper and not writable by the daemon.
@@ -55,34 +56,54 @@ type Config struct {
 	Priv Priv `yaml:"priv"`
 	Log  Log  `yaml:"log"`
 
-	Reconcile Reconcile   `yaml:"reconcile"`
-	ZFS       ZFSConf     `yaml:"zfs"`
-	Limits    Limits      `yaml:"limits"`
-	Projects  Projects    `yaml:"projects"`
-	Network   NetworkConf `yaml:"network"`
-	Lifecycle Lifecycle   `yaml:"lifecycle"`
+	Reconcile Reconcile `yaml:"reconcile"`
+	ZFS       ZFSConf   `yaml:"zfs"`
+	Limits    Limits    `yaml:"limits"`
+	Projects  Projects  `yaml:"projects"`
+	Lifecycle Lifecycle `yaml:"lifecycle"`
 	// Backup, when present, enables host-side backups (design 9): the key,
 	// capture, the schedule, restore and restore tests, against one backup
 	// node. Absent, every backup call answers unsupported.
 	Backup *BackupConf `yaml:"backup"`
 	// Updates configures the update scheduler.
 	Updates UpdatesConf `yaml:"updates"`
+	// Jails holds the defaults of new jails: their shell and bash prompt (docs/shell.md).
+	Jails JailsConf `yaml:"jails"`
 	// Apps configures the application catalog (docs/apps.md).
 	Apps AppsConf `yaml:"apps"`
 	// Host configures host management (docs/appliance.md).
 	Host HostConf `yaml:"host"`
 	// Logging configures log forwarding (docs/logging.md).
 	Logging LoggingConf `yaml:"logging"`
+	// Audit configures how long the audit log keeps its entries.
+	Audit AuditConf `yaml:"audit"`
+	// Devd configures reading the kernel's notifications from devd(8) (docs/operations.md).
+	Devd DevdConf `yaml:"devd"`
 
 	// Appliance are the modules rc.conf turned on (ApplyAppliance); never read from the file.
 	Appliance []string `yaml:"-"`
+}
+
+// AuditConf bounds the audit log. Once a day the daemon deletes the entries older than Retention and the oldest
+// beyond MaxEntries; the newest 1000 entries are never deleted.
+type AuditConf struct {
+	// Retention is how long an entry is kept (default 90d; at least 1d).
+	Retention Duration `yaml:"retention"`
+	// MaxEntries bounds the number of entries (default 1000000; at least 1000).
+	MaxEntries int `yaml:"max_entries"`
 }
 
 // LoggingConf configures where the logs of the jails go. Forward is the
 // sink list in force until an administrator stores one through the API.
 type LoggingConf struct {
 	Forward []api.LogSink `yaml:"forward"`
+	// SecretsDir is the only directory the CA and token files of a sink set through the API may lie in (default
+	// DefaultLogSecretsDir; root-owned, 0750 root:jailops). The files of Forward may lie anywhere.
+	SecretsDir string `yaml:"secrets_dir"`
 }
+
+// DefaultLogSecretsDir is the default of logging.secrets_dir.
+const DefaultLogSecretsDir = "/usr/local/etc/jailops/sinks"
 
 // HostConf configures host management: JailOps changes the host itself only for the modules listed here (and in
 // host-manage of priv.conf).
@@ -107,6 +128,23 @@ type AppsConf struct {
 	LocalDir string `yaml:"local_dir"`
 }
 
+// DevdConf configures the events the host raises from the kernel's notifications: ZFS errors, the link of the uplink,
+// a limit a jail hit.
+type DevdConf struct {
+	// Enable turns reading devd's socket on or off; the default is on for FreeBSD and off elsewhere.
+	Enable *bool `yaml:"enable"`
+	// Pipe is the seqpacket socket of devd; default /var/run/devd.seqpacket.pipe.
+	Pipe string `yaml:"pipe"`
+}
+
+// On reports whether the daemon reads devd's socket.
+func (d DevdConf) On() bool {
+	if d.Enable != nil {
+		return *d.Enable
+	}
+	return runtime.GOOS == "freebsd"
+}
+
 // UpdatesConf configures managed updates (design 8.4). Updates are off for
 // every jail until a user sets its updates.mode.
 type UpdatesConf struct {
@@ -115,6 +153,27 @@ type UpdatesConf struct {
 	// ProjectFilesDir holds the provisioning files, one directory per project
 	// (default <state_dir>/project-files).
 	ProjectFilesDir string `yaml:"project_files_dir"`
+}
+
+// DefaultMaxStates is the default of jails.max_states: the pf states each pass rule of a jail may create. Ten thousand
+// keeps a jail far from the 100000 states of pf's default table, and is above what a busy DNS or web server of a
+// jail keeps open at once; a jail that needs more has limits.states.
+const DefaultMaxStates = 10000
+
+// JailsConf holds the defaults a new FreeBSD jail gets when its request (and its profiles) leave the shell and
+// prompt keys empty. They apply to jails created from now on; an existing jail gets them only through
+// `jailops jail shell-setup`.
+type JailsConf struct {
+	// Shell is bash (the default: installed at the jail's first start and started by `jailops shell` and the
+	// console) or sh (FreeBSD's own shell; nothing is installed).
+	Shell string `yaml:"shell"`
+	// Prompt is the bash prompt of a jail whose shell is bash: default (the default), short, none, or a PS1 text.
+	Prompt string `yaml:"prompt"`
+	// PromptColor is the 256-colour number of the default prompt, 1 to 255 (default 39, a light blue).
+	PromptColor *int `yaml:"prompt_color"`
+	// MaxStates is the pf state limit of a jail whose limits.states is 0: each pass rule of its anchor may create that
+	// many states (default 10000; 0 sets no limit).
+	MaxStates *int `yaml:"max_states"`
 }
 
 // BackupConf configures internal/hostbackup.
@@ -163,15 +222,6 @@ type PersistentPath struct {
 	Class   string `yaml:"class"` // system or data
 	Merge   bool   `yaml:"merge"`
 	NoSeed  bool   `yaml:"no_seed"`
-}
-
-// NetworkConf configures host networking.
-type NetworkConf struct {
-	// Sysctl overrides the bridge sysctls the daemon sets at runtime
-	// through the helper; only net.link.bridge.pfil_bridge, pfil_member and
-	// pfil_onlyip are accepted, each 0 or 1. They are re-asserted by the
-	// reconcile loop and never written to /etc/sysctl.conf.
-	Sysctl map[string]string `yaml:"sysctl"`
 }
 
 // Projects configures project creation. NetworkPool is the pool of subnets
@@ -318,6 +368,15 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	if err := n.Decode(&s); err != nil {
 		return err
 	}
+	// whole days are written "90d"
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		days, err := strconv.Atoi(n)
+		if err != nil || days < 0 {
+			return fmt.Errorf("invalid duration %q", s)
+		}
+		*d = Duration(time.Duration(days) * 24 * time.Hour)
+		return nil
+	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q", s)
@@ -333,14 +392,16 @@ func (d Duration) Std() time.Duration { return time.Duration(d) }
 func Defaults() Config {
 	t := true
 	return Config{
-		Role: "host", MountBase: "/jailops", DataDir: "/var/db/jailops",
+		Role: "host", MountBase: "/usr/local/jailops", DataDir: "/var/db/jailops",
 		ConfDir: "/usr/local/etc/jailops/jails", WorkDir: "/var/tmp/jailops",
 		Listen:    Listen{Unix: UnixListen{Path: "/var/run/jailops/jailops.sock", Mode: 0o666}},
-		Priv:      Priv{Socket: "/var/run/jailops/priv.sock"},
+		Priv:      Priv{Socket: priv.DefaultSocket},
 		Log:       Log{Level: "info", Format: "text"},
 		Reconcile: Reconcile{Interval: Duration(60 * time.Second), Autostart: &t},
 		Limits:    Limits{MaxBodyBytes: 4 << 20, RequestTimeout: Duration(60 * time.Second)},
 		Apps:      AppsConf{CatalogDir: apps.DefaultDir, LocalDir: apps.DefaultLocalDir},
+		Audit:     AuditConf{Retention: Duration(90 * 24 * time.Hour), MaxEntries: 1000000},
+		Logging:   LoggingConf{SecretsDir: DefaultLogSecretsDir},
 	}
 }
 
@@ -351,39 +412,12 @@ func Decode(r io.Reader) (Config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("config: %w", err)
 	}
-	if err := rejectRemovedKeys(raw); err != nil {
-		return cfg, err
-	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil && err != io.EOF {
 		return cfg, fmt.Errorf("config: %w", err)
 	}
 	return cfg.finish()
-}
-
-// removedUnixKeys are the keys of the old Unix user/group to role mapping.
-var removedUnixKeys = []string{"admin_group", "user_group", "user_projects"}
-
-// rejectRemovedKeys fails with an explanation, not a bare "unknown field", for the keys that mapped Unix groups to
-// roles: that mapping no longer exists.
-func rejectRemovedKeys(raw []byte) error {
-	var probe struct {
-		Listen struct {
-			Unix map[string]any `yaml:"unix"`
-		} `yaml:"listen"`
-	}
-	if err := yaml.Unmarshal(raw, &probe); err != nil {
-		return nil // the strict decode reports the real syntax or type error
-	}
-	for _, k := range removedUnixKeys {
-		if _, ok := probe.Listen.Unix[k]; ok {
-			return fmt.Errorf("config: listen.unix.%s is no longer supported: Unix users and groups are not mapped to roles any more. "+
-				"Remove the key; root on the host is the global administrator, and everyone else signs in with a JailOps user, API token or client certificate "+
-				"(create the first administrator with: sudo jailops user create NAME --admin)", k)
-		}
-	}
-	return nil
 }
 
 // Load reads the file at path.
@@ -415,6 +449,15 @@ func (c Config) finish() (Config, error) {
 	if c.StateDir == "" {
 		c.StateDir = filepath.Join(c.DataDir, "state")
 	}
+	if c.Audit.Retention == 0 {
+		c.Audit.Retention = Duration(90 * 24 * time.Hour)
+	}
+	if c.Audit.MaxEntries == 0 {
+		c.Audit.MaxEntries = 1000000
+	}
+	if c.Audit.Retention.Std() < 24*time.Hour || c.Audit.MaxEntries < 1000 {
+		return c, fmt.Errorf("config: audit.retention must be at least 1d and audit.max_entries at least 1000")
+	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
@@ -427,6 +470,33 @@ func (c Config) finish() (Config, error) {
 	}
 	if c.Apps.CatalogDir == "" {
 		c.Apps.CatalogDir = apps.DefaultDir
+	}
+	switch c.Jails.Shell {
+	case "":
+		c.Jails.Shell = api.ShellBash
+	case api.ShellBash, api.ShellSh:
+	default:
+		return c, fmt.Errorf("config: jails.shell %q must be bash or sh", c.Jails.Shell)
+	}
+	if c.Jails.Prompt == "" {
+		c.Jails.Prompt = api.PromptDefault
+	}
+	if err := api.CheckPrompt(c.Jails.Prompt); err != nil {
+		return c, fmt.Errorf("config: jails.prompt: %v", err)
+	}
+	if c.Jails.PromptColor == nil {
+		n := api.DefaultPromptColor
+		c.Jails.PromptColor = &n
+	}
+	if err := api.CheckPromptColor(*c.Jails.PromptColor); err != nil || *c.Jails.PromptColor == 0 {
+		return c, fmt.Errorf("config: jails.prompt_color %d must be a 256-colour number between 1 and 255 (16 is black)", *c.Jails.PromptColor)
+	}
+	if c.Jails.MaxStates == nil {
+		n := DefaultMaxStates
+		c.Jails.MaxStates = &n
+	}
+	if *c.Jails.MaxStates < 0 || *c.Jails.MaxStates > 10000000 {
+		return c, fmt.Errorf("config: jails.max_states %d must be between 0 and 10000000", *c.Jails.MaxStates)
 	}
 	if c.Apps.LocalDir == "" {
 		c.Apps.LocalDir = apps.DefaultLocalDir
@@ -475,17 +545,6 @@ func (c Config) finish() (Config, error) {
 			return c, fmt.Errorf("config: projects.network_bits %d does not fit %s", bits, p)
 		}
 	}
-	if v, ok := c.Network.Sysctl[service.SysctlPfilMemberKey]; ok && v != "1" {
-		return c, fmt.Errorf("config: network.sysctl %s must be 1: the per-jail pf rules stand on the ports of the bridge", service.SysctlPfilMemberKey)
-	}
-	for k, v := range c.Network.Sysctl {
-		if !slices.Contains(service.NetSysctlKeys, k) {
-			return c, fmt.Errorf("config: network.sysctl accepts only %s, not %q", strings.Join(service.NetSysctlKeys, ", "), k)
-		}
-		if v != "0" && v != "1" {
-			return c, fmt.Errorf("config: network.sysctl %s must be 0 or 1, not %q", k, v)
-		}
-	}
 	if b := c.Backup; b != nil {
 		if b.Node.Address == "" || b.Node.Fingerprint == "" {
 			return c, fmt.Errorf("config: backup.node.address and backup.node.fingerprint are required (the node's certificate is pinned)")
@@ -528,6 +587,15 @@ func (c Config) finish() (Config, error) {
 	}
 	if err := (api.LogForwardSpec{Sinks: c.Logging.Forward}).Validate(); err != nil {
 		return c, fmt.Errorf("config: logging.forward: %v", err)
+	}
+	if d := c.Logging.SecretsDir; d == "" || !filepath.IsAbs(d) || filepath.Clean(d) != d || d == "/" {
+		return c, fmt.Errorf("config: logging.secrets_dir %q must be a clean absolute path other than /", d)
+	}
+	if c.Devd.Pipe == "" {
+		c.Devd.Pipe = "/var/run/devd.seqpacket.pipe"
+	}
+	if p := c.Devd.Pipe; !filepath.IsAbs(p) || filepath.Clean(p) != p || p == "/" || strings.ContainsRune(p, 0) {
+		return c, fmt.Errorf("config: devd.pipe %q must be a clean absolute path", p)
 	}
 	if c.Reconcile.Interval.Std() < time.Second {
 		return c, fmt.Errorf("config: reconcile.interval must be at least 1s")

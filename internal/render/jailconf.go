@@ -47,13 +47,24 @@ type JailConfInput struct {
 	// SysVIPC gives the jail System V IPC namespaces of its own (sysvmsg,
 	// sysvsem, sysvshm = new); never inherit, which would share the host's.
 	SysVIPC bool
+	// ZFSDataset is the dataset handed to the jail (zfs_delegation): jail(8) runs `zfs jail` on it at the start and
+	// `zfs unjail` at the stop. It needs allow.mount.zfs and enforce_statfs below 2, which the caller sets.
+	ZFSDataset string
+	// Where is the jail's name, its project and the short name of its host. They become the jail parameters
+	// env.jailops_jail, env.jailops_project and env.jailops_host, which the jail reads as lines of the sysctl
+	// security.jail.env (EnvScript); the keys are prefixed because any tool may write that buffer. A value that is
+	// empty has no parameter.
+	Where api.PromptContext
+	// StopTimeout is the number of seconds jail(8) waits after exec.stop before it kills the jail (stop.timeout);
+	// zero leaves jail(8)'s default of ten.
+	StopTimeout int
 }
 
 // ConsoleLog is where jail(8) sends the output of the exec.* commands of a
 // jail, instead of the pipes of whoever ran jail -c or jail -r: a daemon an rc
 // script starts keeps its descriptors open, and the caller would wait for the
 // end of that output for ever. ${name} is the jail's name.
-const ConsoleLog = "/var/log/jail_${name}_console.log"
+const ConsoleLog = "/var/log/jailops/jail_${name}_console.log"
 
 // JailConf renders the jail.conf of one jail.
 func JailConf(in JailConfInput) (string, error) {
@@ -126,6 +137,15 @@ func JailConf(in JailConfInput) (string, error) {
 	b.line("%s {", in.Name)
 	b.line("\tpath = %s;", path)
 	b.line("\thost.hostname = %s;", hq)
+	for _, e := range []struct{ key, val string }{{"env." + api.EnvKeyJail, in.Where.Jail}, {"env." + api.EnvKeyProject, in.Where.Project}, {"env." + api.EnvKeyHost, in.Where.Host}} {
+		if v := api.NameChars(e.val); v != "" {
+			q, err := quoted(e.key, v)
+			if err != nil {
+				return "", err
+			}
+			b.line("\t%s = %s;", e.key, q)
+		}
+	}
 	b.line("\tvnet;")
 	if len(ifs) > 0 {
 		b.line("\tvnet.interface = %s;", join(ifs, ", "))
@@ -156,6 +176,9 @@ func JailConf(in JailConfInput) (string, error) {
 		b.line("\texec.start = \"/bin/sh /etc/rc\";")
 		b.line("\texec.stop = \"/bin/sh /etc/rc.shutdown jail\";")
 	}
+	if in.StopTimeout > 0 {
+		b.line("\tstop.timeout = %d;", in.StopTimeout)
+	}
 	b.line("\tenforce_statfs = %d;", es)
 	if in.SecureLevel != nil {
 		b.line("\tsecurelevel = %d;", *in.SecureLevel)
@@ -169,6 +192,13 @@ func JailConf(in JailConfInput) (string, error) {
 	}
 	for _, a := range allow {
 		b.line("\tallow.%s;", a)
+	}
+	if in.ZFSDataset != "" {
+		q, err := quoted("zfs.dataset", in.ZFSDataset)
+		if err != nil {
+			return "", err
+		}
+		b.line("\tzfs.dataset = %s;", q)
 	}
 	if in.SysVIPC {
 		// UNVERIFIED on FreeBSD: that a server (PostgreSQL) in a vnet jail runs with these.

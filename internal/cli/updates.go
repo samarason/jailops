@@ -237,7 +237,7 @@ jailops update apply --all -y --packages`,
 	}
 	apply.Flags().BoolVar(&applyAll, "all", false, "apply to every jail of the project that has updates")
 	apply.Flags().BoolVar(&pkgs, "packages", false, "only package updates")
-	apply.Flags().BoolVar(&osOnly, "os", false, "only image generation (OS) updates")
+	apply.Flags().BoolVar(&osOnly, "images", false, "only image generation updates")
 
 	history := &cobra.Command{
 		Use:               "history JAIL",

@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"strings"
+	"jailops.net/jailops/internal/validate"
 	"time"
 
 	"jailops.net/jailops/internal/state"
@@ -153,6 +153,12 @@ func (k kindStore[S]) create(ctx context.Context, meta api.ObjectMeta, spec S) (
 	if k.projectLevel && k.project == "" {
 		return object[S]{}, ErrProjectRequired()
 	}
+	if err := api.ValidLabels(meta.Labels); err != nil {
+		return object[S]{}, err
+	}
+	if err := api.CheckComment(spec); err != nil {
+		return object[S]{}, err
+	}
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return object[S]{}, internal(err)
@@ -189,6 +195,9 @@ func (k kindStore[S]) update(ctx context.Context, name string, expect int64, lab
 		return object[S]{}, api.Errorf(api.CodeConflict, "%s %q changed: current generation is %d", k.action, name, old.Metadata.Generation).
 			WithHint("read it again and re-apply your change").WithDetail("generation", itoa64(old.Metadata.Generation))
 	}
+	if err := api.CheckComment(spec); err != nil {
+		return object[S]{}, err
+	}
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return object[S]{}, internal(err)
@@ -199,6 +208,12 @@ func (k kindStore[S]) update(ctx context.Context, name string, expect int64, lab
 	}
 	if equalJSON(raw, old.Spec) && labelsEqual(labels, old.Metadata.Labels) && mb == old.Metadata.ManagedBy {
 		return decodeObject[S](old)
+	}
+	if !labelsEqual(labels, old.Metadata.Labels) {
+		// labels stored before the rules existed stay until they are changed
+		if err := api.ValidLabels(labels); err != nil {
+			return object[S]{}, err
+		}
 	}
 	res, err := k.s.d.State.Apply(state.Command{
 		Version: state.CommandVersion, ID: state.NewUUID(), Time: k.s.now().UTC(), Op: state.OpPut,
@@ -274,22 +289,9 @@ func MatchLabels(labels, want map[string]string) bool {
 	return true
 }
 
-// ValidObjectName is the name rule for kinds without a stricter validator:
-// lowercase letters, digits and "-_." (PROTOCOL.md).
-func ValidObjectName(n string) error {
-	if n == "" || len(n) > 128 {
-		return invalid("name must be 1 to 128 characters")
-	}
-	for _, c := range n {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
-			return invalid("invalid name %q", n).WithHint("use lowercase letters, digits, '-', '_' and '.'")
-		}
-	}
-	if strings.HasPrefix(n, ".") {
-		return invalid("invalid name %q", n)
-	}
-	return nil
-}
+// ValidObjectName is the name rule for kinds without a stricter validator: the one rule for every name a user
+// chooses, api.NamePattern, at most 63 characters.
+func ValidObjectName(n string) error { return validate.Name("name", n) }
 
 // MergePatch applies an RFC 7386 merge patch to the JSON form of v and
 // decodes the result into out.

@@ -218,12 +218,12 @@ func (a *app) printUnified(r api.LogsRead, withProject, colour bool) error {
 		width = max(width, len(prefix(api.LogEntry{Project: s.Project, Jail: s.Jail, File: s.File})))
 	}
 	for _, l := range r.Lines {
-		p := prefix(l)
+		p := termText(prefix(l), false)
 		pad := strings.Repeat(" ", max(width-len(p), 0))
 		if colour {
 			p = "\x1b[" + jailColour(l.Project+"/"+l.Jail) + "m" + p + "\x1b[0m"
 		}
-		fprintln(a.env.Stdout, p+pad+"  "+terminalSafe(l.Line))
+		fprintln(a.env.Stdout, colored(p+pad+"  "+terminalSafe(l.Line)))
 	}
 	return nil
 }

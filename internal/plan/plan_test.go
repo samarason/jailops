@@ -124,3 +124,34 @@ func TestEvents(t *testing.T) {
 		t.Fatal(ev)
 	}
 }
+
+// A record that outlived a completed plan (the daemon died between the last step and the removal of the record, or the
+// removal failed) is dropped by the recovery: undoing it would destroy what the plan made.
+func TestRecoverOfACompletedPlanUndoesNothing(t *testing.T) {
+	j := &MemJournal{}
+	ex := &Executor{Journal: &failingDelete{MemJournal: j}}
+	undone := false
+	p := New("make")
+	p.Add(Step{Name: "one", Do: func(context.Context) error { return nil }, Undo: func(context.Context) error { undone = true; return nil }})
+	p.Add(Step{Name: "two", Do: func(context.Context) error { return nil }, Undo: func(context.Context) error { undone = true; return nil }})
+	if err := ex.Run(context.Background(), "make/x", p); err == nil {
+		t.Fatal("the failed cleanup was not reported")
+	}
+	if _, ok := j.Recs["make/x"]; !ok {
+		t.Fatal("the record is gone although the delete failed")
+	}
+	found, err := (&Executor{Journal: j}).Recover(context.Background(), "make/x", p)
+	if !found || err != nil {
+		t.Fatalf("%v %v", found, err)
+	}
+	if undone {
+		t.Fatal("a completed plan was undone")
+	}
+	if _, ok := j.Recs["make/x"]; ok {
+		t.Fatal("the record of a completed plan stays")
+	}
+}
+
+type failingDelete struct{ *MemJournal }
+
+func (f *failingDelete) Delete(context.Context, string) error { return errors.New("EIO") }

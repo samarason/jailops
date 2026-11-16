@@ -1,51 +1,130 @@
-// Package ifconfig manages bridges, epair interfaces, addresses and routes
-// through ifconfig(8) and route(8), and reads interface state. By default it
-// only changes interfaces whose names carry a JailOps prefix.
+// Package ifconfig manages epair interfaces, addresses and routes
+// through ifconfig(8) and route(8), and reads interface state. It changes only
+// interfaces JailOps owns: those whose description carries the JailOps marker
+// (see Owns), which it writes itself when it creates an interface.
 package ifconfig
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 
+	"jailops.net/jailops/internal/ipam"
 	"jailops.net/jailops/sdk/api"
 )
 
-// DefaultPrefixes are the name prefixes JailOps owns: bridges are jo<n> and
-// epairs are named after the jail with the same prefix.
-var DefaultPrefixes = []string{"jo"}
+// Marker is the description JailOps gives an interface it creates, in the same operation, before the interface has
+// the name it is created for. The reconcile loop replaces it with the readable text ("jailops jail=web/app net=lan (host side)"); every
+// text JailOps writes starts with "jailops ", which HasMarker tests. Only root can set the description of an interface in the host's network stack, so the daemon cannot forge it.
+const Marker = "jailops managed"
 
-// Options configure a Client.
-type Options struct {
-	// Prefixes of interface names that may be changed. Nil means
-	// DefaultPrefixes.
-	Prefixes []string
-	// AllowForeign lifts the prefix restriction. It must be an explicit
-	// decision of the caller.
-	AllowForeign bool
+// HasMarker reports whether a description is one JailOps writes: it starts with "jailops ".
+func HasMarker(desc string) bool {
+	return strings.HasPrefix(desc, "jailops ")
 }
 
-func (o Options) prefixes() []string {
-	if len(o.Prefixes) == 0 {
-		return DefaultPrefixes
+// OwnedKinds are the interface kinds (their driver's group) JailOps creates and may change: epairs. A physical
+// interface, a loopback, a tunnel, a bridge or a vlan is never owned, whatever its description says.
+var OwnedKinds = []string{"epair"}
+
+// Options configure how ownership is decided. There is nothing to set today; the type stays so that the clients keep
+// one place to say it.
+type Options struct{}
+
+// Owns decides from the kernel's view of an interface (its kind and description, never a name or a claim of the
+// caller) whether JailOps may change it, and returns the error that explains a refusal.
+func (o Options) Owns(i Iface) error {
+	kind := ""
+	for _, g := range i.Groups {
+		if slices.Contains(OwnedKinds, g) {
+			kind = g
+		}
 	}
-	return o.Prefixes
+	if kind == "" {
+		return api.Errorf(api.CodeForbidden, "interface %q is not managed by JailOps: JailOps changes only epairs it created (this one is in the groups %s)", i.Name, groupList(i.Groups))
+	}
+	if HasMarker(i.Description) {
+		return nil
+	}
+	if i.Description != "" {
+		return api.Errorf(api.CodeForbidden, "interface %q is not managed by JailOps: its description %q is not one JailOps writes", i.Name, i.Description)
+	}
+	return api.Errorf(api.CodeForbidden, "interface %q is not managed by JailOps: it has no JailOps description (JailOps marks every interface it creates and never takes one over by its name)", i.Name)
 }
 
-// owned checks the name format and, unless AllowForeign, the prefix.
-func (o Options) owned(name string) error {
+func groupList(g []string) string {
+	if len(g) == 0 {
+		return "(none)"
+	}
+	return strings.Join(g, ", ")
+}
+
+// CheckNewName checks the name of an interface JailOps is about to create: a valid interface name that does not have
+// the form of a driver's interface (ipam.DriverLikeName), so that it can never be mistaken for a device the kernel
+// makes. Whether the name is free is the kernel's answer at the creation itself.
+func CheckNewName(name string) error {
 	if err := ValidateIfName(name); err != nil {
 		return err
 	}
-	if o.AllowForeign {
-		return nil
+	if drv, ok := ipam.DriverLikeName(name); ok {
+		return api.Errorf(api.CodeInvalid, "interface name %q has the form of the interfaces of the driver %q (%s, %s0, ...); JailOps does not create interfaces under such names", name, drv, drv, drv)
 	}
-	for _, p := range o.prefixes() {
-		if strings.HasPrefix(name, p) && len(name) > len(p) {
-			return nil
-		}
+	return nil
+}
+
+// Reader reads one interface from the kernel, in the host's network stack or in a jail's.
+type Reader interface {
+	// Show reads the interface name in the host's stack; an interface that does not exist is api.CodeNotFound.
+	Show(ctx context.Context, name string) (Iface, error)
+	// ShowInJail reads the interface name in the vnet of jail.
+	ShowInJail(ctx context.Context, jail, name string) (Iface, error)
+}
+
+// owned reads name through r and checks that JailOps owns it.
+func (o Options) owned(ctx context.Context, r Reader, name string) error {
+	if err := ValidateIfName(name); err != nil {
+		return err
 	}
-	return api.Errorf(api.CodeForbidden, "interface %q is not managed by JailOps (prefix %s)", name, strings.Join(o.prefixes(), ","))
+	i, err := r.Show(ctx, name)
+	if err != nil {
+		return err
+	}
+	return o.Owns(i)
+}
+
+// ownedInJail is owned for an interface in the vnet of jail.
+func (o Options) ownedInJail(ctx context.Context, r Reader, jail, name string) error {
+	if err := ValidateIfName(name); err != nil {
+		return err
+	}
+	if err := ValidateJailRef(jail); err != nil {
+		return err
+	}
+	i, err := r.ShowInJail(ctx, jail, name)
+	if err != nil {
+		return err
+	}
+	return o.Owns(i)
+}
+
+// one returns the single interface of `ifconfig <name>` output.
+func one(out, name string) (Iface, error) {
+	l := ParseIfconfig(out)
+	if len(l) != 1 || l[0].Name != name {
+		return Iface{}, api.Errorf(api.CodeInternal, "ifconfig %s: %s", name, fmt.Sprintf("unexpected output (%d interfaces)", len(l)))
+	}
+	return l[0], nil
+}
+
+// descOrMarker is the description to write: clearing it writes the marker, so that an interface of JailOps never
+// loses the mark that makes it JailOps's.
+func descOrMarker(d string) string {
+	if d == "" {
+		return Marker
+	}
+	return d
 }
 
 // ValidateIfName accepts FreeBSD interface names: a letter, then letters,
@@ -96,7 +175,7 @@ type Addr struct {
 	Prefix netip.Prefix // address with prefix length
 }
 
-// Member is a bridge member port.
+// Member is a port of a bridge (read from the host's own bridges, never changed).
 type Member struct {
 	Name    string
 	Flags   []string
@@ -130,13 +209,6 @@ func (i Iface) Up() bool {
 	return false
 }
 
-// Neighbor is a permanent IPv6 neighbor entry (ndp -an).
-type Neighbor struct {
-	Addr  netip.Addr
-	Iface string
-	MAC   string
-}
-
 // Route describes a route for RouteAdd and RouteDelete.
 type Route struct {
 	// Dest is "default" or an address or prefix; its family selects -inet
@@ -146,17 +218,17 @@ type Route struct {
 	// (-interface).
 	Gateway   string
 	Interface string
+	// Reject makes a route that answers packets for the prefix with an error (route -reject through the loopback
+	// address): Dest is a prefix, there is no Gateway and no Interface.
+	Reject bool
 }
 
-// Client is the interface layer. Names given to mutating calls must carry a
-// managed prefix (see Options).
+// Client is the interface layer. A mutating call changes only an interface JailOps owns (Options.Owns, read from the
+// kernel at the call); a create makes a new interface under a name that is free and not a driver's, marked in the same
+// call.
 type Client interface {
 	List(ctx context.Context) ([]Iface, error)
 
-	BridgeCreate(ctx context.Context, name string) error
-	BridgeDestroy(ctx context.Context, name string) error
-	BridgeAddMember(ctx context.Context, bridge, member string, private bool) error
-	BridgeDeleteMember(ctx context.Context, bridge, member string) error
 	SetDescription(ctx context.Context, iface, desc string) error
 
 	// EpairCreate creates a pair named <name>a and <name>b and returns both.
@@ -175,18 +247,24 @@ type Client interface {
 	RouteAdd(ctx context.Context, r Route) error
 	RouteDelete(ctx context.Context, r Route) error
 
-	// NeighborSet installs a permanent IPv6 neighbor entry on iface: addr is at mac. An entry of the same address is
-	// replaced (a static entry that outlived its jail would send the next owner's traffic to a dead address).
-	NeighborSet(ctx context.Context, iface string, addr netip.Addr, mac string) error
-	// NeighborDelete removes the entry of addr on iface.
-	NeighborDelete(ctx context.Context, iface string, addr netip.Addr) error
-
 	// IPv6Forwarding reads net.inet6.ip6.forwarding.
 	IPv6Forwarding(ctx context.Context) (bool, error)
 }
 
-// routeArgs validates r and renders `-inet|-inet6 <dest> <gw>|-interface <if>`.
-func routeArgs(o Options, r Route) ([]string, error) {
+// routeArgs validates r and renders `-inet|-inet6 <dest> <gw>|-interface <if>`. The caller checks that JailOps owns
+// the interface.
+func routeArgs(r Route, del bool) ([]string, error) {
+	if r.Reject {
+		p, err := netip.ParsePrefix(r.Dest)
+		if err != nil || r.Gateway != "" || r.Interface != "" || p.Addr().Zone() != "" || p.Addr().IsUnspecified() && p.Bits() == 0 {
+			return nil, api.Errorf(api.CodeInvalid, "invalid reject route %q", r.Dest)
+		}
+		args := []string{famOf(p.Addr()), p.Masked().String()}
+		if !del {
+			args = append(args, loopback(p.Addr()), "-reject")
+		}
+		return args, nil
+	}
 	var fam string
 	dest := r.Dest
 	switch {
@@ -216,7 +294,7 @@ func routeArgs(o Options, r Route) ([]string, error) {
 		}
 		args = append(args, g.String())
 	case r.Interface != "":
-		if err := o.owned(r.Interface); err != nil {
+		if err := ValidateIfName(r.Interface); err != nil {
 			return nil, err
 		}
 		args = append(args, "-interface", r.Interface)
@@ -224,6 +302,13 @@ func routeArgs(o Options, r Route) ([]string, error) {
 		return nil, api.Errorf(api.CodeInvalid, "route needs a gateway or an interface")
 	}
 	return args, nil
+}
+
+func loopback(a netip.Addr) string {
+	if a.Is4() || a.Is4In6() {
+		return "127.0.0.1"
+	}
+	return "::1"
 }
 
 func famOf(a netip.Addr) string {

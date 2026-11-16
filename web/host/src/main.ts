@@ -14,7 +14,8 @@ import { initTheme } from '@jailops/shared/composables/theme'
 initTheme()
 const router = makeRouter()
 
-void boot({ role: 'host', loadDemo: async (o) => (await import('./demo/transport')).demoTransport({ ...o, signedOut: o.signedOut || new URLSearchParams(location.search).get('demo') === 'setup' }) }).then(async () => {
+// only a demo build (JAILOPS_DEMO_BUILD=1) carries the canned data and honours ?demo
+void boot({ role: 'host', loadDemo: import.meta.env.VITE_JAILOPS_DEMO === '1' ? async (o) => (await import('./demo/transport')).demoTransport({ ...o, signedOut: o.signedOut || new URLSearchParams(location.search).get('demo') === 'setup' }) : undefined }).then(async () => {
   const app = createApp(App)
   app.use(router)
   await router.isReady()

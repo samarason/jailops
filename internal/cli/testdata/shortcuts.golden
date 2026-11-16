@@ -2,8 +2,8 @@ $ jailops create nginx --image freebsd-15@stable --storage default --network lan
 jail/nginx created
 
 $ jailops list
-NAME    STATE     IMAGE               GEN   ADDRESSES    AGE
-nginx   stopped   freebsd-15@stable   g1    10.20.0.10   3h
+NAME    STATE     IMAGE               GEN   ADDRESSES    AUTOSTART   AGE
+nginx   stopped   freebsd-15@stable   g1    10.20.0.10   -           3h
 
 $ jailops start nginx
 jail/nginx started
@@ -39,7 +39,7 @@ $ jailops shell nginx --shell /usr/local/bin/bash
 ! hint: start it first
 [exit 5]
 
-$ jailops delete -y nginx
+$ jailops delete --confirm-data-loss nginx
 jail/nginx deleted
 
 $ jailops jail create web --image freebsd-15@stable --network lan --storage default

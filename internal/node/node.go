@@ -163,6 +163,9 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 	if n.now == nil {
 		n.now = time.Now
 	}
+	if n.db != nil {
+		n.db.SetClock(n.now) // the leases of the sessions run on the clock of the node
+	}
 	if n.cfg.Lease <= 0 {
 		n.cfg.Lease = DefaultLease
 	}

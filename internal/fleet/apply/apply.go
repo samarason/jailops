@@ -356,7 +356,7 @@ func applyApp(ctx context.Context, s *plan.Session, it plan.Item, ch plan.AppCha
 			return nil, nil
 		}
 		return []string{
-			fmt.Sprintf("    connection string for %s on %s/%s (shown once, stored nowhere; `jailops app allow %s from %s --rotate` makes a new one):",
+			fmt.Sprintf("    connection string for %s on %s/%s (shown once, stored nowhere; `jailops app allow %s --from %s --rotate` makes a new one):",
 				allow.Source, it.Project, ch.Jail, ch.Jail, allow.Source),
 			"      " + r.ConnectionString,
 		}, nil

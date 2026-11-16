@@ -90,7 +90,7 @@ setup:
   # /usr/sbin/sendmail of the jail hands mail to Postfix; the package's install message leaves this to the person
   - [/bin/mkdir, -p, /usr/local/etc/mail]
   - [/bin/sh, -c, "printf '%s\\t%s\\n' sendmail /usr/local/sbin/sendmail send-mail /usr/local/sbin/sendmail mailq /usr/local/sbin/sendmail newaliases /usr/local/sbin/sendmail > /usr/local/etc/mail/mailer.conf"]
-  - [/bin/sh, -c, "f=/usr/local/etc/dovecot/dovecot.conf; [ -e $f ] || printf '%s\\n' '# Starter configuration of the mail app (Dovecot 2.3); see its notes.' 'protocols = imap' 'ssl = no' 'disable_plaintext_auth = no' 'mail_location = maildir:~/Maildir' 'passdb {' '  driver = pam' '}' 'userdb {' '  driver = passwd' '}' 'service auth {' '  unix_listener /var/spool/postfix/private/auth {' '    mode = 0660' '    user = postfix' '    group = postfix' '  }' '}' 'service imap-login {' '  inet_listener imaps {' '    port = 0' '  }' '}' > $f"]
+  - [/bin/sh, -c, "f=/usr/local/etc/dovecot/dovecot.conf; [ -e $f ] || printf '%s\\n' '# Starter configuration of the mail app (Dovecot 2.3); see its notes.' 'protocols = imap' 'ssl = no' 'disable_plaintext_auth = yes' 'mail_location = maildir:~/Maildir' 'passdb {' '  driver = pam' '}' 'userdb {' '  driver = passwd' '}' 'service auth {' '  unix_listener /var/spool/postfix/private/auth {' '    mode = 0660' '    user = postfix' '    group = postfix' '  }' '}' 'service imap-login {' '  inet_listener imaps {' '    port = 0' '  }' '}' > $f"]
   - [/usr/local/bin/doveconf, -n]
 health:
   tcp: 25
@@ -105,11 +105,17 @@ notes: |
     then postfix reload.
   - A user: pw useradd -n alice -d /home/mail/alice -m -s /usr/sbin/nologin,
     then passwd alice. Mail to alice@YOUR.DOMAIN lands in ~alice/Maildir.
-  - TLS: put a certificate and key in the jail, then postconf -e
-    'smtpd_tls_cert_file = CERT' 'smtpd_tls_key_file = KEY'
-    'smtpd_tls_security_level = may' and postfix reload; in dovecot.conf set
-    ssl = required, ssl_cert = <CERT, ssl_key = <KEY,
-    delete the port = 0 line of the imaps listener and service dovecot restart. Then clients use 587 and 993 with a login.
+  - TLS comes first: until it is set, IMAP and submission logins from other
+    machines are refused (dovecot.conf has disable_plaintext_auth = yes, so a
+    password never crosses the network in clear). Put a certificate and key in
+    the jail, then postconf -e 'smtpd_tls_cert_file = CERT'
+    'smtpd_tls_key_file = KEY' 'smtpd_tls_security_level = may' and postfix
+    reload. In dovecot.conf replace the line ssl = no with these lines:
+      ssl = required
+      ssl_cert = <CERT
+      ssl_key = <KEY
+    delete the port = 0 line of the imaps listener, and service dovecot
+    restart. Then clients use 587 and 993 with a login.
   DNS for YOUR.DOMAIN (the jail's public address must be reachable on 25):
   - A/AAAA: mail.YOUR.DOMAIN -> the address; PTR of the address back to
     mail.YOUR.DOMAIN (set by whoever owns the address).

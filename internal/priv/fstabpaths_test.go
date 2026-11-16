@@ -26,7 +26,7 @@ func jailTree(t *testing.T, e *env) (root, host string) {
 func TestFstabMountPointsMayNotPassThroughLinks(t *testing.T) {
 	e := newEnv(t)
 	root, host := jailTree(t, e)
-	data := filepath.Join(e.cfg.MountBase, "projects", "alpha", "jails", "web", "data", "vol")
+	data := filepath.Join(e.cfg.MountBase, "projects", "alpha", "volumes", "vol")
 	fstab := data + " " + root + "/data/ssh nullfs rw 0 0\n"
 	if err := e.cfg.checkFstabPaths(fstab, root); err != nil {
 		t.Fatalf("a plain tree was refused: %v", err)
@@ -88,7 +88,7 @@ func TestStartingAJailRechecksItsFstab(t *testing.T) {
 	ctx := context.Background()
 	fstabPath := filepath.Join(e.cfg.ConfDir, "alpha_web.fstab")
 	conf := strings.Replace(e.goodConf(), "\tmount.devfs;\n", "\tmount.devfs;\n\tmount.fstab = \""+fstabPath+"\";\n", 1)
-	data := filepath.Join(e.cfg.MountBase, "projects", "alpha", "jails", "web", "data", "vol")
+	data := filepath.Join(e.cfg.MountBase, "projects", "alpha", "volumes", "vol")
 	mustWrite(t, filepath.Join(e.cfg.ConfDir, "alpha_web.conf"), conf)
 	mustWrite(t, fstabPath, data+" "+root+"/data/ssh nullfs rw 0 0\n")
 	g := jailGuard{e.local}

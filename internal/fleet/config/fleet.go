@@ -724,7 +724,7 @@ func (f *Fleet) readProfile(p, project string) (*Profile, error) {
 	if _, has := frag["profiles"]; has {
 		return nil, fmt.Errorf("%s: a profile cannot list profiles", f.rel(p))
 	}
-	for _, k := range []string{"host_mounts", "zfs_delegation"} {
+	for _, k := range []string{"zfs_delegation"} {
 		if _, has := frag[k]; has {
 			return nil, fmt.Errorf("%s: a profile cannot carry %s (it needs a global admin and the host operator's approval): put it in the jail", f.rel(p), k)
 		}
@@ -892,7 +892,7 @@ func (f *Fleet) loadObjectDir(dir string, ki model.KindInfo, scope, project stri
 			return fmt.Errorf("%s: spec: %w", f.rel(p), err)
 		}
 		if as, ok := spec.(model.AppAccessSpec); ok {
-			if err := as.Validate(proj); err != nil {
+			if err := as.Validate(); err != nil {
 				return fmt.Errorf("%s: spec: %w", f.rel(p), err)
 			}
 		}

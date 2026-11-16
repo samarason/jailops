@@ -1,10 +1,6 @@
-bridge: jailops net=lan bridge
-gateway bridge side: jailops net=lan gateway (bridge side)
-gateway host side: jailops net=lan gateway (host side)
 jail host side: jailops jail=web/nginx net=lan (host side)
 jail jail side: jailops jail=web/nginx net=lan (jail side)
 wireguard: jailops wireguard=office
-long bridge: jailops net=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.. bridge
 long jail: jailops jail=aaaaaaaaaaaaaaa.. net=aaaaaaaaaaaaaaa.. (host side)
 long jail side: jailops jail=p/aaaaaaaaaaaaaaaaaaaaaaaaa.. net=net-1 (jail side)
 long wireguard: jailops wireguard=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..

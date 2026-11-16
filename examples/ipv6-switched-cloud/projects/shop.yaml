@@ -3,7 +3,7 @@ kind: Project
 metadata:
   name: shop
 spec:
-  description: The public shop. Its web jail is reachable from the internet over IPv6.
+  comment: The public shop. Its web jail is reachable from the internet over IPv6.
   hosts: [cloud1]
   networks:
     - {network: shop}
@@ -11,5 +11,5 @@ spec:
     - {storage: default, quota: 200G}
   quotas: {jails: 10, memory: 16G, addresses: 50}
   # The floor: rendered before every jail's own policy. A jail can add rules but cannot weaken this.
-  firewall: floor
+  firewall_policies: [floor]
   images: [freebsd-15]

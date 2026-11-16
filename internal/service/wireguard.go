@@ -294,8 +294,11 @@ func (s *Service) CreateWireGuard(ctx context.Context, w api.WireGuard) (api.Wir
 	if err := wireguard.ValidName("name", name); err != nil {
 		return api.WireGuard{}, err
 	}
+	if err := checkWireGuardName(name, w.Spec.Interface); err != nil {
+		return api.WireGuard{}, err
+	}
 	if w.Spec.Mode == api.WireGuardClient && w.Spec.PeerPublicKey != "" {
-		return api.WireGuard{}, invalid("a client is made from a join token").WithHint("jailops wireguard join TOKEN")
+		return api.WireGuard{}, invalid("a client is made from a join token").WithHint("jailops wireguard join NAME --token-file TOKEN-FILE")
 	}
 	wireguard.Defaults(name, s.d.Hostname, &w.Spec)
 	for i := range w.Spec.Peers {
@@ -649,6 +652,9 @@ func (s *Service) JoinWireGuard(ctx context.Context, q api.WireGuardJoin) (api.W
 		for _, a := range addrs {
 			spec.Address = append(spec.Address, a.String())
 		}
+	}
+	if err := checkWireGuardName(name, spec.Interface); err != nil {
+		return api.WireGuard{}, err
 	}
 	wireguard.Defaults(name, s.d.Hostname, &spec)
 	unlock, err := s.locks.lockPatient(ctx, "join wireguard "+name, wgLock(name), "wireguard/_all")

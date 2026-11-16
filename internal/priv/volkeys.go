@@ -3,10 +3,12 @@ package priv
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"jailops.net/jailops/internal/sys/run"
@@ -19,9 +21,9 @@ import (
 // no argv, no audit line and no error. The helper feeds it to zfs on standard input: zfs reads a passphrase from a
 // stdin that is not a terminal as one line.
 //
-// The operations accept only what JailOps creates: a dataset named <container>/data/<volume> below a registered
-// storage root, managed (jailops:managed=on set locally), of kind volume, below a parent of kind volumes, and, except
-// at creation, its own encryption root with keyformat=passphrase.
+// The operations accept only what JailOps creates: a dataset named <storage root>/projects/<project>/volumes/<volume>,
+// managed (jailops:managed=on set locally), of kind volume, below a parent of kind volumes, and, except at creation,
+// its own encryption root with keyformat=passphrase.
 //
 // UNVERIFIED: the zfs commands below were not run on FreeBSD by this change (scripts/ci-freebsd-e2e.sh has the
 // block): that create, load-key and change-key read one line from a stdin that is not a terminal, that
@@ -140,7 +142,7 @@ func (l *Local) localProp(m map[string]zfs.Prop, k string) string {
 	return ""
 }
 
-// volumeParent checks that parent is the managed volumes dataset of a jail.
+// volumeParent checks that parent is the managed volumes dataset of a project: <storage root>/projects/<project>/volumes.
 func (l *Local) volumeParent(ctx context.Context, parent string) error {
 	if err := (zfsGuard{l}).managed(ctx, parent); err != nil {
 		return err
@@ -149,13 +151,27 @@ func (l *Local) volumeParent(ctx context.Context, parent string) error {
 	if err != nil {
 		return err
 	}
-	if l.localProp(m, "jailops:kind") != "volumes" || !strings.HasSuffix(parent, "/data") {
-		return forbidden("%s is not the volumes dataset of a jail", parent)
+	if l.localProp(m, "jailops:kind") != "volumes" || !l.cfg.isVolumesDataset(parent) {
+		return forbidden("%s is not the volumes dataset of a project", parent)
 	}
 	return nil
 }
 
-// encryptedVolume checks that ds is an encrypted volume of a managed jail and returns its key status.
+// isVolumesDataset reports whether ds is <storage root>/projects/<project>/volumes.
+func (c Config) isVolumesDataset(ds string) bool {
+	e, ok := c.rootOf(ds)
+	if !ok {
+		return false
+	}
+	rest, ok := strings.CutPrefix(ds, e.Dataset+"/projects/")
+	if !ok {
+		return false
+	}
+	p, last, ok := strings.Cut(rest, "/")
+	return ok && p != "" && last == "volumes"
+}
+
+// encryptedVolume checks that ds is an encrypted volume of a project and returns its key status.
 func (l *Local) encryptedVolume(ctx context.Context, ds string) (string, error) {
 	if err := l.cfg.zfsDataset(ds); err != nil {
 		return "", err
@@ -165,7 +181,7 @@ func (l *Local) encryptedVolume(ctx context.Context, ds string) (string, error) 
 	}
 	i := strings.LastIndexByte(ds, '/')
 	if i < 0 {
-		return "", forbidden("%s is not a volume of a jail", ds)
+		return "", forbidden("%s is not a volume of a project", ds)
 	}
 	if err := l.volumeParent(ctx, ds[:i]); err != nil {
 		return "", err
@@ -175,7 +191,7 @@ func (l *Local) encryptedVolume(ctx context.Context, ds string) (string, error) 
 		return "", err
 	}
 	if l.localProp(m, "jailops:kind") != "volume" {
-		return "", forbidden("%s is not a volume of a jail", ds)
+		return "", forbidden("%s is not a volume of a project", ds)
 	}
 	if m["encryptionroot"].Value != ds || m["keyformat"].Value != "passphrase" {
 		return "", forbidden("%s is not an encrypted volume with a passphrase", ds)
@@ -262,7 +278,89 @@ func (l *Local) CreateEncrypted(ctx context.Context, o zfs.CreateOpts, passphras
 	if _, err := l.zfsKey(ctx, args, passphrase); err != nil {
 		return keyError("create", err)
 	}
+	// a volume created incomplete is being restored: file agents may write it until it is marked complete or destroyed
+	if o.Props[propComplete] == "off" {
+		l.grants.beginRestore(o.Name)
+	}
 	return nil
+}
+
+// Wrong passphrases are limited in the helper itself, not only in the daemon, which a compromised daemon would skip:
+// after keyFreeTries wrong ones for a volume (keyGlobalFree for all volumes together) every further try waits,
+// keyBaseWait at first and twice as long after each further wrong one, at most keyMaxWait. A right passphrase forgets
+// the failures. The counters live in memory: a restart of the helper forgets them, which needs root.
+const (
+	keyFreeTries  = 5
+	keyGlobalFree = 20
+	keyBaseWait   = 30 * time.Second
+	keyMaxWait    = time.Hour
+)
+
+type keyFails struct {
+	n     int
+	until time.Time
+}
+
+// keyLimiter counts wrong passphrases per dataset and for all of them.
+type keyLimiter struct {
+	mu  sync.Mutex
+	per map[string]*keyFails
+	all keyFails
+}
+
+func keyWait(n, free int) time.Duration {
+	if n < free {
+		return 0
+	}
+	d := keyBaseWait
+	for i := free; i < n && d < keyMaxWait; i++ {
+		d *= 2
+	}
+	return min(d, keyMaxWait)
+}
+
+// check refuses while the dataset, or every dataset, waits after wrong passphrases.
+func (k *keyLimiter) check(ds string, now time.Time) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	until := k.all.until
+	if f := k.per[ds]; f != nil && f.until.After(until) {
+		until = f.until
+	}
+	if !now.Before(until) {
+		return nil
+	}
+	wait := max(until.Sub(now).Round(time.Second), time.Second)
+	return api.Errorf(api.CodeRateLimited, "too many wrong passphrases for %s", ds).WithHint(fmt.Sprintf("wait %s and try again", wait))
+}
+
+// result counts a wrong passphrase, or forgets the failures of the dataset (and the global count) after a right one.
+func (k *keyLimiter) result(ds string, err error, now time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	switch {
+	case err == nil:
+		delete(k.per, ds)
+		k.all = keyFails{}
+	case api.IsCode(err, api.CodeBadPassphrase):
+		if k.per == nil {
+			k.per = map[string]*keyFails{}
+		}
+		f := k.per[ds]
+		if f == nil {
+			f = &keyFails{}
+			k.per[ds] = f
+		}
+		for _, c := range []struct {
+			f    *keyFails
+			free int
+		}{{f, keyFreeTries}, {&k.all, keyGlobalFree}} {
+			c.f.n++
+			if w := keyWait(c.f.n, c.free); w > 0 {
+				c.f.until = now.Add(w)
+			}
+		}
+	}
 }
 
 // LoadKey loads the key of an encrypted volume. A key that is loaded already is success.
@@ -277,13 +375,17 @@ func (l *Local) LoadKey(ctx context.Context, dataset string, passphrase []byte) 
 	if st == "available" {
 		return nil
 	}
-	if _, err := l.zfsKey(ctx, []string{"load-key", dataset}, passphrase); err != nil {
-		if ee, ok := run.IsExit(err); ok && strings.Contains(strings.ToLower(ee.Stderr), "already loaded") {
-			return nil
-		}
-		return keyError("load-key", err)
+	if err := l.keyLim.check(dataset, l.now()); err != nil {
+		return err
 	}
-	return nil
+	_, err = l.zfsKey(ctx, []string{"load-key", dataset}, passphrase)
+	if ee, ok := run.IsExit(err); ok && strings.Contains(strings.ToLower(ee.Stderr), "already loaded") {
+		err = nil
+	} else if err != nil {
+		err = keyError("load-key", err)
+	}
+	l.keyLim.result(dataset, err, l.now())
+	return err
 }
 
 // UnloadKey unloads the key of an encrypted volume; the volume must be unmounted. An unloaded key is success.
@@ -317,9 +419,15 @@ func (l *Local) ChangeKey(ctx context.Context, dataset string, oldPass, newPass 
 	if err := checkNewPassphrase(newPass); err != nil {
 		return err
 	}
-	if _, err := l.zfsKey(ctx, []string{"load-key", "-n", dataset}, oldPass); err != nil {
-		return keyError("load-key", err)
+	if err := l.keyLim.check(dataset, l.now()); err != nil {
+		return err
 	}
+	if _, err := l.zfsKey(ctx, []string{"load-key", "-n", dataset}, oldPass); err != nil {
+		err = keyError("load-key", err)
+		l.keyLim.result(dataset, err, l.now())
+		return err
+	}
+	l.keyLim.result(dataset, nil, l.now())
 	if _, err := l.zfsKey(ctx, []string{"change-key", "-o", "keyformat=passphrase", "-o", "keylocation=prompt", dataset}, newPass); err != nil {
 		return keyError("change-key", err)
 	}

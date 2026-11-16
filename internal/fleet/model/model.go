@@ -56,6 +56,8 @@ var Kinds = []KindInfo{
 	{Kind: api.KindFirewallPolicy, Dir: "firewall-policies", ProjectLevel: true, Extension: "firewall_anchors"},
 	{Kind: api.KindBackupTarget, Dir: "backup-targets", Extension: "backup_policies"},
 	{Kind: api.KindBackupPolicy, Dir: "backup-policies", ProjectLevel: true, Extension: "backup_policies"},
+	// A volume is a dataset of one host; a jail that attaches it comes after it.
+	{Kind: api.KindVolume, Dir: "volumes", HostOnly: true, ProjectLevel: true, Extension: "volumes"},
 	{Kind: api.KindJail, Dir: "jails", HostOnly: true, ProjectLevel: true, Extension: "jails"},
 }
 
@@ -100,7 +102,7 @@ type AppSpec struct {
 	// Network and Storage default to the project's only grant of a kind.
 	Network string `json:"network,omitempty"`
 	Storage string `json:"storage,omitempty"`
-	// Image defaults to the only FreeBSD image with the alias stable.
+	// Image defaults to the FreeBSD image of the highest release the host runs.
 	Image string `json:"image,omitempty"`
 	// Limits replace the definition's resource hints.
 	Limits *api.Resources `json:"limits,omitempty"`
@@ -114,7 +116,7 @@ type AppAccessSpec struct {
 
 // AppGrant is one source of an AppAccess document.
 type AppGrant struct {
-	// Source is @jail, @project/jail, @address-set, an address or a prefix, or host.
+	// Source is @jail, @address-set, an address or a prefix, or host.
 	Source string `json:"source"`
 	// Ports are "N" or "N/proto"; empty means the definition's ports.
 	Ports []string `json:"ports,omitempty"`
@@ -125,35 +127,30 @@ type AppGrant struct {
 }
 
 var (
-	dbNameRe  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
-	srcNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
-	jailRe    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	dbNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 )
 
 // CanonicalSource is the form the host stores a grant under, so a declared
-// source and a live grant compare: host, @name, @project/jail (@jail when the
-// project is the app's), an address, or a masked prefix.
-func CanonicalSource(project, s string) (string, error) {
+// source and a live grant compare: host, jail:NAME, set:NAME, an address, or a masked prefix.
+func CanonicalSource(s string) (string, error) {
 	switch {
 	case s == "host":
 		return s, nil
 	case strings.HasPrefix(s, "@"):
-		rest := s[1:]
-		if p, j, ok := strings.Cut(rest, "/"); ok {
-			if !jailRe.MatchString(p) || !jailRe.MatchString(j) {
-				return "", fmt.Errorf("source %q: @project/jail needs a project name and a jail name", s)
-			}
-			if p == project {
-				return "@" + j, nil
-			}
-			return s, nil
-		}
-		if !srcNameRe.MatchString(rest) {
-			return "", fmt.Errorf("source %q: @ is followed by the name of a jail or of an address set", s)
+		n := s[1:]
+		return "", fmt.Errorf("source %q: @ is not used: write jail:%s or set:%s", s, n, n)
+	case strings.HasPrefix(s, "jail:"):
+		if !api.IsName(s[5:], 29) {
+			return "", fmt.Errorf("source %q: jail: is followed by the name of a jail of the project", s)
 		}
 		return s, nil
-	case s == "" || s == "any":
-		return "", fmt.Errorf("source %q: name a jail (@web), an address set (@office), an address or a prefix, or host", s)
+	case strings.HasPrefix(s, "set:"):
+		if !api.IsName(s[4:], 29) {
+			return "", fmt.Errorf("source %q: set: is followed by the name of an address set of the project", s)
+		}
+		return s, nil
+	case s == "" || s == "any" || strings.HasPrefix(s, "tag:"):
+		return "", fmt.Errorf("source %q: name a jail (jail:web), an address set (set:office), an address or a prefix, or host", s)
 	}
 	if strings.Contains(s, "/") {
 		p, err := netip.ParsePrefix(s)
@@ -168,7 +165,7 @@ func CanonicalSource(project, s string) (string, error) {
 	}
 	a, err := netip.ParseAddr(s)
 	if err != nil || a.Zone() != "" || a.Is4In6() {
-		return "", fmt.Errorf("source %q is not an address, a prefix, @jail, @address-set or host", s)
+		return "", fmt.Errorf("source %q is not an address, a prefix, jail:NAME, set:NAME or host", s)
 	}
 	return a.String(), nil
 }
@@ -193,17 +190,17 @@ func NormalizePorts(in []string) ([]string, error) {
 
 // Validate checks an App spec.
 func (s AppSpec) Validate() error {
-	if !jailRe.MatchString(s.App) {
+	if !api.IsName(s.App, 29) {
 		return fmt.Errorf("spec.app %q must name an app of the catalog (^[a-z][a-z0-9-]{0,62}$)", s.App)
 	}
 	return nil
 }
 
 // Validate checks an AppAccess spec in a project: sources, ports, databases, no source twice.
-func (s AppAccessSpec) Validate(project string) error {
+func (s AppAccessSpec) Validate() error {
 	seen := map[string]bool{}
 	for i, g := range s.Grants {
-		c, err := CanonicalSource(project, g.Source)
+		c, err := CanonicalSource(g.Source)
 		if err != nil {
 			return fmt.Errorf("grants[%d]: %w", i, err)
 		}
@@ -327,7 +324,7 @@ func (h Hook) Validate() error {
 
 // TemplateSpec is the spec of a JailTemplate document.
 type TemplateSpec struct {
-	Description string `json:"description,omitempty"`
+	Comment string `json:"comment,omitempty"`
 	// Jail is a fragment of a JailSpec merged under every jail using the template.
 	Jail map[string]any `json:"jail,omitempty"`
 	// After hooks run, in order, after a jail using the template is created.
@@ -336,7 +333,7 @@ type TemplateSpec struct {
 
 // RolloutSpec is the spec of a Rollout document: a staged operation over jails.
 type RolloutSpec struct {
-	Description string `json:"description,omitempty"`
+	Comment string `json:"comment,omitempty"`
 	// Hosts limits the hosts; empty means every host.
 	Hosts []string `json:"hosts,omitempty"`
 	// Project is the project whose jails are selected. Required.
@@ -410,16 +407,14 @@ func (r RolloutSpec) Validate() error {
 
 var genRe = regexp.MustCompile(`^g[1-9][0-9]*$`)
 
-var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
-
-// CheckName enforces the API's name rule: lowercase letters, digits and
-// "-_." starting with a letter or digit.
+// CheckName enforces the API's name rule (api.NamePattern): lowercase letters, digits and hyphens, starting with
+// a letter.
 func CheckName(name string) error {
 	if name == "" {
 		return fmt.Errorf("name is empty")
 	}
-	if !nameRe.MatchString(name) {
-		return fmt.Errorf("name %q must use lowercase letters, digits, '-', '_' and '.', start with a letter or digit, at most 128 characters", name)
+	if !api.IsName(name, api.MaxName) {
+		return fmt.Errorf("name %q must use lowercase letters, digits and hyphens, start with a letter, not end in a hyphen, at most %d characters", name, api.MaxName)
 	}
 	return nil
 }
@@ -478,6 +473,10 @@ func DecodeSpec(kind api.Kind, raw map[string]any) (any, error) {
 		var s api.AddressSetSpec
 		err := DecodeStrict(raw, &s)
 		return s, err
+	case api.KindVolume:
+		var s api.VolumeSpec
+		err := DecodeStrict(raw, &s)
+		return s, err
 	case api.KindBackupPolicy:
 		var s api.BackupPolicySpec
 		err := DecodeStrict(raw, &s)
@@ -517,6 +516,14 @@ func DecodeSpec(kind api.Kind, raw map[string]any) (any, error) {
 // only the keys it sets) instead of replacing the whole list.
 var deviceLists = map[string]bool{"network": true, "volumes": true, "devfs": true, "proxy": true}
 
+// deviceKey is the key an element of a device list is named by: the volumes of a jail by the volume they attach.
+func deviceKey(list string) string {
+	if list == "volumes" {
+		return "volume"
+	}
+	return "name"
+}
+
 // MergeSpec merges a jail spec fragment over a base: maps merge, null
 // deletes, device lists (network, volumes, devfs, proxy) merge by device
 // name, every other value replaces. Unnamed network devices are named
@@ -555,7 +562,7 @@ func nameDevices(kind string, l []any) []any {
 			continue
 		}
 		m = cloneMap(m)
-		if name, _ := m["name"].(string); name == "" && kind == "network" {
+		if name, _ := m[deviceKey(kind)].(string); name == "" && kind == "network" {
 			m["name"] = autoName + "eth" + strconv.Itoa(n)
 		}
 		if kind == "network" {
@@ -594,17 +601,18 @@ func mergeDevices(kind string, base any, over []any) any {
 	out := nameDevices(kind, b)
 	for _, e := range nameDevices(kind, over) {
 		m, ok := e.(map[string]any)
-		name, _ := m["name"].(string)
+		key := deviceKey(kind)
+		name, _ := m[key].(string)
 		if !ok || name == "" {
 			out = append(out, e)
 			continue
 		}
 		found := false
 		for i, x := range out {
-			if xm, ok := x.(map[string]any); ok && sameName(xm["name"], name) {
+			if xm, ok := x.(map[string]any); ok && sameName(xm[key], name) {
 				merged := Merge(xm, m)
-				if xn, _ := xm["name"].(string); !strings.HasPrefix(xn, autoName) {
-					merged["name"] = xn
+				if xn, _ := xm[key].(string); !strings.HasPrefix(xn, autoName) {
+					merged[key] = xn
 				}
 				out[i] = merged
 				found = true

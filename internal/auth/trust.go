@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"regexp"
 	"strings"
 	"time"
 
@@ -18,8 +17,6 @@ const TrustPrefix = "joc_"
 
 // MaxTrustTTL bounds the lifetime of a trust token.
 const MaxTrustTTL = 30 * 24 * time.Hour
-
-var trustNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
 // TrustClaims is the content of a trust token. The grant (role, projects) is
 // stored on the server under ID, not in the token.
@@ -51,7 +48,7 @@ func NewTrustToken(key []byte, name, serverFingerprint string, ttl time.Duration
 	if len(key) < 16 {
 		return "", TrustClaims{}, errors.New("auth: trust key too short")
 	}
-	if !trustNameRE.MatchString(name) || strings.HasPrefix(name, ".") {
+	if !api.IsName(name, api.MaxName) {
 		return "", TrustClaims{}, api.Errorf(api.CodeInvalid, "invalid name %q", name).WithHint("use lowercase letters, digits, '-', '_' and '.'")
 	}
 	fp, err := NormalizeFingerprint(serverFingerprint)

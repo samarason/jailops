@@ -1,13 +1,15 @@
 // Pure helpers of the network form. They only catch typing mistakes early; the server's validator is the authority
 // (prefix limits, proxy rules, overlaps) and its message is shown as it comes.
 import type { Network } from '@jailops/shared/api/types'
+import { nameError } from './nameField'
+import { clone } from './clone'
 
 export interface NetForm {
   name: string; uplink: string
   v4: boolean; v4subnet: string; v4gateway: string; v4range: string; nat: boolean
-  mode: 'none' | 'routed' | 'proxy'; v6subnet: string; v6gateway: string; v6range: string
+  mode: 'none' | 'routed' | 'proxy'; v6subnet: string; v6range: string
 }
-export const blankNet = (): NetForm => ({ name: '', uplink: '', v4: true, v4subnet: '', v4gateway: '', v4range: '', nat: false, mode: 'none', v6subnet: '', v6gateway: '', v6range: '' })
+export const blankNet = (): NetForm => ({ name: '', uplink: '', v4: true, v4subnet: '', v4gateway: '', v4range: '', nat: false, mode: 'none', v6subnet: '', v6range: '' })
 
 function v4int(a: string): number | null {
   const p = a.trim().split('.')
@@ -42,10 +44,12 @@ export function suggestV4(subnet: string): { gateway: string; range: string } | 
 
 export const isV6Cidr = (s: string) => /^[0-9a-fA-F:]+\/\d{1,3}$/.test(s.trim()) && s.includes(':') && Number(s.split('/')[1]) <= 128
 
-/** Field -> message for what is plainly wrong; empty when the form may be sent. */
-export function checkNet(f: NetForm): Record<string, string> {
+/** Field -> message for what is plainly wrong; empty when the form may be sent. An existing network (editing)
+ *  keeps its name, which may be longer than a new one may be. */
+export function checkNet(f: NetForm, existing = false): Record<string, string> {
   const e: Record<string, string> = {}
-  if (!/^[a-z0-9][a-z0-9._-]*$/.test(f.name)) e.name = f.name ? 'Use lower-case letters, digits, dots, dashes and underscores.' : ''
+  // the name rule of the server (shared lib/names.ts); an empty name is the form's "Required."
+  if (!existing && f.name && nameError(f.name, 'network')) e.name = nameError(f.name, 'network')
   if (f.v4) {
     const c = parseV4Cidr(f.v4subnet)
     if (f.v4subnet && !c) e.v4subnet = 'Write the subnet as a.b.c.d/len, for example 10.20.0.0/24.'
@@ -59,19 +63,33 @@ export function checkNet(f: NetForm): Record<string, string> {
   }
   if (f.mode !== 'none') {
     if (f.v6subnet && !isV6Cidr(f.v6subnet)) e.v6subnet = 'Write the prefix as an IPv6 CIDR, for example 2001:db8:20::/64.'
-    if (f.v6gateway && !f.v6gateway.includes(':')) e.v6gateway = 'Not an IPv6 address.'
     if (f.v6range && !/^[0-9a-fA-F:]+-[0-9a-fA-F:]+$/.test(f.v6range.trim())) e.v6range = 'Write the range as first-last.'
-    if (f.mode === 'proxy' && !f.uplink) e.uplink = 'Proxy mode answers neighbor discovery on an uplink: name it.'
-    if (f.mode === 'proxy' && f.v6gateway && !/^fe80:/i.test(f.v6gateway.trim())) e.v6gateway = 'In proxy mode the gateway is the bridge\'s link-local address, for example fe80::1.'
+    if (f.mode === 'proxy' && !f.uplink) e.uplink = 'Proxy mode answers neighbour discovery on an uplink: name it.'
   }
   if (!f.v4 && f.mode === 'none') e.family = 'A network needs IPv4, IPv6, or both.'
-  return Object.fromEntries(Object.entries(e).filter(([k, v]) => v || k === 'name'))
+  return e
 }
 
-export function netBody(f: NetForm): Pick<Network, 'metadata' | 'spec'> {
-  const spec: Network['spec'] = {}
+/** The form of an existing network, for editing. */
+export function formOf(n: Network): NetForm {
+  const v4 = n.spec.ipv4
+  const v6 = n.spec.ipv6
+  return {
+    name: n.metadata.name, uplink: n.spec.uplink ?? '',
+    v4: !!v4, v4subnet: v4?.subnet ?? '', v4gateway: v4?.gateway ?? '', v4range: v4?.range ?? '', nat: !!v4?.nat,
+    mode: (v6?.mode as NetForm['mode']) ?? 'none', v6subnet: v6?.subnet ?? '', v6range: v6?.range ?? '',
+  }
+}
+
+/** The body of POST /networks, or of PUT for an edit: base keeps what the form does not show (DNS, MTU,
+ *  exclusions). */
+export function netBody(f: NetForm, base?: Network): Pick<Network, 'metadata' | 'spec'> {
+  const spec: Network['spec'] = base ? clone(base.spec) : {}
+  delete spec.uplink
+  delete spec.ipv4
+  delete spec.ipv6
   if (f.uplink.trim()) spec.uplink = f.uplink.trim()
-  if (f.v4) spec.ipv4 = { subnet: f.v4subnet.trim(), gateway: f.v4gateway.trim(), range: f.v4range.trim(), ...(f.nat ? { nat: true } : {}) }
-  if (f.mode !== 'none') spec.ipv6 = { mode: f.mode, subnet: f.v6subnet.trim(), gateway: f.v6gateway.trim(), range: f.v6range.trim() }
-  return { metadata: { name: f.name }, spec }
+  if (f.v4) spec.ipv4 = { ...(base?.spec.ipv4?.exclude?.length ? { exclude: base.spec.ipv4.exclude } : {}), subnet: f.v4subnet.trim(), gateway: f.v4gateway.trim(), range: f.v4range.trim(), ...(f.nat ? { nat: true } : {}) }
+  if (f.mode !== 'none') spec.ipv6 = { mode: f.mode, subnet: f.v6subnet.trim(), range: f.v6range.trim() }
+  return { metadata: base ? { ...base.metadata } : { name: f.name }, spec }
 }

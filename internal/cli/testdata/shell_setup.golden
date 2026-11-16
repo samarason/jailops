@@ -1,0 +1,62 @@
+$ jailops create web --image freebsd-15@stable --network lan --storage default --shell sh --prompt none
+jail/web created
+
+$ jailops config get web shell
+/bin/sh
+
+$ jailops config get web prompt
+none
+
+$ jailops create bad --image freebsd-15@stable --network lan --storage default --prompt $(id)
+! usage: --prompt: the prompt may contain $ only as \$ (# for root, $ for everyone else): variables and commands in the prompt are not accepted
+! hint: run 'jailops create --help' for usage
+[exit 2]
+
+$ jailops jail shell-setup web
+! busy: jail "web" is not running; the shell is set up inside it
+! hint: start it first
+[exit 5]
+
+$ jailops start web
+jail/web started
+
+$ jailops config unset web shell
+jail/web configuration updated
+
+$ jailops config unset web prompt
+jail/web configuration updated
+
+$ jailops jail shell-setup web
+jail/web: shell /usr/local/bin/bash, prompt default
+  PS1='\[\e[38;5;39m\]\u@\h\[\e[0m\]${_jailops_where:+ \[\e[38;5;245m\][${_jailops_where}]\[\e[0m\]}:\w\$ '
+  pkg -r ROOT install -y bash
+  wrote /usr/local/etc/profile.d/jailops-prompt.sh
+
+$ jailops jail shell-setup web -o json
+{
+  "jail": "web",
+  "shell": "/usr/local/bin/bash",
+  "prompt": "default",
+  "ps1": "\\[\\e[38;5;39m\\]\\u@\\h\\[\\e[0m\\]${_jailops_where:+ \\[\\e[38;5;245m\\][${_jailops_where}]\\[\\e[0m\\]}:\\w\\$ ",
+  "steps": [
+    "pkg -r ROOT install -y bash",
+    "wrote /usr/local/etc/profile.d/jailops-prompt.sh"
+  ]
+}
+
+$ jailops --dry-run jail shell-setup web
+dry-run: would set up the shell of jail web
+{}
+
+$ jailops config set web prompt \[\e[38;5;196m\]\u@\h:\w\$\[\e[0m\] 
+jail/web configuration updated
+
+$ jailops config set web prompt `id`
+! invalid: prompt: the prompt may not contain a backquote: commands in the prompt are not accepted
+[exit 2]
+
+$ jailops jail shell-setup ghost
+! not_found: jail "ghost" not found
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
+[exit 4]
+

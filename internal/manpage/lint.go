@@ -35,6 +35,13 @@ func Lint(page string) []string {
 		case ".Sh":
 			seeAlso = strings.TrimPrefix(l, ".Sh ") == "SEE ALSO"
 		}
+		// mandoc -Tlint: a macro line that ends in a word with a closing bracket glued to it ("PROJECT]" after
+		// "[--project") has no blank before its trailing delimiter; the usage string should not end like that
+		if (macro == ".Ar" || macro == ".Nm") && len(tok) > 1 {
+			if w := tok[len(tok)-1]; strings.HasSuffix(w, "]") && !strings.HasPrefix(w, "[") {
+				say(n, "no blank before trailing delimiter: %q (word the usage so that it does not end in a word and a bracket)", w)
+			}
+		}
 		if len(l) > width {
 			say(n, "%d bytes", len(l))
 		}

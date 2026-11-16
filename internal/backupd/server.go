@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"jailops.net/jailops/internal/supervise"
 	"log/slog"
 	"net"
 	"net/http"
@@ -220,7 +221,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.mu.Unlock()
 	schedCtx, stopSched := context.WithCancel(ctx)
 	done := make(chan struct{})
-	go func() { s.scheduler.Run(schedCtx); close(done) }()
+	go func() {
+		supervise.Run(schedCtx, nil, "backup-scheduler", func(c context.Context) { s.scheduler.Run(c) })
+		close(done)
+	}()
 	var err error
 	select {
 	case <-ctx.Done():

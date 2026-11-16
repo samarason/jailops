@@ -16,8 +16,7 @@ const (
 	KindContainer  = "container"  // holds spec.json and bundle.json
 	KindRoot       = "root"       // the OS root (cloned from a generation when thin)
 	KindPersistent = "persistent" // a persistent path of a thin jail
-	KindVolume     = "volume"     // a user volume
-	KindVolumes    = "volumes"    // the parent of the volumes (no content)
+	KindVolume     = "volume"     // a volume: the only dataset of a volume record
 	KindState      = "state"      // the host state dataset (include_state)
 )
 
@@ -34,12 +33,15 @@ type Dataset struct {
 	// restore (for example jailops:path, jailops:class, quota, readonly). The
 	// mountpoint is recorded separately, relative to the container.
 	Props map[string]string
-	// Skip says why the dataset is left out of this capture: SkipLocked for an encrypted volume whose key is not
-	// loaded (its files cannot be read). The run reports it as a warning.
+	// Skip says why the dataset is left out of this capture (SkipDelegated). The run reports it as a warning.
 	Skip string
 }
 
-// SkipLocked is Dataset.Skip of a locked encrypted volume.
+// SkipDelegated is Dataset.Skip of the dataset a jail manages itself (zfs_delegation): it is not mounted on the host,
+// so its files cannot be read there.
+const SkipDelegated = "delegated"
+
+// SkipLocked is Dataset.Skip of an encrypted volume whose key is not loaded: its files cannot be read.
 const SkipLocked = "locked"
 
 // JailRecord is what the daemon knows about one jail, taken from its record
@@ -61,14 +63,26 @@ type JailRecord struct {
 	Image api.ImageGeneration
 	// SecretRefs name sealed secrets (never their values).
 	SecretRefs []string
+	// VolumeIDs maps the name of each volume the jail attaches to its UUID (the bundle records it).
+	VolumeIDs map[string]string
 	// IsState marks the host state record (include_state): its datasets are
 	// all captured and it has no restore bundle.
 	IsState bool
+	// IsVolume marks the record of a volume. A volume is a backup unit of its own: Name and UUID are the volume's,
+	// Container is its dataset (the only one), Volume is its spec and there is no restore bundle. Whatever number
+	// of jails attach it, it has one record and so one copy in a run.
+	IsVolume bool
+	Volume   *api.VolumeSpec
 }
 
 // JailSource lists the jails of this host.
 type JailSource interface {
 	Jails(ctx context.Context) ([]JailRecord, error)
+}
+
+// VolumeSource lists the volumes of this host as records (IsVolume). Optional: without it no volume is backed up.
+type VolumeSource interface {
+	Volumes(ctx context.Context) ([]JailRecord, error)
 }
 
 // StateSource returns the host state dataset as a record, for policies with
@@ -110,6 +124,13 @@ type Mounter interface {
 	// MountDir returns the directory a freshly created dataset is mounted on,
 	// writable by the restore. It fails when the dataset is not mounted.
 	MountDir(ctx context.Context, dataset string) (string, error)
+}
+
+// DatasetMounter mounts and unmounts a dataset. A backup of a jail that is stopped (or was never started) finds its
+// datasets unmounted: the capture mounts them for the time it reads the snapshot and unmounts them again.
+type DatasetMounter interface {
+	Mount(ctx context.Context, dataset string) error
+	Unmount(ctx context.Context, dataset string) error
 }
 
 // Placement is where a restored jail goes. The daemon decides it from the
@@ -173,6 +194,18 @@ type Host interface {
 	Running(ctx context.Context, project, name string) (bool, error)
 	// Start starts a restored jail.
 	Start(ctx context.Context, project, name string) error
+}
+
+// VolumeHost is implemented by a Host that restores volumes. Without it a volume backup cannot be restored and a
+// jail restore cannot bring back the volumes it attaches.
+type VolumeHost interface {
+	// RestoreVolume makes an empty volume of the project from the spec of a volume backup, the way volume create does
+	// (owner, mode, quota, encryption with the passphrase), registers it and returns its dataset. The returned undo
+	// removes it again. It fails with api.CodeAlreadyExists when the project has a volume of that name.
+	RestoreVolume(ctx context.Context, project, name string, spec api.VolumeSpec, labels map[string]string, passphrase string) (dataset string, undo func(context.Context) error, err error)
+	// CompleteVolume ends the restore of a volume made by RestoreVolume: until then the helper lets a file agent write
+	// its dataset, and never afterwards.
+	CompleteVolume(ctx context.Context, project, name string) error
 }
 
 // DrillHost is what a full restore test needs of the host besides Host. The test restores the backup as a jail of

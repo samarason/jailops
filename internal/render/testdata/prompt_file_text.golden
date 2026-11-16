@@ -1,0 +1,7 @@
+# Managed by JailOps: the bash prompt of this jail. JailOps rewrites this file;
+# change the prompt with: jailops config set JAIL prompt default|short|none|PS1
+# Your own ~/.bashrc, ~/.bash_profile or ~/.profile is read after this file and wins.
+# Only an interactive bash sets the prompt; sh, scripts and bash -c are not affected.
+if [ -n "${BASH_VERSION-}" ] && [ -n "${PS1-}" ]; then
+	PS1='\u@${JAILOPS_JAIL-} ${JAILOPS_PROJECT-}/${JAILOPS_HOST-}:\w\$ '
+fi

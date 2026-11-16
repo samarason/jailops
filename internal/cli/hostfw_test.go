@@ -16,7 +16,7 @@ func TestHostFirewallCommands(t *testing.T) {
 	h.seed()
 	tr := h.transcript()
 	tr.ok("host", "firewall", "show")
-	if _, errs, code := tr.do("", "host", "firewall", "set", "--ssh-from", "192.0.2.0/24"); code != 3 || !strings.Contains(errs, "not_managed") {
+	if _, errs, code := tr.do("", "host", "firewall", "set", "--ssh-from", "192.0.2.0/24"); code != 6 || !strings.Contains(errs, "not_managed") {
 		t.Fatalf("not managed: %d %s", code, errs)
 	}
 	tr.golden("host_firewall_not_managed")
@@ -30,12 +30,21 @@ func TestHostFirewallCommands(t *testing.T) {
 		t.Fatalf("the dry run left a pending change: %q", p)
 	}
 	tr.do("", "host", "firewall", "set", "--ssh-port", "0")
-	tr.do("", "host", "firewall", "set", "--allow", "tcp 80 comment web")
-	tr.do("", "host", "firewall", "set", "--template", "custom-rules", "--allow", "tcp")
+	tr.do("", "host", "firewall", "allow", "add", "--proto", "tcp", "--port", "80")
+	tr.do("", "host", "firewall", "allow", "add", "--proto", "tcp", "--comment", "web")
+	tr.do("", "host", "firewall", "allow", "remove", "1")
+	tr.do("", "host", "firewall", "address-set", "set", "admins", "--member", "192.0.2.0/24")
 	tr.do("", "host", "firewall", "set", "--confirm-within", "5")
 	tr.do("", "host", "firewall", "set", "--icmp", "sometimes")
-	tr.ok("host", "firewall", "set", "--template", "custom-rules", "--set", "admins=192.0.2.0/24,2001:db8:a::/48", "--ssh-from", "@admins",
-		"--allow", "tcp 80,443 comment web", "--allow", "udp 51820 from 2001:db8:1::/56", "--confirm-within", "90s")
+	tr.ok("host", "firewall", "address-set", "create", "admins", "--member", "192.0.2.0/24", "--member", "2001:db8:a::/48", "--confirm-within", "90s")
+	tr.ok("host", "confirm")
+	tr.do("", "host", "firewall", "address-set", "create", "admins", "--member", "192.0.2.0/24")
+	tr.ok("host", "firewall", "set", "--template", "custom-rules", "--ssh-from", "@admins", "--confirm-within", "90s")
+	tr.ok("host", "confirm")
+	tr.ok("host", "firewall", "allow", "add", "--proto", "tcp", "--port", "80,443", "--comment", "web", "--confirm-within", "90s")
+	tr.ok("host", "confirm")
+	tr.ok("host", "firewall", "allow", "add", "--proto", "udp", "--port", "51820", "--from", "2001:db8:1::/56", "--comment", "WireGuard", "--confirm-within", "90s")
+	tr.ok("host", "firewall", "allow", "list")
 	tr.ok("host", "pending")
 	tr.do("", "host", "firewall", "set", "--icmp", "disable")
 	tr.do("", "host", "confirm", "--id", "nothex")

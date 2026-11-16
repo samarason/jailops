@@ -26,92 +26,35 @@ import (
 
 const defaultPort = "39110"
 
-func (a *app) trustCmd() *cobra.Command {
-	d := certDesc()
-	tc := group("trust", "Trust new clients and manage who is trusted",
-		`Identities are certificates, tokens and users, each with a role and a project
-scope (--projects a,b, or --global). An empty scope grants nothing.
-
-Adding a client takes no trust on first use and no copying of certificates:
-
-  1. A global admin runs 'jailops trust add --name laptop --permission operator --projects web'.
-     The server answers with a single-use trust token that carries its own
-     certificate fingerprint.
-  2. On the client, 'jailops remote add HOST --token TOKEN' pins that fingerprint,
-     makes a key pair and presents the token with the certificate.
-  3. The server consumes the token and records the certificate with the role
-     and projects.
-
-'trust list', 'trust revoke' and 'trust edit' manage the store. A revocation
-takes effect on the next request.`,
-		`jailops trust add --name laptop --permission operator --projects web
-jailops trust list
-jailops trust revoke laptop`, "trusted")
-	tc.AddCommand(a.trustAdd())
-	addList(a, tc, d, "")
-	addShow(a, tc, d)
-	addEdit(a, tc, d)
-	rev := &cobra.Command{
-		Use:   "revoke NAME|FINGERPRINT...",
-		Short: "Stop trusting a client certificate",
-		Long: `Remove a certificate from the trust store, by name or by fingerprint. It takes
-effect on the next request of that client, which is then refused. The command
-asks for confirmation unless -y is given.`,
-		Example:           "jailops trust revoke laptop\njailops trust revoke -y ab:cd:ef:...",
-		Args:              cobra.MinimumNArgs(1),
-		ValidArgsFunction: completeKind(a, d),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			for _, id := range args {
-				if ok, err := a.dry("revoke trust of "+id, nil); ok || err != nil {
-					if err != nil {
-						return err
-					}
-					continue
-				}
-				if err := a.confirm(fmt.Sprintf("Revoke trust of %q?", id)); err != nil {
-					return err
-				}
-				c, err := a.connect(cmd.Context())
-				if err != nil {
-					return err
-				}
-				if err := c.Certificates().Delete(cmd.Context(), id); err != nil {
-					return err
-				}
-				if err := a.finishOp(cmd.Context(), nil, "certificate", id, "revoked", nil); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-	}
-	tc.AddCommand(rev)
-	return tc
-}
-
-func (a *app) trustAdd() *cobra.Command {
-	var name, role string
+// certEnroll makes a single-use token that lets a new client add its own certificate.
+func (a *app) certEnroll() *cobra.Command {
+	var role string
 	var ttl, certExpires time.Duration
 	var scope func() ([]string, bool, error)
 	cmd := &cobra.Command{
-		Use:   "add --name NAME --permission ROLE (--projects a,b | --global)",
-		Short: "Create a single-use trust token for a new client",
+		Use:   "enroll NAME --role ROLE (--projects a,b | --global)",
+		Short: "Create a single-use token that enrolls a new client",
 		Long: `Create a trust token that lets one new client add itself to the trust store.
 The token is printed once, on standard output, and a warning on standard error;
-it cannot be shown again. It is single use, bound to NAME, and valid for --ttl
+it cannot be shown again. It is single use, bound to NAME, and valid for --expires
 (default 1 hour). It carries the server's certificate fingerprint, so the
 client pins the server without trusting it on first use.
 
 The identity needs a scope: --projects a,b or --global (global admins only).
---cert-expires limits how long the trust itself lasts once the token is used.`,
-		Example: `jailops trust add --name laptop --permission operator --projects web
-jailops trust add --name ops --permission admin --global --ttl 15m
-jailops trust add --name ci --permission operator --projects web,db --cert-expires 2160h`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if name == "" {
-				return usagef("--name is required")
-			}
+--cert-expires limits how long the trust itself lasts once the token is used.
+
+The client joins with the one-argument form of remote add, the token on
+standard input: jailops remote add NAME ADDRESS --token-file -.
+
+A client that was enrolled is an ordinary certificate: 'jailops cert list' shows it
+and 'jailops cert revoke NAME' ends its trust.`,
+		Example: `jailops cert enroll laptop --role operator --projects web
+jailops cert enroll ops --role admin --global --expires 15m
+jailops cert enroll ci --role operator --projects web,db --cert-expires 2160h`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeNone,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
 			projects, global, err := scope()
 			if err != nil {
 				return err
@@ -140,11 +83,8 @@ jailops trust add --name ci --permission operator --projects web,db --cert-expir
 			return a.emit(tt, nil, nil, func() []string { return []string{tt.Name} })
 		},
 	}
-	cmd.Flags().StringVar(&name, "name", "", "name of the new client (required)")
-	permFlag(cmd, &role, "readonly")
-	cmd.Flags().StringVar(&role, "role", "readonly", "the former name of --permission")
-	_ = cmd.Flags().MarkHidden("role")
-	cmd.Flags().DurationVar(&ttl, "ttl", 0, "how long the token can be redeemed (default 1h)")
+	roleFlag(cmd, &role, "readonly", "")
+	cmd.Flags().DurationVar(&ttl, "expires", 0, "how long the token can be redeemed (default 1h)")
 	cmd.Flags().DurationVar(&certExpires, "cert-expires", 0, "how long the client's trust lasts after redemption (default: no expiry)")
 	scope = scopeFlags(cmd)
 	a.completeFlag(cmd, "projects", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Projects().List(ctx), projName) }))
@@ -321,6 +261,18 @@ func (a *app) sessionsCmd() *cobra.Command {
 		Long:    "End one or more sessions. The browser behind a revoked session is signed out on its next request. The command asks for confirmation unless -y is given.",
 		Example: "jailops sessions revoke 3f9c...\njailops sessions revoke -y a b",
 		Args:    cobra.MinimumNArgs(1),
+		ValidArgsFunction: a.completeNames(func(ctx context.Context, c *sdk.Client) ([]string, error) {
+			var ids []string
+			for s, err := range c.Sessions().List(ctx) {
+				if err != nil {
+					return ids, err
+				}
+				if !s.Current {
+					ids = append(ids, s.ID+"\t"+s.User)
+				}
+			}
+			return ids, nil
+		}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			for _, id := range args {
 				if ok, err := a.dry("revoke session "+id, nil); ok || err != nil {

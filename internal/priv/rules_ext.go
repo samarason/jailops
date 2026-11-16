@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"jailops.net/jailops/internal/sys/ifconfig"
 	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/internal/validate"
+	"jailops.net/jailops/sdk/api"
 )
 
 // Rules for building images and wiring Linux jails from the host. Every
@@ -24,7 +26,7 @@ import (
 // verified on the 15.1 test host and recorded in the design.
 
 // DefaultFetchHosts are the hosts fetch may download from.
-var DefaultFetchHosts = []string{"dl-cdn.alpinelinux.org", "pkg.freebsd.org"}
+var DefaultFetchHosts = []string{"dl-cdn.alpinelinux.org", "pkg.freebsd.org", "pkg.jailops.net", "deb.debian.org", "archive.ubuntu.com", "ports.ubuntu.com"}
 
 // Devfs rulesets JailOps may define or mount: numbers below 100 belong to the
 // stock devfs.rules and are left alone (4 may be mounted, not changed).
@@ -43,7 +45,6 @@ var (
 	reDevfsGlob  = regexp.MustCompile(`^[a-z0-9*?_./-]{1,64}$`)
 	reDevfsName  = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 	reApkArg     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+@:=/<>~-]{0,127}$`)
-	reIfCreate   = regexp.MustCompile(`^(bridge[0-9]{1,4}|epair[0-9]{1,4}[ab])$`)
 	reNumber     = regexp.MustCompile(`^[0-9]{1,5}$`)
 	apkSubs      = []string{"add", "update", "upgrade", "del", "info", "verify", "--version"}
 	apkFlags     = []string{"--no-cache", "-q", "--quiet", "--update-cache", "-U", "--simulate", "-s", "--no-progress", "-v", "--verbose", "-a", "--available", "--no-interactive"}
@@ -185,8 +186,12 @@ func customChmod(c Config, _ bool, args []string) error {
 
 // verifyChmod refuses a path with a symbolic link in it: chmod follows links, and an image archive can contain one
 // that points out of the image root.
-func verifyChmod(_ context.Context, _ *Local, args []string) error {
+func verifyChmod(ctx context.Context, l *Local, args []string) error {
 	for _, p := range args[1:] {
+		// a tree a running jail controls can change under the call: chmod is for the roots of images and of jails that are stopped
+		if name := l.runningJailAt(ctx, p); name != "" {
+			return forbidden("chmod: %q is in the tree of the running jail %s", p, name)
+		}
 		real, err := filepath.EvalSymlinks(p)
 		if err != nil {
 			return invalid("chmod: %v", err)
@@ -297,8 +302,9 @@ func (c Config) devfsRulesetOK(n int) bool {
 
 // customMount accepts: mount -t <type> [-o <options>] <device> <path>. The
 // device of every type but nullfs is the type name; a nullfs source is below
-// a storage root. The path is checked against the jail in verifyMount.
-func customMount(c Config, _ bool, args []string) error {
+// a storage root or, with the admin assertion, below an admin-host-mount directory (the mount a volume of a host
+// directory gives a running jail again). The path is checked against the jail in verifyMount.
+func customMount(c Config, admin bool, args []string) error {
 	if len(args) < 4 || args[0] != "-t" || !slices.Contains(mountTypes, args[1]) {
 		return forbidden("mount: only -t <%s> is accepted", strings.Join(mountTypes, "|"))
 	}
@@ -316,7 +322,7 @@ func customMount(c Config, _ bool, args []string) error {
 		return invalid("mount: expected <device> <path>")
 	}
 	if typ == "nullfs" {
-		if err := c.checkRulePath(pathJailTree, rest[0]); err != nil {
+		if err := c.checkRulePath(pathJailTree, rest[0]); err != nil && !(admin && c.hostMountSource(rest[0])) {
 			return err
 		}
 	} else if rest[0] != typ {
@@ -328,7 +334,28 @@ func customMount(c Config, _ bool, args []string) error {
 	return nil
 }
 
+// hostMountSource reports whether p is below a directory of admin-host-mount.
+func (c Config) hostMountSource(p string) bool {
+	for _, r := range c.Admin.HostMountRoots {
+		if within(r, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func verifyMount(_ context.Context, l *Local, args []string) error {
+	if i := slices.Index(args, "nullfs"); i == 1 && len(args) >= 4 {
+		// a source of the host's own directories is held to the allowed directory it lies below, links and all
+		src := args[len(args)-2]
+		for _, r := range l.cfg.Admin.HostMountRoots {
+			if within(r, src) {
+				if err := plainBelow(r, src); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return l.checkJailRootPath(args[len(args)-1])
 }
 
@@ -343,8 +370,23 @@ func customUmount(c Config, _ bool, args []string) error {
 	return nil
 }
 
-func verifyUmount(_ context.Context, l *Local, args []string) error {
-	return l.checkJailRootPath(args[len(args)-1])
+// verifyUmount takes a path that is a mount point of the host as it is listed, and no other: umount(8) resolves the
+// path, so a path that is a link a jail put in its tree would unmount whatever the link points at (a host file system).
+// A mount point cannot be replaced while it is mounted, so what the list shows now is what umount will resolve.
+func verifyUmount(ctx context.Context, l *Local, args []string) error {
+	p := args[len(args)-1]
+	if err := l.checkJailRootPath(p); err != nil {
+		return err
+	}
+	if mps := l.mountPoints(ctx); mps != nil {
+		for _, mp := range mps {
+			if mp == p {
+				return nil
+			}
+		}
+		return api.Errorf(api.CodeNotFound, "umount: %s is not a mount point", p)
+	}
+	return nil
 }
 
 // ---- jail ----
@@ -554,8 +596,8 @@ func customDebootstrap(c Config, admin bool, args []string) error {
 	if key == args[2] || !cleanAbs(key) {
 		return forbidden("debootstrap: --keyring=<file> is required and checks the release signature")
 	}
-	if !strings.HasPrefix(key, "/usr/local/share/keyrings/") && c.checkRulePath(pathState, key) != nil {
-		return forbidden("debootstrap: keyring %q is not in /usr/local/share/keyrings, the work directory or a storage root", key)
+	if err := c.checkKeyring(key); err != nil {
+		return err
 	}
 	if !reDebSuite.MatchString(args[3]) {
 		return forbidden("debootstrap: %q is not a suite name", args[3])
@@ -566,8 +608,17 @@ func customDebootstrap(c Config, admin bool, args []string) error {
 	if err := c.checkRulePath(pathJailTree, args[4]); err != nil {
 		return err
 	}
-	if len(args) == 6 && !reDebMirror.MatchString(args[5]) {
-		return forbidden("debootstrap: mirror %q must be an https URL", args[5])
+	if len(args) == 6 {
+		if !reDebMirror.MatchString(args[5]) {
+			return forbidden("debootstrap: mirror %q must be an https URL", args[5])
+		}
+		host := strings.TrimPrefix(args[5], "https://")
+		if i := strings.IndexAny(host, "/:"); i >= 0 {
+			host = host[:i]
+		}
+		if !c.pkgHostAllowed(strings.ToLower(host), true) {
+			return forbidden("debootstrap: mirror host %s is not in fetch-host of priv.conf", host)
+		}
 	}
 	return nil
 }
@@ -608,7 +659,9 @@ func verifyJexec(_ context.Context, l *Local, args []string) error {
 
 // ---- ifconfig and route ----
 
-func (c Config) checkJailIface(name string) error { return c.ifOwned(name) }
+// checkJailIface checks the form of an interface name in a jail's vnet; verifyIfconfig and verifyRoute read the
+// interface there and require JailOps's marker before the command runs.
+func (c Config) checkJailIface(name string) error { return ifconfig.ValidateIfName(name) }
 
 func parseAddr(s string, v6 bool) (netip.Addr, error) {
 	a, err := netip.ParseAddr(s)
@@ -626,11 +679,10 @@ func parseBits(s string, max int) error {
 	return nil
 }
 
-// customIfconfig accepts:
+// customIfconfig accepts (only in the vnet of a managed jail; epairs of the host are made by the typed
+// net.* operations, which mark them, never by a command line):
 //
-//	ifconfig bridge create | ifconfig epair create
-//	ifconfig bridgeN name <owned name> | ifconfig epairNa|epairNb name <owned name>
-//	ifconfig -j <jail> <owned iface>
+//	ifconfig -j <jail> <iface>
 //	ifconfig -j <jail> <owned iface> up|down
 //	ifconfig -j <jail> <owned iface> description <JailOps description>
 //	ifconfig -j <jail> <owned iface> mtu <n>
@@ -638,10 +690,6 @@ func parseBits(s string, max int) error {
 //	ifconfig -j <jail> <owned iface> inet6 <addr> [prefixlen <n>] [alias|-alias]
 func customIfconfig(c Config, _ bool, args []string) error {
 	switch {
-	case len(args) == 2 && (args[0] == "bridge" || args[0] == "epair") && args[1] == "create":
-		return nil
-	case len(args) == 3 && reIfCreate.MatchString(args[0]) && args[1] == "name":
-		return c.ifOwned(args[2])
 	case len(args) == 3 && args[0] == "-j":
 		// read-only: the state of one interface in the jail's vnet (its description is repaired from it)
 		if err := ValidJailName(args[1]); err != nil {
@@ -718,11 +766,19 @@ func checkIfconfigJail(r []string) error {
 	return bad()
 }
 
-func verifyIfconfig(_ context.Context, l *Local, args []string) error {
-	if len(args) >= 2 && args[0] == "-j" {
-		return jailGuard{l}.managed(args[1])
+// verifyIfconfig runs in the helper before the command: the jail is managed and, for a form that changes the
+// interface, the interface carries JailOps's marker in the jail's vnet (read there, never taken from the request).
+func verifyIfconfig(ctx context.Context, l *Local, args []string) error {
+	if len(args) < 3 || args[0] != "-j" {
+		return forbidden("ifconfig: only the -j forms are accepted")
 	}
-	return nil
+	if err := (jailGuard{l}).managed(args[1]); err != nil {
+		return err
+	}
+	if len(args) == 3 {
+		return nil // reading one interface
+	}
+	return l.ifOwnedInJail(ctx, args[1], args[2])
 }
 
 // customRoute accepts: route -j <jail> add|delete [-inet6] default|<host> <gateway>.
@@ -741,7 +797,7 @@ func customRoute(c Config, _ bool, args []string) error {
 			return nil
 		}
 		if args[2] == "add" && len(args) == 7 && args[5] == "-interface" {
-			return c.ifOwned(args[6])
+			return c.checkJailIface(args[6])
 		}
 		return forbidden("route: expected -host <ipv4> -interface <interface>")
 	}
@@ -766,7 +822,7 @@ func customRoute(c Config, _ bool, args []string) error {
 	}
 	gw, zone, hasZone := strings.Cut(r[1], "%")
 	if hasZone {
-		if !v6 || c.ifOwned(zone) != nil {
+		if !v6 || c.checkJailIface(zone) != nil {
 			return invalid("invalid gateway %q", r[1])
 		}
 		a, err := parseAddr(gw, true)
@@ -779,6 +835,48 @@ func customRoute(c Config, _ bool, args []string) error {
 	return err
 }
 
-func verifyRoute(_ context.Context, l *Local, args []string) error {
-	return jailGuard{l}.managed(args[1])
+// verifyRoute: the jail is managed, and an interface the route names (-interface, or the zone of a link-local
+// gateway) carries JailOps's marker in the jail's vnet.
+func verifyRoute(ctx context.Context, l *Local, args []string) error {
+	if err := (jailGuard{l}).managed(args[1]); err != nil {
+		return err
+	}
+	iface := ""
+	if len(args) == 7 && args[5] == "-interface" {
+		iface = args[6]
+	} else if _, zone, ok := strings.Cut(args[len(args)-1], "%"); ok {
+		iface = zone
+	}
+	if iface == "" {
+		return nil
+	}
+	return l.ifOwnedInJail(ctx, args[1], iface)
+}
+
+// runningJailAt returns the name of the running jail whose root path p lies in, "" when there is none.
+func (l *Local) runningJailAt(ctx context.Context, p string) string {
+	if l == nil || l.d.Jails == nil {
+		return ""
+	}
+	list, err := l.d.Jails.List(ctx)
+	if err != nil {
+		return ""
+	}
+	real := filepath.Clean(p)
+	if r, err := filepath.EvalSymlinks(real); err == nil {
+		real = r
+	}
+	for _, j := range list {
+		if j.Path == "" {
+			continue
+		}
+		jp := filepath.Clean(j.Path)
+		if r, err := filepath.EvalSymlinks(jp); err == nil {
+			jp = r
+		}
+		if within(jp, real) || within(jp, filepath.Clean(p)) {
+			return j.Name
+		}
+	}
+	return ""
 }

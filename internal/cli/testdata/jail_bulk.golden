@@ -58,44 +58,90 @@ $ jailops stop db --grace 5
 jail/db stopped
 
 $ jailops delete -l env=test
-! This deletes 1 jail of project "main": tmp. It cannot be undone.
+! conflict: jail "tmp" is running
+! hint: stop it first ('jailops stop tmp'), or pass --stop to stop it before the delete
+[exit 5]
+
+$ jailops stop tmp
+jail/tmp stopped
+
+$ jailops delete -l env=test
+! This deletes 1 jail of project "main" and destroys its data; it cannot be undone:
+!   tmp (stopped): root 256.0 MiB, data 70.0 MiB, 0 snapshots
 ! Type the name "main" to confirm: 
-! usage: confirmation required
-! hint: type the name on standard input, or pass -y
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: type the name on standard input, or pass --confirm-data-loss (-y does not answer this question)
 [exit 2]
 
 $ jailops delete -l env=test
-! This deletes 1 jail of project "main": tmp. It cannot be undone.
+! This deletes 1 jail of project "main" and destroys its data; it cannot be undone:
+!   tmp (stopped): root 256.0 MiB, data 70.0 MiB, 0 snapshots
 ! Type the name "main" to confirm: aborted: the name did not match, nothing was changed
 [exit 1]
 
-$ jailops delete -l env=test
-! This deletes 1 jail of project "main": tmp. It cannot be undone.
-! Type the name "main" to confirm: busy: jail "tmp" is running
-! hint: stop it first
-[exit 5]
-
-$ jailops delete -l env=test --force -y
-jail/tmp stopped
-jail/tmp deleted
-
-$ jailops delete web
-! Delete jail "web"? [y/N]: 
-! usage: confirmation required
-! hint: answer on standard input, or pass -y
+$ jailops delete -l env=test -y
+! This deletes 1 jail of project "main" and destroys its data; it cannot be undone:
+!   tmp (stopped): root 256.0 MiB, data 70.0 MiB, 0 snapshots
+! Type the name "main" to confirm: 
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: type the name on standard input, or pass --confirm-data-loss (-y does not answer this question)
 [exit 2]
 
-$ jailops --dry-run delete --force web
-dry-run: would stop jail web when it is running
-dry-run: would delete jail web
+$ jailops delete -l env=test
+jail/tmp deleted
+! This deletes 1 jail of project "main" and destroys its data; it cannot be undone:
+!   tmp (stopped): root 256.0 MiB, data 70.0 MiB, 0 snapshots
+! Type the name "main" to confirm: 
 
-$ jailops delete --force -y web
+$ jailops delete web
+! conflict: jail "web" is running
+! hint: stop it first ('jailops stop web'), or pass --stop to stop it before the delete
+[exit 5]
+
+$ jailops --dry-run delete web
+dry-run: would delete jail web (running): root 256.0 MiB, data 70.0 MiB, 0 snapshots; the delete needs --stop to stop it first
+
+$ jailops --dry-run delete web -o json
+{
+  "action": "delete jail",
+  "destroys": [
+    "web (running): root 256.0 MiB, data 70.0 MiB, 0 snapshots; the delete needs --stop to stop it first"
+  ],
+  "dry_run": true
+}
+
+$ jailops --dry-run delete --stop web
+dry-run: would delete jail web (running): root 256.0 MiB, data 70.0 MiB, 0 snapshots; --stop stops it first
+
+$ jailops --dry-run delete --stop web -o json
+{
+  "action": "delete jail",
+  "destroys": [
+    "web (running): root 256.0 MiB, data 70.0 MiB, 0 snapshots; --stop stops it first"
+  ],
+  "dry_run": true
+}
+
+$ jailops --dry-run delete nosuch
+! not_found: jail "nosuch" not found
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
+[exit 4]
+
+$ jailops delete --stop -y web
+! This deletes 1 jail of project "main" and destroys its data; it cannot be undone:
+!   web (running): root 256.0 MiB, data 70.0 MiB, 0 snapshots; --stop stops it first
+! Type the name "web" to confirm: 
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: type the name on standard input, or pass --confirm-data-loss (-y does not answer this question)
+[exit 2]
+
+$ jailops delete --stop --confirm-data-loss web
 jail/web stopped
 jail/web deleted
 
-$ jailops delete --all -y
+$ jailops delete --all --stop --confirm-data-loss
 jail/db deleted
 
 $ jailops list
-! No resources found.
+! No jails in project main. Create one with: jailops jail create NAME --image IMAGE --network NETWORK --storage STORAGE
 

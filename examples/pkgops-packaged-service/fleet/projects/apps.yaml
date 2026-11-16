@@ -7,4 +7,4 @@ spec:
   networks: [{network: apps}]
   storage: [{storage: default, quota: 20G}]
   quotas: {jails: 5, memory: 2G}
-  firewall: floor
+  firewall_policies: [floor]

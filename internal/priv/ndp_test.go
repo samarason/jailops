@@ -2,12 +2,16 @@ package priv
 
 import (
 	"context"
+	"encoding/json"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"jailops.net/jailops/internal/ndproxy"
+	"jailops.net/jailops/internal/sys/ifconfig"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -44,10 +48,10 @@ func TestNDPAnswerRefusals(t *testing.T) {
 		code api.Code
 		text string
 	}{
-		{"an uplink that is not approved", func(q *NDPAnswerReq, _ *fakeNDP) { q.Uplink = "igb0" }, api.CodeForbidden, "ndp-proxy = igb0="},
+		{"an uplink that is not approved", func(q *NDPAnswerReq, _ *fakeNDP) { q.Uplink = "igb0" }, api.CodeForbidden, "no network in IPv6 proxy mode uses"},
 		{"a bad interface name", func(q *NDPAnswerReq, _ *fakeNDP) { q.Uplink = "-x" }, api.CodeInvalid, ""},
-		{"a target outside the approved prefix", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "2001:db8:1:2:200::10" }, api.CodeForbidden, "outside the prefixes"},
-		{"a target that is the upstream router", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "fe80::1" }, api.CodeForbidden, "outside the prefixes"},
+		{"a target outside the approved prefix", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "2001:db8:1:2:200::10" }, api.CodeForbidden, "outside the subnets"},
+		{"a target that is the upstream router", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "fe80::1" }, api.CodeForbidden, "outside the subnets"},
 		{"a target that is not an address", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "nonsense" }, api.CodeInvalid, ""},
 		{"an IPv4 target", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "10.0.0.1" }, api.CodeInvalid, ""},
 		{"a target with a zone", func(q *NDPAnswerReq, _ *fakeNDP) { q.Target = "2001:db8:1:2:100::10%em0" }, api.CodeInvalid, ""},
@@ -77,27 +81,55 @@ func TestNDPAnswerRefusals(t *testing.T) {
 	}
 }
 
-func TestNDPIsRefusedWithoutAnApproval(t *testing.T) {
-	e := newEnv(t)
-	cfg := e.cfg
-	cfg.NDPProxy = nil
-	l, err := NewLocal(cfg, Deps{ZFS: e.zfs, NDP: newFakeNDP(e.base)}, WithoutChown())
-	if err != nil {
-		t.Fatal(err)
+// The helper approves a prefix itself, from the stored networks in proxy mode, and checks it.
+func TestNDPPrefixChecks(t *testing.T) {
+	proxy := func(uplink, subnet string) api.NetworkSpec {
+		return api.NetworkSpec{Uplink: uplink, IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: subnet}}
 	}
-	for name, err := range map[string]error{
-		"answer": l.NDPAnswer(context.Background(), ndpReq()),
-		"open": func() error {
-			f, err := l.NDPOpen(context.Background(), "em0", false)
-			if f != nil {
-				f.Close()
-			}
-			return err
-		}(),
-	} {
-		if !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), "add the line `ndp-proxy = em0=") {
-			t.Errorf("%s: %v", name, err)
+	store := func(e *env, name string, spec api.NetworkSpec) {
+		b, _ := json.Marshal(map[string]any{"kind": "Network", "metadata": api.ObjectMeta{Name: name, UUID: name + "-uuid"}, "spec": spec})
+		mustWrite(t, filepath.Join(e.cfg.StateDir, "objects", "Network", name+"-uuid.json"), string(b))
+	}
+	alone := func(e *env) { // the network of the fixture is not there: the one under test is the only one on em0
+		if err := os.Remove(filepath.Join(e.cfg.StateDir, "objects", "Network", "bbbb-1111-2222.json")); err != nil {
+			t.Fatal(err)
 		}
+	}
+	cases := []struct {
+		name string
+		mod  func(e *env)
+		text string
+	}{
+		{"a prefix wider than /48", func(e *env) { alone(e); store(e, "wide", proxy("em0", "2001:db8::/32")) }, "must be between"},
+		{"a single address", func(e *env) { alone(e); store(e, "one", proxy("em0", "2001:db8:9::1/128")) }, "must be between"},
+		{"a link-local prefix", func(e *env) { alone(e); store(e, "ll", proxy("em0", "fe80::/64")) }, "not a global"},
+		{"an address of the host inside the prefix", func(e *env) {
+			e.net.AddIface(ifconfig.Iface{Name: "em1", Flags: []string{"UP"}, Inet6: []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2:100::5/64")}})
+		}, "own address"},
+		{"an overlapping network", func(e *env) {
+			store(e, "other", api.NetworkSpec{Uplink: "em1", IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:1:2:100::/96"}})
+		}, "overlaps"},
+		{"an uplink that is a bridge", func(e *env) {
+			store(e, "onbr", proxy("mybr", "2001:db8:7::/64"))
+			e.net.AddIface(ifconfig.Iface{Name: "mybr", Groups: []string{"bridge"}, Flags: []string{"UP"}})
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			tc.mod(e)
+			q := ndpReq()
+			if tc.name == "an uplink that is a bridge" {
+				q.Uplink = "mybr"
+			}
+			err := e.local.NDPAnswer(context.Background(), q)
+			if !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), tc.text) {
+				t.Fatalf("want forbidden %q, got %v", tc.text, err)
+			}
+			if e.local.d.NDP.(*fakeNDP).frames() != 0 {
+				t.Fatal("a frame was sent")
+			}
+		})
 	}
 }
 
@@ -123,33 +155,6 @@ func TestNDPAnswersAreRateLimited(t *testing.T) {
 	now = now.Add(time.Second) // a second later the bucket is full again
 	if err := e.local.NDPAnswer(context.Background(), ndpReq()); err != nil {
 		t.Fatalf("after a second: %v", err)
-	}
-}
-
-func TestParseAndNormalizeNDPProxy(t *testing.T) {
-	u, err := ParseNDPProxy("em0=2001:db8:1:2:100::/80, 2001:db8:9::/48")
-	if err != nil || u.Uplink != "em0" || len(u.Prefixes) != 2 {
-		t.Fatalf("%+v %v", u, err)
-	}
-	for _, bad := range []string{"", "em0", "em0=", "=2001:db8::/64", "em0=nonsense", "em0=10.0.0.0/24"} {
-		if u, err := ParseNDPProxy(bad); err == nil {
-			if _, err := normalizeNDP([]NDPUplink{u}); err == nil {
-				t.Errorf("%q was accepted", bad)
-			}
-		}
-	}
-	for name, in := range map[string][]NDPUplink{
-		"a prefix that is too wide":      {{Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")}}},
-		"a prefix that is a single host": {{Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("2001:db8::1/128")}}},
-		"link-local":                     {{Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("fe80::/64")}}},
-		"multicast":                      {{Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("ff02::/64")}}},
-		"an uplink twice":                {{Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}}, {Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("2001:db8:1::/64")}}},
-		"a bad uplink name":              {{Uplink: "-x", Prefixes: []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}}},
-		"no prefix":                      {{Uplink: "em0"}},
-	} {
-		if _, err := normalizeNDP(in); err == nil {
-			t.Errorf("%s was accepted", name)
-		}
 	}
 }
 
@@ -197,6 +202,7 @@ func TestNDPOnlyForAddressesThatRouteToAJail(t *testing.T) {
 		"no route at all":         {},
 		"a route out the uplink":  {"2001:db8:1:2:100::10": "em0"},
 		"a route of someone else": {"2001:db8:1:2:100::10": "tun0"},
+		"a bridge made by hand":   {"2001:db8:1:2:100::10": "mybr"},
 	} {
 		e := newEnv(t)
 		dev := e.local.d.NDP.(*fakeNDP)
@@ -257,37 +263,13 @@ func TestParseHostRoutes(t *testing.T) {
 Internet6:
 Destination                       Gateway                       Flags         Netif Expire
 default                           fe80::1%vtnet0                UGS          vtnet0
-2a0a:4cc0:c1:3bb8::1              link#2                        UHS             lo0
-2a0a:4cc0:c1:3bb8:100::10         link#8                        UHS          jo30gb
+2001:db8:c1:3bb8::1              link#2                        UHS             lo0
+2001:db8:c1:3bb8:100::10         link#8                        UHS          jo30gb
 fe80::%vtnet0/64                  link#1                        U            vtnet0
 fe80::1%lo0                       link#11                       UHS             lo0
 `
 	r := parseHostRoutes(text)
-	if r[netip.MustParseAddr("2a0a:4cc0:c1:3bb8:100::10")] != "jo30gb" || len(r) != 2 {
+	if r[netip.MustParseAddr("2001:db8:c1:3bb8:100::10")] != "jo30gb" || len(r) != 2 {
 		t.Fatalf("%v", r)
-	}
-}
-
-func TestParseStaticNeighbors(t *testing.T) {
-	text := `Neighbor                             Linklayer Address  Netif Expire    S Flags
-fe80::1%jo30gb                       58:9c:fc:10:5e:2c jo30gb permanent R 
-fe80::e85c:a9ff:fed2:4e32%jo30gb     ea:5c:a9:d2:4e:32 jo30gb permanent R 
-2a0a:4cc0:c1:3bb8:100::10            4e:10:c9:7c:3e:00 jo30gb permanent R 
-fe80::d4b8:89ff:fe47:7d4%vtnet0      d6:b8:89:47:07:d4 vtnet0 23h50m S R
-`
-	got := parseStaticNeighbors(text)
-	if len(got) != 2 || got[1].Addr.String() != "fe80::e85c:a9ff:fed2:4e32" || got[1].Iface != "jo30gb" || got[1].MAC != "ea:5c:a9:d2:4e:32" {
-		t.Fatalf("%+v", got)
-	}
-}
-
-func TestParseStaticARP(t *testing.T) {
-	text := `? (10.94.0.1) at 58:9c:fc:10:5e:2c on jo0gb permanent [ethernet]
-? (10.94.0.2) at 4e:10:c9:7c:3e:00 on jo0gb permanent [ethernet]
-? (10.94.0.3) at ea:5c:a9:d2:4e:32 on jo0gb expires in 1168 seconds [ethernet]
-`
-	got := parseStaticARP(text)
-	if len(got) != 2 || got[1].Addr.String() != "10.94.0.2" || got[1].Iface != "jo0gb" || got[1].MAC != "4e:10:c9:7c:3e:00" {
-		t.Fatalf("%+v", got)
 	}
 }

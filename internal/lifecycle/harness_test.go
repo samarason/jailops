@@ -64,6 +64,8 @@ type world struct {
 	mergeOut string
 	mergeErr error
 	started  []string // generation of the root at each jail start
+	// attach is what Config.Attached answers: the volumes attached to each jail key.
+	attach map[string][]Attached
 }
 
 func newWorld(t *testing.T) *world {
@@ -84,9 +86,11 @@ func newWorld(t *testing.T) *world {
 	w.Images.aliases["alp@stable"] = 1
 	w.Exec.Handler = w.handle
 	w.Files.Trees["/jailops/projects/alpha/jails/web/root/etc"] = []string{"rc.conf"}
+	w.attach = map[string][]Attached{}
 	w.S = &Service{
 		Cfg: Config{Root: "tank/jailops", MountBase: "/jailops", RootOldRetention: 24 * time.Hour,
-			Now: func() time.Time { return w.now }},
+			Now:      func() time.Time { return w.now },
+			Attached: func(key string) ([]Attached, error) { return w.attach[key], nil }},
 		ZFS: w.Z, Exec: w.Exec, Jails: w.Jails, Files: w.Files, Hooks: w.Hooks, Images: w.Images,
 		Executor: &plan.Executor{Journal: w.J},
 	}
@@ -125,19 +129,46 @@ func (w *world) handle(argv []string) ([]byte, error) {
 	return []byte(w.mergeOut), w.mergeErr
 }
 
+// dbVol is the volume db of the project alpha, which the test jails attach at /srv/db.
+const dbVol = "tank/jailops/projects/alpha/volumes/db"
+
 func spec(image string) api.JailSpec {
 	return api.JailSpec{Image: image, Update: api.UpdatePolicy{Strategy: api.UpdateRebase, Healthcheck: "/bin/true"},
 		Resources: api.Resources{Disk: "10G"},
-		Volumes:   []api.VolumeMount{{Name: "db", Mount: "/srv/db", Quota: "5G"}}}
+		Volumes:   []api.VolumeAttach{{Name: "db", Mount: "/srv/db"}}}
 }
 
 func (w *world) jail(name string) api.Jail {
 	return api.Jail{Metadata: api.ObjectMeta{Name: name, Project: "alpha", UUID: "uuid-" + name}, Spec: spec("fb@stable")}
 }
 
-// created makes a stopped jail named web (normalised: nothing mounted below the container).
+func (w *world) storage() Storage { return Storage{Root: "tank/jailops", MountBase: "/jailops"} }
+
+// volume makes the volume of the project alpha (owner 5000:5000, mode 0770) when it is not there yet.
+func (w *world) volume(name string) {
+	w.t.Helper()
+	if ok, _ := w.Z.Exists(bg, VolumeDS(w.storage(), "alpha", name)); ok {
+		return
+	}
+	req := VolumeRequest{Storage: w.storage(), Project: "alpha", Name: name, UUID: "vol-" + name, Size: "5G", UID: 5000, GID: 5000, Mode: 0o770}
+	if _, err := w.S.CreateVolume(bg, req, nil, false); err != nil {
+		w.t.Fatal(err)
+	}
+}
+
+// attachTo attaches a volume to the jail key at a path, as the service's answer to Config.Attached.
+func (w *world) attachTo(key, volume, mount string, ro bool) {
+	w.t.Helper()
+	w.volume(volume)
+	st := w.storage()
+	w.attach[key] = append(w.attach[key], Attached{Dataset: VolumeDS(st, "alpha", volume), Mountpoint: VolumeMP(st, "alpha", volume), Path: mount, ReadOnly: ro})
+}
+
+// created makes a stopped jail named web (normalised: nothing mounted below the container). The jail attaches the
+// volume db at /srv/db.
 func (w *world) created(name string) {
 	w.t.Helper()
+	w.attachTo("alpha_"+name, "db", "/srv/db", false)
 	if _, err := w.S.CreateJail(bg, w.jail(name), false); err != nil {
 		w.t.Fatal(err)
 	}

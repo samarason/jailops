@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# PROVIDE: jailops_shutdown
+# REQUIRE: jailopsd jailops_priv
+# KEYWORD: shutdown
+#
+# Stops the jails of JailOps when the host shuts down. Without it init kills every process of every jail at once,
+# a database gets no chance to flush, and the poststop hooks (the epairs, the pf anchors) never run. At shutdown
+# rc stops this script before the daemon and the helper it requires, so both still run: it asks the daemon to stop
+# every running jail, a few at a time, a jail before the jails in its boot.depends (the reverse of
+# `jailops boot`), each with its own graceful shutdown. Nothing happens at boot, and `service jailopsd restart`
+# does not run it: restarting the daemon never touches the jails.
+#
+# It runs whenever jailopsd_enable is YES and needs no line of its own in rc.conf. To change it:
+#   jailops_shutdown_enable="NO"     leave the jails to init when the host shuts down
+#   jailops_shutdown_timeout="80"    seconds for all the jails together; the rest are left to init. It must stay below
+#                                    rcshutdown_timeout (90 by default): raise both for a host with slow databases
+#                                    Up to eight jails stop at once: a jail that asks for more than ten seconds
+#                                    (boot.stop_timeout) needs that time here, and a chain of jails that depend on
+#                                    each other needs the sum of theirs
+#   jailops_shutdown_grace=""        seconds, or a duration such as 30s, each jail gets to shut down (empty: the
+#                                    jail's own stop timeout)
+#   service jailops_shutdown stop    the same by hand: it stops every running jail of the host
+
+. /etc/rc.subr
+
+name="jailops_shutdown"
+rcvar="jailops_shutdown_enable"
+desc="JailOps: stop the jails cleanly when the host shuts down"
+start_cmd=":"
+stop_cmd="jailops_shutdown_stop"
+
+jailops_shutdown_stop()
+{
+	local grace=""
+	[ -x "${jailops_shutdown_cli}" ] || return 0
+	[ -n "${jailops_shutdown_grace}" ] && grace="--grace ${jailops_shutdown_grace}"
+	echo "Stopping the jails of JailOps."
+	# the host is going down: whatever happens here, the shutdown goes on
+	timeout "${jailops_shutdown_timeout}" "${jailops_shutdown_cli}" stop-all ${grace} ||
+		warn "not every jail was stopped; init stops what is left"
+	return 0
+}
+
+load_rc_config $name
+: ${jailops_shutdown_enable:=${jailopsd_enable:-NO}}   # jailopsd_enable=YES is enough: it is part of the same service
+: ${jailops_shutdown_timeout:="80"}
+: ${jailops_shutdown_grace:=""}
+: ${jailops_shutdown_cli:="/usr/local/bin/jailops"}
+
+run_rc_command "$1"

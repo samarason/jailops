@@ -3,6 +3,5 @@ kind: Network
 metadata:
   name: apps
 spec:
-  bridge: jo11
   uplink: vtnet0
   ipv4: {subnet: 10.11.0.0/24, gateway: 10.11.0.1, range: 10.11.0.10-10.11.0.250, nat: true}

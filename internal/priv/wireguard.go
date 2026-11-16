@@ -44,6 +44,7 @@ const (
 	OpWGImport   = "wg.import"
 	OpWGApply    = "wg.apply"
 	OpWGRemove   = "wg.remove"
+	OpWGRename   = "wg.rename"
 	OpWGShow     = "wg.show"
 	OpWGTools    = "wg.tools"
 )
@@ -71,6 +72,9 @@ func init() {
 	})
 	register(OpWGRemove, false, func(ctx context.Context, h Host, a wireguard.RemoveReq, _ *callIO) (any, error) {
 		return empty{}, h.WGRemove(ctx, a)
+	})
+	register(OpWGRename, false, func(ctx context.Context, h Host, a wireguard.RenameReq, _ *callIO) (any, error) {
+		return empty{}, h.WGRename(ctx, a)
 	})
 	register(OpWGShow, false, func(ctx context.Context, h Host, a wireguard.ShowReq, _ *callIO) (any, error) {
 		return h.WGShow(ctx, a)
@@ -105,6 +109,11 @@ func (c *Client) WGApply(ctx context.Context, q wireguard.ApplyReq) (wireguard.A
 // WGRemove implements wireguard.Host.
 func (c *Client) WGRemove(ctx context.Context, q wireguard.RemoveReq) error {
 	return callNone(ctx, c, OpWGRemove, q)
+}
+
+// WGRename implements wireguard.Host.
+func (c *Client) WGRename(ctx context.Context, q wireguard.RenameReq) error {
+	return callNone(ctx, c, OpWGRename, q)
 }
 
 // WGShow implements wireguard.Host.
@@ -461,6 +470,9 @@ func (l *Local) WGApply(ctx context.Context, q wireguard.ApplyReq) (wireguard.Ap
 		}
 		return ifconfig.Iface{}, false
 	}
+	if err := l.checkWGRoutes(ctx, t, q, ifs); err != nil {
+		return wireguard.ApplyRes{}, err
+	}
 	var res wireguard.ApplyRes
 	// The object's interface was renamed in its spec: the one the helper made under the old name goes.
 	if record != "" && record != q.Iface {
@@ -478,10 +490,14 @@ func (l *Local) WGApply(ctx context.Context, q wireguard.ApplyReq) (wireguard.Ap
 	}
 	created := false
 	if !exists {
-		if err := wgWrite(r, wgIfaceFile, []byte(q.Iface+"\n")); err != nil {
+		// The record is written after the interface exists: a failed create must not leave a record that claims an
+		// interface of that name which somebody else makes later. (A record that cannot be written takes the
+		// interface down again.)
+		if err := t.Create(ctx, q.Iface); err != nil {
 			return res, err
 		}
-		if err := t.Create(ctx, q.Iface); err != nil {
+		if err := wgWrite(r, wgIfaceFile, []byte(q.Iface+"\n")); err != nil {
+			_ = t.Destroy(ctx, q.Iface)
 			return res, err
 		}
 		created = true
@@ -565,6 +581,88 @@ func (l *Local) WGApply(ctx context.Context, q wireguard.ApplyReq) (wireguard.Ap
 	return res, nil
 }
 
+// wgSpecial are the ranges no tunnel route may touch without admin-routes or wireguard-routes: loopback, this
+// network, link-local and multicast.
+var wgSpecial = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("224.0.0.0/4"), netip.MustParsePrefix("::/128"), netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("ff00::/8"),
+}
+
+// inside reports whether the prefix r lies within p.
+func inside(r, p netip.Prefix) bool {
+	return p.Addr().Is4() == r.Addr().Is4() && p.Bits() <= r.Bits() && p.Contains(r.Addr())
+}
+
+// checkWGRoutes keeps the routes of a tunnel to the networks behind it. Every route lies inside the allowed IPs of
+// one of its peers. Without admin-routes (and the admin assertion), a route that is not inside a prefix of
+// wireguard-routes must also be at least a /8 (IPv4) or /16 (IPv6) and stay clear of loopback, link-local and
+// multicast, of the host's own addresses (the tunnel's excepted), of its default gateways and of its resolvers:
+// otherwise a tunnel could take over the host's own traffic, which priv.conf did not allow.
+func (l *Local) checkWGRoutes(ctx context.Context, t wgtool.Tool, q wireguard.ApplyReq, ifs []ifconfig.Iface) error {
+	if len(q.Routes) == 0 {
+		return nil
+	}
+	for _, r := range q.Routes {
+		covered := false
+		for _, p := range q.Peers {
+			covered = covered || slices.ContainsFunc(p.AllowedIPs, func(a netip.Prefix) bool { return inside(r, a.Masked()) })
+		}
+		if !covered {
+			return forbidden("route %s is not inside the allowed IPs of a peer of the tunnel", r)
+		}
+	}
+	if isAdmin(ctx) && l.cfg.Admin.Routes {
+		return nil
+	}
+	type held struct {
+		addr netip.Addr
+		what string
+	}
+	var host []held
+	for _, i := range ifs {
+		if i.Name == q.Iface {
+			continue
+		}
+		for _, p := range slices.Concat(i.Inet, i.Inet6) {
+			if !slices.Contains(q.Addresses, p) {
+				host = append(host, held{p.Addr().WithZone(""), "an address of " + i.Name})
+			}
+		}
+	}
+	for _, g := range t.DefaultGateways(ctx) {
+		host = append(host, held{g, "the default gateway"})
+	}
+	if b, err := os.ReadFile(l.etcPath("resolv.conf")); err == nil {
+		ns, _, _ := parseResolv(string(b))
+		for _, n := range ns {
+			if a, err := netip.ParseAddr(n); err == nil {
+				host = append(host, held{a.WithZone(""), "a resolver"})
+			}
+		}
+	}
+	for _, r := range q.Routes {
+		if slices.ContainsFunc(l.cfg.WireGuardRoutes, func(p netip.Prefix) bool { return inside(r, p) }) {
+			continue
+		}
+		hint := "; priv.conf allows it with wireguard-routes or admin-routes"
+		if min := map[bool]int{true: 8, false: 16}[r.Addr().Is4()]; r.Bits() < min {
+			return forbidden("route %s is wider than /%d%s", r, min, hint)
+		}
+		for _, s := range wgSpecial {
+			if r.Overlaps(s) {
+				return forbidden("route %s overlaps %s (loopback, link-local or multicast)%s", r, s, hint)
+			}
+		}
+		for _, h := range host {
+			if r.Contains(h.addr) {
+				return forbidden("route %s covers %s, %s of the host%s", r, h.addr, h.what, hint)
+			}
+		}
+	}
+	return nil
+}
+
 // wgSync writes the configuration to a file of the object's directory (mode 0600), has `wg syncconf` read it, and
 // removes it again. The private key is never on a command line.
 func (l *Local) wgSync(ctx context.Context, r *os.Root, t wgtool.Tool, name, iface string, c wireguard.Conf) error {
@@ -577,6 +675,46 @@ func (l *Local) wgSync(ctx context.Context, r *os.Root, t wgtool.Tool, name, ifa
 	}
 	defer func() { _ = r.Remove(wgConfFile) }()
 	return t.SyncConf(ctx, iface, filepath.Join(l.cfg.WireGuardDir, name, wgConfFile))
+}
+
+// WGRename implements wireguard.Host: the key directory of an object moves to the new name inside the helper's own
+// WireGuard directory, and nowhere else. A second call changes nothing.
+func (l *Local) WGRename(ctx context.Context, q wireguard.RenameReq) error {
+	if err := l.wgAdmin("renaming a WireGuard object")(ctx); err != nil {
+		return err
+	}
+	for _, n := range []string{q.From, q.To} {
+		if err := wireguard.ValidName("name", n); err != nil {
+			return err
+		}
+	}
+	if q.From == q.To {
+		return api.Errorf(api.CodeInvalid, "the new name is the old name")
+	}
+	l.wgMu.Lock()
+	defer l.wgMu.Unlock()
+	base, err := l.wgDir(false)
+	if err != nil {
+		if api.IsCode(err, api.CodeNotFound) {
+			return nil // nothing was ever made on this host
+		}
+		return err
+	}
+	defer base.Close()
+	_, fromErr := base.Lstat(q.From)
+	_, toErr := base.Lstat(q.To)
+	switch {
+	case fromErr != nil && errors.Is(fromErr, fs.ErrNotExist):
+		return nil // never made, or already renamed
+	case fromErr != nil:
+		return api.Errorf(api.CodeInternal, "reading the key directory of %s: %v", q.From, fromErr)
+	case toErr == nil:
+		return api.Errorf(api.CodeAlreadyExists, "wireguard %q already has keys on this host", q.To)
+	}
+	if err := base.Rename(q.From, q.To); err != nil {
+		return api.Errorf(api.CodeInternal, "renaming the key directory of %s: %v", q.From, err)
+	}
+	return nil
 }
 
 // WGRemove implements wireguard.Host.

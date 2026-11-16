@@ -430,3 +430,41 @@ func TestSinkFirstJailAfterStart(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+// The tables of a sink do not keep a jail that was deleted (a daemon that runs for a year makes and deletes many).
+func TestSinkForgetsADeletedJail(t *testing.T) {
+	r := newRig()
+	r.rd.set("/j/web_a/var/log/messages", "old\n")
+	r.rd.set("/j/web_b/var/log/messages", "old\n")
+	ctx := context.Background()
+	s := r.sink(api.LogSink{Name: "s", Sources: api.LogSinkSource{NoAppLogs: true}})
+	s.cycle(ctx)
+	r.rd.add("/j/web_a/var/log/messages", "new a\n")
+	r.rd.add("/j/web_b/var/log/messages", "new b\n")
+	r.clock.advance(2 * time.Second)
+	s.cycle(ctx)
+	r.snd.take()
+	if _, ok := s.read["web/b/messages"]; !ok {
+		t.Fatalf("read %v acked %v", s.read, s.acked)
+	}
+	var left []Jail
+	for _, j := range r.jails {
+		if j.Name != "b" {
+			left = append(left, j)
+		}
+	}
+	r.jails = left // jail b is deleted
+	r.clock.advance(time.Minute)
+	s.cycle(ctx)
+	for _, m := range []map[string]int64{s.read, s.acked} {
+		if _, ok := m["web/b/messages"]; ok {
+			t.Fatalf("a deleted jail is still in the tables: read %v acked %v", s.read, s.acked)
+		}
+		if _, ok := m["web/a/messages"]; !ok {
+			t.Fatalf("a live jail left the tables: read %v acked %v", s.read, s.acked)
+		}
+	}
+	if _, ok := s.pending["web/b/messages"]; ok {
+		t.Fatalf("pending %v", s.pending)
+	}
+}

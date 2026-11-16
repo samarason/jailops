@@ -6,12 +6,12 @@
 // The upstream network treats jail addresses as on-link (a switched /64).
 // The upstream router therefore sends neighbor solicitations for a jail
 // address onto the uplink, where nobody owns it. The host, which routes to
-// the jail bridge through /128 host routes, must answer them with its own
+// each jail through its own /128 host route, must answer them with its own
 // MAC so that traffic for the jail arrives at the host.
 //
 // JailOps allocates every jail address itself, so the proxy knows which
 // addresses to answer for and never has to learn them. By default it answers
-// at once (ModeImmediate). ModeProbe first solicits toward the bridge and
+// at once (ModeImmediate). ModeProbe first solicits toward the jail and
 // answers only when the jail replies.
 //
 // # Design (RFC 4861, RFC 4443, RFC 8200)

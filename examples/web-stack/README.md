@@ -6,8 +6,8 @@ nginx in front of an app in front of PostgreSQL, on one host, with **encrypted b
 
 - The jails sit on one network of one project (`shop`). Each has its own firewall policy, so nginx accepts web traffic
   from anywhere, the app accepts port 8080 only from nginx and PostgreSQL accepts port 5432 only from the app.
-- PostgreSQL's data is a **volume** (`data` at `/var/db/postgres`, a quota of 50G): its own dataset, snapshotted and backed up
-  with the jail and untouched when the OS root is replaced by an image update.
+- PostgreSQL's data is a **volume** (`postgres-data` at `/var/db/postgres`, a quota of 50G, owned by uid 770): a dataset of the
+  project with its own snapshots, untouched when the OS root is replaced by an image update and still there when the jail is deleted.
 - `DB_PASSWORD` and `POSTGRES_PASSWORD` are `secret:db.password`, a value of `shared/secrets.sops.yaml` (SOPS + age). Sync
   decrypts it in memory when it applies, seals it to the host's own age key and sends it sealed; the repository holds only
   ciphertext and the API never returns it.
@@ -45,7 +45,7 @@ restoring on a new host from the recovery key alone is **not usable from the CLI
     jailops backup run --project shop nightly        # now, instead of at 02:17
 
 `hosts/app1/host.yaml` reaches the host over https with a pinned fingerprint and an API token of a **global admin**
-(creating networks, images and projects needs one): `jailops token create sync --permission admin --global --expires 2160h
+(creating networks, images and projects needs one): `jailops token create sync --role admin --global --expires 2160h
 --allow-from <your address>`, then `jailops-sync secrets set app1-token`. To take the token out of the picture use a client
 certificate instead (`jailops-sync remote bootstrap`, see [multi-host-fleet](../multi-host-fleet)).
 

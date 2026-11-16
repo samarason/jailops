@@ -23,10 +23,19 @@ type Host interface {
 	WGApply(ctx context.Context, q ApplyReq) (ApplyRes, error)
 	// WGRemove destroys the interface the helper created for the object; Purge also removes its keys.
 	WGRemove(ctx context.Context, q RemoveReq) error
+	// WGRename gives the keys directory of an object the new name. The interface keeps its name; its description
+	// follows with the next apply. Nothing is done for an object that never had keys, and a second call is a no-op.
+	WGRename(ctx context.Context, q RenameReq) error
 	// WGShow reports the interface and its peers, public parts only.
 	WGShow(ctx context.Context, q ShowReq) (ShowRes, error)
 	// WGTools says where the wg program is and whether the if_wg module is loaded.
 	WGTools(ctx context.Context) (ToolsRes, error)
+}
+
+// RenameReq names the object before and after.
+type RenameReq struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 // KeysReq names an object; Rotate replaces its key.

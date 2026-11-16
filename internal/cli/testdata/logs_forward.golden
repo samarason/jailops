@@ -3,10 +3,10 @@ NAME   TYPE     TO                FACILITY   SOURCES
 file   syslog   udp://127.0.0.1   local0     messages+apps of all jails
 ! jailops: the list of jailopsd.yaml (logging.forward) is in force
 
-$ jailops logs forward add syslog --to tls://logs.example.com:6514 --facility local3 --jail web -l tier=front
-log sink logs added (syslog tls://logs.example.com:6514)
+$ jailops logs forward add logs --url tls://logs.example.com:6514 --facility local3 --jail web -l tier=front
+log-sink/logs added (syslog tls://logs.example.com:6514)
 
-$ jailops --dry-run logs forward add webhook --to https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit-only
+$ jailops --dry-run logs forward add hooks --url https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit-only
 dry-run: would add log sink
 name: hooks
 type: webhook
@@ -16,11 +16,11 @@ sources:
   no_jails: true
   audit: true
 
-$ jailops logs forward add webhook --to https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit-only
-log sink hooks added (webhook https://hooks.example.com/jailops)
+$ jailops logs forward add hooks --url https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit-only
+log-sink/hooks added (webhook https://hooks.example.com/jailops)
 
-$ jailops logs forward add syslog --to udp://192.0.2.10 --name lan
-log sink lan added (syslog udp://192.0.2.10)
+$ jailops logs forward add lan --url udp://192.0.2.10
+log-sink/lan added (syslog udp://192.0.2.10)
 ! warning: plain udp to 192.0.2.10:514 sends the logs in the clear; use tls://
 
 $ jailops logs forward list
@@ -31,8 +31,8 @@ hooks   webhook   https://hooks.example.com/jailops   -          audit
 lan     syslog    udp://192.0.2.10                    local0     messages+apps of all jails
 ! jailops: the list stored through the API is in force (generation 3); 'logs forward reset' returns to jailopsd.yaml
 
-$ jailops logs forward edit logs --facility local5 --file messages --file auth.log
-log sink logs changed
+$ jailops logs forward set logs --facility local5 --file messages --file auth.log
+log-sink/logs updated
 
 $ jailops logs forward list -o yaml
 - name: file
@@ -81,40 +81,52 @@ $ jailops logs forward remove lan --dry-run
 dry-run: would remove log sink lan
 
 $ jailops logs forward remove lan
-log sink lan removed
+! Remove log sink lan? Its queued lines are dropped. [y/N]: 
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: answer y on standard input, or pass -y to confirm without a question
+[exit 2]
 
-$ jailops logs forward add syslog --to https://logs.example.com
-! usage: sink "syslog": a syslog sink is udp://, tcp:// or tls://HOST[:PORT], not "https://"
+$ jailops logs forward remove lan
+! Remove log sink lan? Its queued lines are dropped. [y/N]: aborted: not confirmed, nothing was changed
+[exit 1]
+
+$ jailops logs forward remove lan
+log-sink/lan removed
+! Remove log sink lan? Its queued lines are dropped. [y/N]: 
+
+$ jailops logs forward add other --url gelf://h
+! usage: sink "other": a syslog sink is udp://, tcp:// or tls://HOST[:PORT], not "gelf://"
 ! hint: run 'jailops logs forward add --help' for usage
 [exit 2]
 
-$ jailops logs forward add gelf --to udp://h
-! usage: TYPE is syslog or webhook, not "gelf"
+$ jailops logs forward add other
+! usage: --url is required: where the sink sends (tls://logs.example.com:6514, https://hooks.example.com/x)
 ! hint: run 'jailops logs forward add --help' for usage
 [exit 2]
 
-$ jailops logs forward add syslog
-! usage: --to is required: where the sink sends (tls://logs.example.com:6514, https://hooks.example.com/x)
-! hint: run 'jailops logs forward add --help' for usage
-[exit 2]
-
-$ jailops logs forward add syslog --to udp://h --name logs
+$ jailops logs forward add logs --url udp://h
 ! already_exists: sink "logs" already exists
-! hint: change it with: jailops logs forward edit logs
+! hint: change it with: jailops logs forward set logs
 [exit 5]
 
-$ jailops logs forward edit nope --facility local1
+$ jailops logs forward set nope --facility local1
 ! not_found: sink "nope" not found
 ! hint: list them with: jailops logs forward list
 [exit 4]
 
-$ jailops logs forward edit logs
+$ jailops logs forward set logs
 ! usage: nothing to change: give the flags to change
-! hint: run 'jailops logs forward edit --help' for usage
+! hint: run 'jailops logs forward set --help' for usage
 [exit 2]
 
 $ jailops logs forward reset
-log sinks of jailopsd.yaml in force (1)
+! Delete the stored list of 3 log sinks and return to jailopsd.yaml? [y/N]: 
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: answer y on standard input, or pass -y to confirm without a question
+[exit 2]
+
+$ jailops logs forward reset -y
+log-forward reset: jailopsd.yaml is in force again (1 sink)
 
 $ jailops logs forward list
 NAME   TYPE     TO                FACILITY   SOURCES

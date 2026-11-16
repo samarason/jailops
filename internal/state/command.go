@@ -44,7 +44,8 @@ const AnyGeneration int64 = -1
 //
 // The object is addressed by UUID; if UUID is empty the (Kind, Scope, Name)
 // index is consulted, and creating requires the proposer to supply a UUID.
-// A put with a different Name than the stored one is a rename.
+// A put with a different Name than the stored one is a rename. The project of a stored object changes only with
+// MoveProject (a project rename moves the objects of the project to its new name).
 //
 // Delete semantics: ExpectGeneration 0 or AnyGeneration delete unconditionally,
 // N>0 requires a matching generation.
@@ -63,6 +64,8 @@ type Command struct {
 	ManagedBy        string            `json:"managed_by,omitempty"`
 	Spec             json.RawMessage   `json:"spec,omitempty"`
 	ExpectGeneration int64             `json:"expect_generation"`
+	// MoveProject lets a put addressed by UUID give the object another project.
+	MoveProject bool `json:"move_project,omitempty"`
 }
 
 // Result is the outcome of an applied Command.

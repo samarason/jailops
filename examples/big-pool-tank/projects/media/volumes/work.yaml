@@ -1,0 +1,12 @@
+apiVersion: jailops/v1
+kind: Volume
+hosts: [nas1]
+metadata:
+  name: work
+spec:
+  storage: bulk
+  size: 4T
+  uid: 0
+  gid: 0
+  mode: "0755"
+  comment: scratch space of the media jobs

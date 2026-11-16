@@ -184,8 +184,13 @@ func TestNoTornObjects(t *testing.T) {
 	if resp, err := http.DefaultClient.Do(req); err == nil {
 		resp.Body.Close()
 	}
-	time.Sleep(50 * time.Millisecond)
-	if _, ok := srv.Object("bkt", "torn"); !ok {
+	visible := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if _, visible = srv.Object("bkt", "torn"); visible {
+			break
+		}
+	}
+	if !visible {
 		t.Fatal("the quirk did not make the torn object visible")
 	}
 }

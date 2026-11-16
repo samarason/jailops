@@ -115,25 +115,59 @@ func TOTPProvisioningURI(issuer, account string, secret []byte) string {
 
 // Recovery codes.
 
-// GenerateRecoveryCodes returns n codes (formatted xxxxx-xxxxx, 50 bits each)
-// and their storage hashes. Show the codes once; store only the hashes.
+// RecoveryCodeBits is the entropy of a recovery code: too many to search, so a copy of the database does not give the
+// second factor away.
+const RecoveryCodeBits = 128
+
+// GenerateRecoveryCodes returns n codes (formatted xxxxx-xxxxx-xxxxx-xxxxx-xxxxxx, 128 bits each) and their storage
+// entries: each with a salt of its own. Show the codes once; store only the entries.
 func GenerateRecoveryCodes(n int) (codes, hashes []string, err error) {
 	for range n {
-		var b [7]byte
+		var b [RecoveryCodeBits / 8]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return nil, nil, fmt.Errorf("auth: entropy: %w", err)
 		}
-		s := strings.ToLower(b32.EncodeToString(b[:])) // 56 bits -> 12 chars
-		code := s[:5] + "-" + s[5:10]
+		s := strings.ToLower(b32.EncodeToString(b[:])) // 128 bits -> 26 chars
+		code := s[:5] + "-" + s[5:10] + "-" + s[10:15] + "-" + s[15:20] + "-" + s[20:]
+		var salt [16]byte
+		if _, err := rand.Read(salt[:]); err != nil {
+			return nil, nil, fmt.Errorf("auth: entropy: %w", err)
+		}
 		codes = append(codes, code)
-		hashes = append(hashes, HashRecoveryCode(code))
+		hashes = append(hashes, recoveryEntry(salt[:], code))
 	}
 	return codes, hashes, nil
 }
 
-// HashRecoveryCode normalises (case, dashes, spaces) and hashes a code.
-func HashRecoveryCode(code string) string {
-	n := strings.ToLower(strings.NewReplacer("-", "", " ", "").Replace(code))
-	h := sha256.Sum256([]byte("jailops-recovery:" + n))
-	return hex.EncodeToString(h[:])
+const recoveryPrefix = "v1$"
+
+func normalizeRecovery(code string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", " ", "").Replace(code))
+}
+
+// recoveryEntry is "v1$<salt>$<sha256(salt, code)>", both in hex.
+func recoveryEntry(salt []byte, code string) string {
+	h := sha256.New()
+	h.Write([]byte("jailops-recovery:"))
+	h.Write(salt)
+	h.Write([]byte(normalizeRecovery(code)))
+	return recoveryPrefix + hex.EncodeToString(salt) + "$" + hex.EncodeToString(h.Sum(nil))
+}
+
+// MatchRecoveryCode reports whether code is the one stored as entry, comparing in constant time. A code carries 128
+// random bits and a salt of its own, so a plain SHA-256 is as good as a slow hash here: there is nothing to search.
+func MatchRecoveryCode(code, entry string) bool {
+	rest, ok := strings.CutPrefix(entry, recoveryPrefix)
+	if !ok {
+		return false
+	}
+	saltHex, _, ok := strings.Cut(rest, "$")
+	if !ok {
+		return false
+	}
+	salt, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(recoveryEntry(salt, code)), []byte(entry)) == 1
 }

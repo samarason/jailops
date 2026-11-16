@@ -195,6 +195,10 @@ func (s *Service) recoverRun(ctx context.Context, rec plan.Record) RecoveryOutco
 		if err := s.life.StopJail(ctx, rest); err != nil {
 			return fail(err)
 		}
+		// kept for inspection means it does not come back with the host either
+		if err := s.setJailAutostart(ctx, rest, false); err != nil {
+			return fail(err)
+		}
 		out.Action, out.Detail = "completed", "the jail of the interrupted installation was stopped and kept for inspection; delete it to install again"
 		return out
 	case "image-build", "image-receive":
@@ -216,8 +220,37 @@ func (s *Service) recoverRun(ctx context.Context, rec plan.Record) RecoveryOutco
 		}
 		out.Action, out.Detail = "rolled-back", "the staging dataset was removed"
 		return out
+	case "rename":
+		// rename/<kind>/<project>/<name>: the steps were recorded before the first ran
+		if !haveReq || req.Rename == nil {
+			return fail(fmt.Errorf("the rename request was not recorded"))
+		}
+		found, err := s.planExec.Recover(ctx, rec.ID, s.renameExecPlan(req.Rename.Steps))
+		if err != nil {
+			return fail(err)
+		}
+		out.Action, out.Detail = "rolled-back", "the interrupted rename was undone; the old name is in force"
+		if !found {
+			out.Action, out.Detail = "dropped", "the run had already ended"
+		}
+		return out
 	case "image-delete":
 		out.Action, out.Detail = "dropped", "the generation delete was interrupted; delete it again to finish"
+		return out
+	case "create-volume":
+		// create-volume/<project>_<name>: the dataset the run made is taken away again (the volume has no object yet:
+		// the object is stored after the dataset is complete), so the name can be used again
+		if !haveReq || req.Volume == nil {
+			return fail(fmt.Errorf("the volume request was not recorded"))
+		}
+		found, err := s.life.RecoverCreateVolume(ctx, *req.Volume)
+		if err != nil {
+			return fail(err)
+		}
+		out.Action, out.Detail = "rolled-back", "the interrupted creation of the volume was undone; create it again"
+		if !found {
+			out.Action, out.Detail = "dropped", "the run had already ended"
+		}
 		return out
 	}
 	return fail(fmt.Errorf("unknown run kind %q", kind))

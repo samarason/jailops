@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -235,5 +236,22 @@ func TestRouteClasses(t *testing.T) {
 		if (e.Class == ClassPublic) != e.Public {
 			t.Errorf("%s: public/class mismatch", e.Key())
 		}
+	}
+}
+
+// The routes an anonymous caller reaches are a fixed list: adding one is a decision this test records.
+func TestPublicRoutesAreExactlyThese(t *testing.T) {
+	want := []string{"GET /api/v1", "GET /readyz", "POST /api/v1/auth/login", "POST /api/v1/cluster/join",
+		"POST /api/v1/trust/clients", "GET /api/v1/setup", "POST /api/v1/setup"}
+	var got []string
+	for _, e := range Perms {
+		if e.Public {
+			got = append(got, e.Key())
+		}
+	}
+	slices.Sort(want)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("public routes %v, want %v", got, want)
 	}
 }

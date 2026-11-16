@@ -63,6 +63,7 @@ func (s *Service) newForwarder() *logfwd.Forwarder {
 	env := logfwd.Env{
 		Hostname: s.d.Hostname, Reader: s.d.Logs, Offsets: metaOffsets{s.d.DB}, Log: s.log,
 		Jails: s.forwardJails, AuditAfter: s.auditAfter, AuditLast: s.auditLast,
+		SecretsDir: s.d.LogSecretsDir, OwnPorts: s.d.LogOwnPorts,
 	}
 	if s.d.Logs == nil {
 		env.Reader = noLogs{}
@@ -137,12 +138,12 @@ func (s *Service) auditLast(ctx context.Context) (int64, error) {
 
 // startLogForward applies the effective sink list and runs the forwarder.
 func (s *Service) startLogForward() {
-	spec, _, err := s.logForwardSpec()
+	spec, o, err := s.logForwardSpec()
 	if err != nil {
 		s.log.Error("log forwarding: the stored sink list is unreadable; using logging.forward of jailopsd.yaml", "err", err)
-		spec = api.LogForwardSpec{Sinks: s.d.LogForward}
+		spec, o = api.LogForwardSpec{Sinks: s.d.LogForward}, nil
 	}
-	s.fwd.Apply(spec.Sinks)
+	s.fwd.ApplyFrom(spec.Sinks, o != nil)
 	s.fwd.Start(s.baseCtx)
 }
 
@@ -197,10 +198,15 @@ func (s *Service) logForwardView() (api.LogForward, error) {
 	return out, nil
 }
 
-// checkSinkFiles checks the CA and token files the daemon will read.
+// checkSinkFiles checks the sinks of a list set through the API: their CA and token files lie directly in
+// logging.secrets_dir and pass the file check, and a literal destination is not one the dial would refuse
+// (loopback, link-local, this daemon's ports).
 func (s *Service) checkSinkFiles(spec api.LogForwardSpec) error {
 	check := s.fwdCheck
 	for _, k := range spec.Sinks {
+		if err := s.fwd.Env().CheckAPISink(k); err != nil {
+			return err
+		}
 		for _, f := range []struct {
 			path, what string
 			secret     bool
@@ -211,7 +217,7 @@ func (s *Service) checkSinkFiles(spec api.LogForwardSpec) error {
 			if err := check(f.path, f.secret); err != nil {
 				hint := "the file must be a regular file owned by root and not writable by others"
 				if f.secret {
-					hint = "write the token into a file owned by root, mode 0640 and group jailops (or 0600 when the daemon runs as root); the token never goes into the configuration"
+					hint = "write the token into a file of logging.secrets_dir owned by root, mode 0640 and group jailops (or 0600 when the daemon runs as root); the token never goes into the configuration"
 				}
 				return api.Errorf(api.CodeInvalid, "sink %q: %s: %v", k.Name, f.what, err).WithHint(hint)
 			}
@@ -258,7 +264,7 @@ func (s *Service) SetLogForward(ctx context.Context, spec api.LogForwardSpec, ex
 			return api.LogForward{}, err
 		}
 	}
-	s.fwd.Apply(spec.Sinks)
+	s.fwd.ApplyFrom(spec.Sinks, true)
 	return s.logForwardView()
 }
 
@@ -285,13 +291,13 @@ func (s *Service) TestLogForward(ctx context.Context, name string) (api.LogForwa
 	if err := requireLogAdmin(ctx, "testing the log forwarding"); err != nil {
 		return api.LogForwardTestResult{}, err
 	}
-	spec, _, err := s.logForwardSpec()
+	spec, o, err := s.logForwardSpec()
 	if err != nil {
 		return api.LogForwardTestResult{}, err
 	}
 	for _, k := range spec.Sinks {
 		if k.Name == name {
-			return s.fwd.Test(ctx, k), nil
+			return s.fwd.Test(ctx, k, o != nil), nil
 		}
 	}
 	return api.LogForwardTestResult{}, api.Errorf(api.CodeNotFound, "sink %q not found", name).WithHint("list them with: jailops logs forward list")

@@ -12,7 +12,7 @@ host cloud1
   create    Project/shop
   create    AddressSet/intra/admins
   create    AddressSet/shop/admins
-  create    AddressSet/shop/web_tier
+  create    AddressSet/shop/web-tier
   create    FirewallPolicy/intra/floor
   create    FirewallPolicy/intra/lan-only
   create    FirewallPolicy/shop/app-private

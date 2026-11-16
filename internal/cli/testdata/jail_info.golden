@@ -12,6 +12,7 @@ Jail web
 
 Resources
   Limits:       cpu 2, memory 2G
+  Firewall:     open: no firewall policy (the host answers ping and DNS only)
   Usage:        processes 23, cpu 2h13m, memory 388.2 MiB of 2G
   Disk:         root 256.0 MiB used (1.5 GiB referenced), data 70.0 MiB
 
@@ -42,6 +43,7 @@ Jail db
 
 Resources
   Limits:       none
+  Firewall:     open: no firewall policy (the host answers ping and DNS only)
   Usage:        - (the jail is not running)
   Disk:         root 256.0 MiB used (1.5 GiB referenced), data 70.0 MiB
   Volume data:  /var/db
@@ -103,7 +105,7 @@ interfaces:
         scope: global
         configured: false
 volumes:
-  - name: data
+  - volume: data
     mount: /var/db
 snapshots:
   count: 2
@@ -171,6 +173,6 @@ $ jailops jail info web -o json
 
 $ jailops jail info nope
 ! not_found: jail "nope" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
 [exit 4]
 

@@ -81,8 +81,8 @@ const ago = (s: number) => new Date(Date.now() - s * 1000).toISOString()
 
 function fileSinks(): LogSink[] {
   return [
-    { name: 'central', type: 'syslog', to: 'tls://logs.example.com:6514', facility: 'local3', ca_file: '/usr/local/etc/jailops/logs-ca.pem', sources: { audit: true } },
-    { name: 'alerts', type: 'webhook', to: 'https://hooks.example.com/jailops/logs', token_file: '/usr/local/etc/jailops/hook.token', queue: 2000, sources: { labels: { role: 'web' }, no_app_logs: true } },
+    { name: 'central', type: 'syslog', to: 'tls://logs.example.com:6514', facility: 'local3', ca_file: '/usr/local/etc/jailops/sinks/logs-ca.pem', sources: { audit: true } },
+    { name: 'alerts', type: 'webhook', to: 'https://hooks.example.com/jailops/logs', token_file: '/usr/local/etc/jailops/sinks/hook.token', queue: 2000, sources: { labels: { role: 'web' }, no_app_logs: true } },
   ]
 }
 

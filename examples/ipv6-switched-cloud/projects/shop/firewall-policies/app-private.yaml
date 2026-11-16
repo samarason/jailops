@@ -7,5 +7,5 @@ spec:
   default_out: allow
   rules:
     # Only the web jail may reach the app; administrators may log in.
-    - {name: from-web, action: allow, direction: in, proto: tcp, ports: ["8080"], from: ["@web_tier"]}
-    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["@admins"]}
+    - {name: from-web, action: allow, direction: in, proto: tcp, ports: ["8080"], from: ["set:web-tier"]}
+    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["set:admins"]}

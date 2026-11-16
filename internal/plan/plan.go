@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Step is one unit of work.
@@ -183,17 +184,38 @@ func (e *Executor) Run(ctx context.Context, id string, p *Plan) error {
 		e.emit(Event{Plan: p.Name, ID: id, Step: s.Name, Index: i, Total: len(p.Steps), Phase: PhaseDone})
 	}
 	if e.Journal != nil {
-		if err := e.Journal.Delete(context.WithoutCancel(ctx), id); err != nil {
-			return fmt.Errorf("plan %s: journal cleanup: %w", p.Name, err)
+		// The last step's Done is recorded before the record goes: a record that survives the cleanup (the daemon dies
+		// in the gap, or the delete fails) says the plan completed, and a recovery drops it instead of undoing it.
+		dctx := context.WithoutCancel(ctx)
+		_ = e.put(dctx, rec)
+		var derr error
+		for try := 0; try < 3; try++ {
+			if derr = e.Journal.Delete(dctx, id); derr == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if derr != nil {
+			return fmt.Errorf("plan %s: journal cleanup: %w", p.Name, derr)
 		}
 	}
 	return nil
 }
 
+type begunKey struct{}
+
+// BegunSteps tells an Undo how many steps of its plan had begun when the rollback started (the step that failed or was
+// interrupted included): an undo that depends on whether a later step ever ran, such as whether a jail was started, asks
+// it, and it gets the same answer after a crash, from the journal.
+func BegunSteps(ctx context.Context) int {
+	n, _ := ctx.Value(begunKey{}).(int)
+	return n
+}
+
 // rollback undoes steps from..0 in reverse. It ignores cancellation of ctx:
 // a cancelled operation must still leave the system consistent.
 func (e *Executor) rollback(ctx context.Context, id string, p *Plan, rec Record, from int, failed string, cause error) error {
-	uctx := context.WithoutCancel(ctx)
+	uctx := context.WithValue(context.WithoutCancel(ctx), begunKey{}, rec.Begun)
 	rec.State = StateRollingBack
 	rec.Err = cause.Error()
 	_ = e.put(uctx, rec)
@@ -236,6 +258,11 @@ func (e *Executor) Recover(ctx context.Context, id string, p *Plan) (found bool,
 	}
 	if rec.Plan != p.Name || strings.Join(rec.Steps, "\x00") != strings.Join(p.Names(), "\x00") {
 		return true, fmt.Errorf("plan: journal record %s does not match plan %s", id, p.Name)
+	}
+	if rec.State == StateRunning && len(rec.Steps) > 0 && rec.Done >= len(rec.Steps) {
+		// every step finished; only the removal of the record was left
+		_ = e.Journal.Delete(ctx, id)
+		return true, nil
 	}
 	rerr := e.rollback(ctx, id, p, rec, rec.Begun-1, "interrupted", errors.New("interrupted by daemon restart"))
 	var pe *Error

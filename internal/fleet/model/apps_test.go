@@ -11,17 +11,17 @@ import (
 // A declared source compares with a live grant in the form the host stores it.
 func TestCanonicalSource(t *testing.T) {
 	for in, want := range map[string]string{
-		"host": "host", "@web": "@web", "@office_net": "@office_net", "@shop/web": "@web", "@other/api": "@other/api",
+		"host": "host", "jail:web": "jail:web", "set:office-net": "set:office-net",
 		"192.0.2.7": "192.0.2.7", "192.0.2.7/32": "192.0.2.7", "192.0.2.9/24": "192.0.2.0/24",
 		"2001:db8::1": "2001:db8::1", "2001:db8::1/64": "2001:db8::/64",
 	} {
-		got, err := CanonicalSource("shop", in)
+		got, err := CanonicalSource(in)
 		if err != nil || got != want {
 			t.Errorf("%q: %q %v, want %q", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"", "any", "@", "@Web", "@a/", "@/b", "web", "192.0.2.300", "fe80::1%em0", "::ffff:192.0.2.1"} {
-		if _, err := CanonicalSource("shop", bad); err == nil {
+	for _, bad := range []string{"", "any", "@", "@web", "jail:Web", "jail:a/", "jail:shop/web", "set:a_b", "tag:web", "web", "192.0.2.300", "fe80::1%em0", "::ffff:192.0.2.1"} {
+		if _, err := CanonicalSource(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
 	}
@@ -48,30 +48,30 @@ func TestAppSpecsDecodeStrictly(t *testing.T) {
 			t.Errorf("%v accepted", raw)
 		}
 	}
-	s, err := DecodeSpec(api.KindAppAccess, map[string]any{"grants": []any{map[string]any{"source": "@web", "database": "shop"}}})
+	s, err := DecodeSpec(api.KindAppAccess, map[string]any{"grants": []any{map[string]any{"source": "jail:web", "database": "shop"}}})
 	if err != nil || len(s.(AppAccessSpec).Grants) != 1 {
 		t.Fatalf("%v %v", s, err)
 	}
 	// a password is never part of a declaration
-	if _, err := DecodeSpec(api.KindAppAccess, map[string]any{"grants": []any{map[string]any{"source": "@web", "password": "x"}}}); err == nil {
+	if _, err := DecodeSpec(api.KindAppAccess, map[string]any{"grants": []any{map[string]any{"source": "jail:web", "password": "x"}}}); err == nil {
 		t.Fatal("a password key was accepted")
 	}
 }
 
 func TestAppAccessSpecValidate(t *testing.T) {
-	ok := AppAccessSpec{Grants: []AppGrant{{Source: "@web", Database: "shop"}, {Source: "192.0.2.0/24", Ports: []string{"5432"}}}}
-	if err := ok.Validate("shop"); err != nil {
+	ok := AppAccessSpec{Grants: []AppGrant{{Source: "jail:web", Database: "shop"}, {Source: "192.0.2.0/24", Ports: []string{"5432"}}}}
+	if err := ok.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	for want, s := range map[string]AppAccessSpec{
-		"listed twice":        {Grants: []AppGrant{{Source: "@web"}, {Source: "@shop/web"}}},
-		"must match":          {Grants: []AppGrant{{Source: "@web", Database: "Shop;drop"}}},
-		"reserves":            {Grants: []AppGrant{{Source: "@web", Database: "postgres"}}},
-		"N or N/tcp":          {Grants: []AppGrant{{Source: "@web", Ports: []string{"http"}}}},
-		"not an address":      {Grants: []AppGrant{{Source: "web"}}},
-		"name a jail (@web),": {Grants: []AppGrant{{Source: ""}}},
+		"listed twice":            {Grants: []AppGrant{{Source: "jail:web"}, {Source: "jail:web"}}},
+		"must match":              {Grants: []AppGrant{{Source: "jail:web", Database: "Shop;drop"}}},
+		"reserves":                {Grants: []AppGrant{{Source: "jail:web", Database: "postgres"}}},
+		"N or N/tcp":              {Grants: []AppGrant{{Source: "jail:web", Ports: []string{"http"}}}},
+		"not an address":          {Grants: []AppGrant{{Source: "web"}}},
+		"name a jail (jail:web),": {Grants: []AppGrant{{Source: ""}}},
 	} {
-		if err := s.Validate("shop"); err == nil || !strings.Contains(err.Error(), want) {
+		if err := s.Validate(); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%+v: %v, want %q", s, err, want)
 		}
 	}

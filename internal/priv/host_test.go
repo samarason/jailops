@@ -65,6 +65,24 @@ func (h *hostSys) rules(r *run.Fake) {
 		}
 		return run.Result{}, os.WriteFile(c.Args[1], []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 	}})
+	// sysrc -f FILE -x NAME removes every assignment of NAME
+	r.Add(run.Rule{Name: sysrcBin, Args: []string{"-f", run.AnyArg, "-x", run.AnyArg}, Fn: func(c run.Cmd) (run.Result, error) {
+		b, err := os.ReadFile(c.Args[1])
+		if err != nil {
+			return run.Result{ExitCode: 1}, &run.ExitError{Name: sysrcBin, Code: 1, Stderr: "bad"}
+		}
+		var keep []string
+		for _, l := range splitLines(string(b)) {
+			if !strings.HasPrefix(l, c.Args[3]+"=") {
+				keep = append(keep, l)
+			}
+		}
+		out := strings.Join(keep, "\n")
+		if len(keep) > 0 {
+			out += "\n"
+		}
+		return run.Result{}, os.WriteFile(c.Args[1], []byte(out), 0o644)
+	}})
 	r.Add(run.Rule{Name: serviceBin, Args: []string{"ntpd", run.AnyArg}, Fn: func(c run.Cmd) (run.Result, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -335,12 +353,19 @@ func TestHostIdentityApplyDryRunAndRestore(t *testing.T) {
 	if st, _ := os.Stat(filepath.Join(etc, "resolv.conf")); st.Mode().Perm() != 0o644 {
 		t.Errorf("mode %v", st.Mode())
 	}
-	// the snapshot holds the three files as they were, and nothing else
+	// the snapshot holds the two files as they were and the module's rc.conf variables, not a copy of rc.conf
 	snapDir := filepath.Join(e.cfg.HostDir, "snapshots", res.Snapshot)
-	for n, want := range map[string]string{"resolv.conf": origResolv, "ntp.conf": origNTP, "rc.conf": origRC} {
+	for n, want := range map[string]string{"resolv.conf": origResolv, "ntp.conf": origNTP} {
 		if got := readFile(t, filepath.Join(snapDir, n)); got != want {
 			t.Errorf("snapshot %s:\n%s", n, got)
 		}
+	}
+	if _, err := os.Lstat(filepath.Join(snapDir, "rc.conf")); err == nil {
+		t.Error("the snapshot keeps a copy of rc.conf")
+	}
+	if man := readFile(t, filepath.Join(snapDir, "snapshot.json")); !strings.Contains(man, `"hostname": "old.example.org"`) ||
+		!strings.Contains(man, `"ntpd_enable": null`) || strings.Contains(man, "sshd_enable") || strings.Contains(man, "ifconfig_em0") {
+		t.Errorf("manifest:\n%s", man)
 	}
 	if st, _ := os.Stat(e.cfg.HostDir); st.Mode().Perm() != 0o700 {
 		t.Errorf("host dir mode %v", st.Mode())

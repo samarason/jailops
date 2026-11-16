@@ -18,7 +18,7 @@ test('the panel shows the self-signed certificate and how clients pin it', async
   await expect(page.getByTestId('cert-source')).toHaveText('Self-signed')
   await expect(page.getByTestId('cert-current')).toContainText('bsd01.example.net')
   await expect(page.getByTestId('cert-current')).toContainText('itself (self-signed)')
-  await expect(page.locator('#copy-remote-add')).toHaveValue(/--fingerprint [0-9a-f]{64} --token-stdin$/)
+  await expect(page.locator('#copy-remote-add')).toHaveValue(/--fingerprint [0-9a-f]{64} --token-file -$/)
   await expect(page.getByTestId('cert-self')).toHaveCount(0)
 })
 
@@ -61,7 +61,7 @@ test('ACME needs the terms, refuses a wildcard, turns valid and needs no pin; se
   await expect(page.getByTestId('acme-state')).toHaveText('Valid')
   await expect(page.getByTestId('cert-current')).toContainText('Signed by a CA the host trusts')
   await expect(page.getByTestId('acme-apply-fw')).toContainText('redirect port 80')
-  await expect(page.locator('#copy-remote-add')).toHaveValue('jailops remote add bsd01 https://console.example.com:39110 --token-stdin')
+  await expect(page.locator('#copy-remote-add')).toHaveValue('jailops remote add bsd01 https://console.example.com:39110 --token-file -')
 
   await page.getByTestId('cert-self').click()
   await expect(page.getByTestId('self-warning')).toContainText('Browsers will warn again')

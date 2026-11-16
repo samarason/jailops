@@ -96,6 +96,7 @@ async function go(): Promise<void> {
     <p v-else class="muted" style="margin-top: 12px">{{ s.upgrade.needPreview }}</p>
     <ErrorPanel v-if="error" :error="error" style="margin-top: 12px" />
     <template #footer>
+      <span v-if="!fresh" class="why-disabled">{{ s.upgrade.needPreview }}</span>
       <button class="btn" type="button" @click="emit('close')">{{ s.app.cancel }}</button>
       <button class="btn btn-primary" type="button" :disabled="!fresh || busy" data-test="upgrade-go" @click="go">{{ s.upgrade.run }}</button>
     </template>

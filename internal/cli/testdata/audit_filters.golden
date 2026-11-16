@@ -1,0 +1,18 @@
+$ jailops audit --limit 50 --since 24h --user alice
+TIME                  REQUESTOR   ACTION                           RESOURCE   RESULT
+2026-03-01 09:00:00   alice       DELETE /api/v1/jails/{name}      web        ok
+2026-03-01 08:59:00   alice       POST /api/v1/jails               web        ok
+2026-03-01 08:58:00   alice       DELETE /api/v1/networks/{name}   lan        denied
+
+$ jailops audit --action delete * --limit 1
+TIME                  REQUESTOR   ACTION                        RESOURCE   RESULT
+2026-03-01 09:00:00   alice       DELETE /api/v1/jails/{name}   web        ok
+
+$ jailops audit --action PUT *
+! No audit entries match.
+
+$ jailops audit --limit 5000
+! usage: --limit must be between 1 and 1000
+! hint: run 'jailops audit --help' for usage
+[exit 2]
+

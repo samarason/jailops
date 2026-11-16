@@ -13,13 +13,15 @@ import ErrorPanel from '@jailops/shared/components/ErrorPanel.vue'
 const props = defineProps<{ open: boolean; backup: Backup | null }>()
 const emit = defineEmits<{ close: []; done: [] }>()
 
-const form = reactive<RestoreForm>({ backup: '', as: '', host: '', replace: false, keepIp: false, networkMap: {} })
+const form = reactive<RestoreForm>({ backup: '', as: '', host: '', replace: false, keepIp: false, noVolumes: false, passphrase: '', networkMap: {} })
 const report = ref<RestorePreflight | null>(null)
 const reportKey = ref('')
 const busy = ref(false)
 const error = ref<ApiError | null>(null)
 
 const bundle = computed(() => props.backup?.spec.bundle)
+const isVolume = computed(() => props.backup?.spec.kind === 'volume')
+const encrypted = computed(() => !!props.backup?.spec.volume?.encrypted)
 const nets = computed(() => [...new Set((bundle.value?.spec.network ?? []).map((n) => n.network))])
 const fresh = computed(() => !!report.value && reportKey.value === requestKey(form))
 const step = computed(() => (!report.value ? 1 : fresh.value ? 3 : 2))
@@ -31,6 +33,8 @@ watch(() => props.open, (o) => {
   form.host = ''
   form.replace = false
   form.keepIp = false
+  form.noVolumes = false
+  form.passphrase = ''
   form.networkMap = Object.fromEntries(nets.value.map((n) => [n, n]))
   report.value = null
   reportKey.value = ''
@@ -57,6 +61,7 @@ async function restore(): Promise<void> {
   error.value = null
   try {
     await runOp(s.restore.started(form.as || props.backup?.spec.jail || ''), () => api.backups.restore(buildRequest(form, false)))
+    form.passphrase = ''
     emit('done')
     emit('close')
   } catch (e) {
@@ -80,9 +85,14 @@ async function restore(): Promise<void> {
         <div class="field"><label for="rs-as">{{ s.restore.as }}</label><input id="rs-as" v-model="form.as" class="mono" type="text" /><span class="hint">{{ s.restore.asHint }}</span></div>
         <div class="field"><label for="rs-host">{{ s.restore.host }}</label><input id="rs-host" v-model="form.host" class="mono" type="text" /><span class="hint">{{ s.restore.hostHint }}</span></div>
       </div>
-      <label class="check"><input v-model="form.replace" type="checkbox" />{{ s.restore.replace }}</label>
-      <label class="check"><input v-model="form.keepIp" type="checkbox" />{{ s.restore.keepIp }}</label>
-      <fieldset v-if="nets.length" class="netmap">
+      <div v-if="isVolume && encrypted" class="field"><label for="rs-pass">{{ s.restore.passphrase }}</label><input id="rs-pass" v-model="form.passphrase" type="password" autocomplete="new-password" data-test="restore-passphrase" /><span class="hint">{{ s.restore.passphraseHint }}</span></div>
+      <Callout v-if="isVolume" tone="info">{{ s.restore.volumeNote }}</Callout>
+      <template v-else>
+        <label class="check"><input v-model="form.replace" type="checkbox" />{{ s.restore.replace }}</label>
+        <label class="check"><input v-model="form.keepIp" type="checkbox" />{{ s.restore.keepIp }}</label>
+        <label v-if="bundle?.volumes?.length" class="check"><input v-model="form.noVolumes" type="checkbox" data-test="restore-no-volumes" />{{ s.restore.noVolumes }}</label>
+      </template>
+      <fieldset v-if="nets.length && !isVolume" class="netmap">
         <legend class="label">{{ s.restore.networkMap }}</legend>
         <p class="hint muted">{{ s.restore.networkMapHint }}</p>
         <div v-for="n in nets" :key="n" class="row" style="flex-wrap: nowrap; margin-bottom: 6px">
@@ -90,7 +100,7 @@ async function restore(): Promise<void> {
           <input v-model="form.networkMap[n]" class="mono" type="text" :aria-label="`${s.restore.mapTo}: ${n}`" />
         </div>
       </fieldset>
-      <details>
+      <details v-if="!isVolume">
         <summary>{{ s.restore.bundle }}</summary>
         <dl class="kv">
           <dt>Image</dt><dd class="mono">{{ backup.spec.bundle.image_generation }}</dd>

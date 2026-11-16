@@ -1,5 +1,5 @@
-$ jailops network create br-web --ipv4 10.50.0.1/24 --ipv6 fd50::1/64
-network/br-web created
+$ jailops network create web --ipv4 10.50.0.1/24 --ipv6 fd50::1/64
+network/web created
 
 $ jailops network create bad --ipv4 10.50.0.1/24 --subnet 10.1.0.0/24
 ! usage: --ipv4 replaces --subnet, --gateway and --range: use one form
@@ -11,9 +11,9 @@ $ jailops network create bad --ipv4 nonsense
 ! hint: run 'jailops network create --help' for usage
 [exit 2]
 
-$ jailops network show br-web -o yaml
+$ jailops network show web -o yaml
 metadata:
-  name: br-web
+  name: web
   uuid: <uuid>
   scope: fleet
   generation: 1
@@ -27,8 +27,7 @@ spec:
   ipv6:
     mode: routed
     subnet: fd50::/64
-    gateway: fd50::1
-    range: fd50::2-fd50::1:0
+    range: fd50::1-fd50::ffff
 status:
   free: 253
 
@@ -42,7 +41,6 @@ $ jailops storage create nodataset
 
 $ jailops storage create bad --dataset nodash
 ! invalid: dataset "nodash" must look like pool/dataset
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops storage list
@@ -53,75 +51,72 @@ fast      tank/fast      tank   ONLINE   1.0 GiB   1023.0 GiB
 $ jailops storage show fast -o name
 fast
 
-$ jailops project create web --description front end
+$ jailops project create web --comment front end
 project/web created
 
-$ jailops project set web --network br-web --storage fast=500G --max-jails 2 --max-memory 8G
+$ jailops network grant web --project web
+network/web granted to project web
+
+$ jailops storage grant fast --project web --quota 500G
+storage/fast granted to project web
+
+$ jailops project set web --max-jails 2 --max-memory 8G
 project/web updated
 
-$ jailops project set web --network br-web=10.50.0.100-10.50.0.150
-! usage: --network "br-web=10.50.0.100-10.50.0.150": a network is granted whole; ranges are not reserved any more
-! hint: run 'jailops project set --help' for usage
-[exit 2]
-
 $ jailops project show web
-Name:        web
-UUID:        <uuid>
-Generation:  2
-Age:         3h
+Project web
+  Comment:     front end
+  Hosts:       this host
+  Networks:    web
+  Storage:     fast (quota 500G)
+  Firewall:    none
+  Images:      any
+  Age:         3h
 
-SPEC                      STATUS
-----                      ------
-description: front end    jails: 0
-networks:                 cpu: 0
-  - network: br-web       memory_used: 0
-storage:                  disk_used: 0
-  - storage: fast         addresses: 0
-    quota: 500G
-quotas:
-  jails: 2
-  memory: 8G
+Usage
+  Jails:       0 of 2
+  CPU:         0 cores (no quota)
+  Memory:      0 B of 8G
+  Disk:        0 B
+  Addresses:   0 (no quota)
 
 $ jailops project list
-    NAME   HOSTS   NETWORKS   STORAGE   JAILS   DESCRIPTION
+    NAME   HOSTS   NETWORKS   STORAGE   JAILS   COMMENT
 *   main   -       lan        default   0       -
-    web    -       br-web     fast      0/2     front end
+    web    -       web        fast      0/2     front end
 
 $ jailops network grant lan --project web
 ! conflict: network lan is already granted to project main
-! hint: Read it again and repeat the change; 'jailops <kind> edit' does this for you. (jailops explain conflict)
 [exit 5]
 
 $ jailops network grant lan
-! usage: --project is required
-! hint: run 'jailops network grant --help' for usage
-[exit 2]
+network/lan granted to project main
 
-$ jailops network revoke br-web --project web
-network/br-web revoked from project web
+$ jailops network revoke web --project web
+network/web revoked from project web
 
-$ jailops network grant br-web --project web
-network/br-web granted to project web
+$ jailops network grant web --project web
+network/web granted to project web
 
-$ jailops project set web --revoke-storage fast
-project/web updated
+$ jailops storage revoke fast --project web
+storage/fast revoked from project web
 
-$ jailops project set web --storage fast=500G
-project/web updated
+$ jailops storage grant fast --project web --quota 500G
+storage/fast granted to project web
 
-$ jailops create nginx --project web --image freebsd-15@stable --memory 1G --cpu 1 --network br-web --storage fast
+$ jailops create nginx --project web --image freebsd-15@stable --memory 1G --cpu 1 --network web --storage fast
 jail/nginx created
 
 $ jailops list --project web
-NAME    STATE     IMAGE               GEN   ADDRESSES           AGE
-nginx   stopped   freebsd-15@stable   g1    10.50.0.2,fd50::2   3h
+NAME    STATE     IMAGE               GEN   ADDRESSES           AUTOSTART   AGE
+nginx   stopped   freebsd-15@stable   g1    10.50.0.2,fd50::1   -           3h
 
 $ jailops list
-! No resources found.
+! No jails in project main. Create one with: jailops jail create NAME --image IMAGE --network NETWORK --storage STORAGE
 
 $ jailops list --project nowhere
 ! not_found: project "nowhere" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops project list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops project show web -o json
@@ -131,15 +126,15 @@ $ jailops project show web -o json
     "uuid": "<uuid>",
     "host": "<uuid>",
     "scope": "host",
-    "generation": 6,
+    "generation": 8,
     "created_at": "2026-03-01T09:00:00Z",
     "updated_at": "2026-03-01T09:00:00Z"
   },
   "spec": {
-    "description": "front end",
+    "comment": "front end",
     "networks": [
       {
-        "network": "br-web"
+        "network": "web"
       }
     ],
     "storage": [
@@ -162,10 +157,10 @@ $ jailops project show web -o json
   }
 }
 
-$ jailops create n2 --project web --image freebsd-15@stable --memory 1G --cpu 1 --network br-web --storage fast
+$ jailops create n2 --project web --image freebsd-15@stable --memory 1G --cpu 1 --network web --storage fast
 jail/n2 created
 
-$ jailops create n3 --project web --image freebsd-15@stable --memory 1G --cpu 1 --network br-web --storage fast
+$ jailops create n3 --project web --image freebsd-15@stable --memory 1G --cpu 1 --network web --storage fast
 ! quota_exceeded: project "web" would exceed its jails quota (3 of 2)
 ! hint: See the usage with 'jailops project show NAME', free something up, or ask a global admin to raise the quota with 'jailops project set NAME --max-...'. (jailops explain quota_exceeded)
 [exit 5]
@@ -177,9 +172,9 @@ $ jailops project delete -y web
 
 $ jailops project delete -y default
 ! not_found: project "default" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops project list'; check --project, --host and --remote too
 [exit 4]
 
-$ jailops project create shop --new-network --hosts h1,h2 --storage fast
+$ jailops project create shop --new-network --hosts h1,h2
 project/shop created
 

@@ -72,24 +72,24 @@ api    shop      not_attempted   freebsd-15#g3   -               stopped after m
 
 $ jailops image upgrade freebsd-15 --project nope
 ! not_found: project "nope" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops project list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops image upgrade nope
 ! not_found: image "nope" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops image list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops image upgrade freebsd-15 --no-wait --no-jails
 OPERATION                              STATUS    DESCRIPTION
 <uuid>   pending   Upgrade image freebsd-15
 
-$ jailops image generations freebsd-15
-NAME            NUMBER   PARENT   PACKAGES   MANIFEST              AGE   USED BY
-freebsd-15#g1   1        -        0          sha256:<hex>   3h    pin
-freebsd-15#g2   2        g1       120        sha256:<hex>   3h    web
-freebsd-15#g3   3        g2       120        sha256:<hex>   3h    api
-freebsd-15#g4   4        g3       120        sha256:<hex>   3h    -
-freebsd-15#g5   5        g4       120        sha256:<hex>   3h    -
-freebsd-15#g6   6        g5       120        sha256:<hex>   3h    -
+$ jailops image generation list freebsd-15
+NAME            NUMBER   PARENT   FREEBSD   PACKAGES   MANIFEST              AGE   USED BY
+freebsd-15#g1   1        -        -         0          sha256:<hex>   3h    pin
+freebsd-15#g2   2        g1       -         120        sha256:<hex>   3h    web
+freebsd-15#g3   3        g2       -         120        sha256:<hex>   3h    api
+freebsd-15#g4   4        g3       -         120        sha256:<hex>   3h    -
+freebsd-15#g5   5        g4       -         120        sha256:<hex>   3h    -
+freebsd-15#g6   6        g5       -         120        sha256:<hex>   3h    -
 

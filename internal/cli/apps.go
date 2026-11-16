@@ -126,9 +126,9 @@ jailops app info postgresql
 jailops app install nginx --project web
 jailops app installed --project web
 jailops app new memcached --package memcached --service memcached --port 11211/tcp
-jailops app export cache -o cache.yaml
+jailops app export cache --file cache.yaml
 jailops app validate ./apps
-jailops app allow db from @web
+jailops app allow db --from jail:web
 jailops app access db`, "apps")
 	addList(a, ac, d, "\njailops app list --category database\njailops app list --source local")
 	ac.AddCommand(a.appInfo(d), a.appInstall(d), a.appInstalled(), a.appValidate(), a.appNew(), a.appExport(),

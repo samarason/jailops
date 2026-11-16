@@ -2,7 +2,7 @@
 // Projects). Host-level routes (images, networks, storage, projects, users, ...) never get it.
 
 /** First path segments of the routes that belong to a project, or that are narrowed by one. */
-export const PROJECT_LEVEL = new Set(['jails', 'firewall', 'backup-policies', 'backups', 'restores', 'operations', 'events', 'audit', 'profiles', 'updates'])
+export const PROJECT_LEVEL = new Set(['jails', 'volumes', 'firewall', 'backup-policies', 'backups', 'restores', 'operations', 'events', 'audit', 'profiles', 'updates'])
 
 export function withProject(path: string, project: string): string {
   if (!project) return path

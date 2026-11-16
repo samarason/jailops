@@ -3,7 +3,7 @@ kind: Rollout
 metadata:
   name: web-upgrade
 spec:
-  description: Move the web project's jails to the newest image generation.
+  comment: Move the web project's jails to the newest image generation.
   project: web
   selector: {tier: web}
   canary: 1

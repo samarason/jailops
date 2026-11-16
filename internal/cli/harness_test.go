@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -42,6 +43,11 @@ type harness struct {
 	resize  chan struct{}
 	// secrets are what the password prompt returns, in order; nil keeps the real prompt
 	secrets []string
+	// ctx and stdin replace the context of a run and its standard input when set
+	ctx   context.Context
+	stdin io.Reader
+	// timeout bounds one command; zero is 30 seconds
+	timeout time.Duration
 }
 
 func newHarness(t *testing.T, opts ...fake.Option) *harness {
@@ -135,9 +141,20 @@ func (h *harness) environ(stdin string, out, errb *bytes.Buffer) *cli.Env {
 func (h *harness) run(stdin string, args ...string) (stdout, stderr string, code int) {
 	h.t.Helper()
 	var out, errb bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	parent := h.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	limit := h.timeout
+	if limit == 0 {
+		limit = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, limit)
 	defer cancel()
 	env := h.environ(stdin, &out, &errb)
+	if h.stdin != nil {
+		env.Stdin = h.stdin
+	}
 	if h.probe == nil {
 		env.ProbeCert = nil
 	}

@@ -1,26 +1,26 @@
-$ jailops image build freebsd-15 --from 1
+$ jailops image build freebsd-15 --from-generation 1
 generation/freebsd-15#g4 built
 
-$ jailops image build freebsd-15 --from freebsd-15#g2 --dry-run
+$ jailops image build freebsd-15 --from-generation freebsd-15#g2 --dry-run
 dry-run: would build freebsd-15#g5 (120 packages)
 
-$ jailops image build freebsd-15 --from other#g2
-! usage: --from: "other#g2" belongs to image other, not freebsd-15
+$ jailops image build freebsd-15 --from-generation other#g2
+! usage: --from-generation: "other#g2" belongs to image other, not freebsd-15
 ! hint: run 'jailops image build --help' for usage
 [exit 2]
 
-$ jailops image alias set freebsd-15 stable g1
+$ jailops image alias add freebsd-15 stable --generation g1
 image/freebsd-15 alias stable set to g1
 
-$ jailops image alias set freebsd-15 edge freebsd-15#g4
+$ jailops image alias add freebsd-15 edge --generation freebsd-15#g4
 image/freebsd-15 alias edge set to g4
 
-$ jailops image delete-generation -y freebsd-15 g3
+$ jailops image generation delete -y freebsd-15 g3
 generation/freebsd-15#g3 deleted
 
-$ jailops image delete-generation -y freebsd-15 three
+$ jailops image generation delete -y freebsd-15 three
 ! usage: GENERATION must be a generation such as g2, not "three"
-! hint: run 'jailops image delete-generation --help' for usage
+! hint: run 'jailops image generation delete --help' for usage
 [exit 2]
 
 $ jailops jail create web --image freebsd-15#g1 --network lan --storage default

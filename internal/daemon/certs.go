@@ -52,6 +52,10 @@ type certManager struct {
 	uploaded *certReloader
 	acme     *acmeManager
 	acmeAddr string // the challenge listener's address in use
+
+	hstsMu   sync.Mutex
+	hstsCert *tls.Certificate // the certificate hstsOK was decided for
+	hstsOK   bool
 }
 
 // certChoice is choice.json.
@@ -265,6 +269,30 @@ func certInfo(c *tls.Certificate, roots *x509.CertPool, now time.Time) api.Certi
 		out.PublicCA = err == nil
 	}
 	return out
+}
+
+// HSTS reports whether Strict-Transport-Security may be sent: the certificate served now comes from ACME or was uploaded
+// or configured, and it verifies against the host's trusted roots. Never for the self-signed certificate (also while
+// ACME waits for its first certificate): a browser that saw the header refuses a certificate it does not trust, with no
+// way to click through. The answer is kept per served certificate.
+func (m *certManager) HSTS() bool {
+	m.mu.Lock()
+	src := m.source
+	m.mu.Unlock()
+	if src != api.CertSourceACME && src != api.CertSourceUploaded && src != api.CertSourceConfigured {
+		return false
+	}
+	c := m.served()
+	if c == nil {
+		return false
+	}
+	m.hstsMu.Lock()
+	defer m.hstsMu.Unlock()
+	if c != m.hstsCert {
+		info := certInfo(c, m.roots, m.now())
+		m.hstsCert, m.hstsOK = c, info.PublicCA && !info.SelfSigned
+	}
+	return m.hstsOK
 }
 
 // Status implements service.CertificateManager.

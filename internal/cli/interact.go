@@ -36,11 +36,11 @@ func (a *app) readLine() (string, error) {
 }
 
 // readSecretFromTerminal reads a line from the terminal without echoing it. It refuses when standard input is not a terminal:
-// a password never comes from a command line, so a script says --password-stdin.
+// a password never comes from a command line, so a script says --password-file -.
 func readSecretFromTerminal(e *Env, prompt string) (string, error) {
 	f, ok := e.Stdin.(*os.File)
 	if !ok || !e.IsTTY(f) {
-		return "", usagef("standard input is not a terminal: pass --password-stdin and give the password on its first line")
+		return "", usagef("standard input is not a terminal: pass --password-file - and give the password on its first line")
 	}
 	fprintf(e.Stderr, "%s", prompt)
 	b, err := term.ReadPassword(int(f.Fd()))
@@ -51,15 +51,12 @@ func readSecretFromTerminal(e *Env, prompt string) (string, error) {
 	return string(b), nil
 }
 
-// newPassword reads a password for a person: from the first line of standard input with --password-stdin, else
-// from a prompt asked twice. It is never an argument of the command line.
-func (a *app) newPassword(fromStdin bool) (string, error) {
-	if fromStdin {
-		line, err := a.readLine()
-		if err != nil || line == "" {
-			return "", usagef("--password-stdin needs the password on the first line of standard input")
-		}
-		return line, nil
+// newPassword reads a password for a person: from the first line of a file with --password-file (- is standard
+// input), else from a prompt asked twice. It is never
+// an argument of the command line.
+func (a *app) newPassword(file string) (string, error) {
+	if file != "" {
+		return a.readSecretFile("password", file)
 	}
 	first, err := a.env.ReadSecret("New password: ")
 	if err != nil {
@@ -75,6 +72,43 @@ func (a *app) newPassword(fromStdin bool) (string, error) {
 	return first, nil
 }
 
+// readSecretFile reads a secret from the first line of a file, or of standard input for "-". A file others may
+// read is warned about.
+func (a *app) readSecretFile(what, path string) (string, error) {
+	if path == "-" {
+		line, err := a.readLine()
+		if err != nil || line == "" {
+			return "", usagef("the %s is not on the first line of standard input", what)
+		}
+		return line, nil
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		fprintf(a.env.Stderr, "warning: %s can be read by other users; keep a %s file at mode 0600\n", path, what)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", usagef("reading the %s file: %v", what, err)
+	}
+	line, rest, _ := strings.Cut(string(b), "\n")
+	line = strings.TrimSuffix(line, "\r")
+	if strings.TrimSpace(rest) != "" {
+		return "", usagef("the %s file %s must hold one line", what, path)
+	}
+	if line == "" {
+		return "", usagef("the %s file %s is empty", what, path)
+	}
+	return line, nil
+}
+
+// noAnswer is the error of a confirmation that got no answer: standard input ended, as it does in a script.
+func (a *app) noAnswer(how string) error {
+	what := "standard input gave no answer"
+	if !a.env.IsTTY(a.env.Stdin) {
+		what = "standard input is not a terminal and gave no answer"
+	}
+	return &usageError{err: fmt.Errorf("%w: %s", errNotConfirmed, what), hint: how}
+}
+
 // confirm asks a yes/no question unless -y was given.
 func (a *app) confirm(prompt string) error {
 	if a.yes {
@@ -83,7 +117,7 @@ func (a *app) confirm(prompt string) error {
 	fprintf(a.env.Stderr, "%s [y/N]: ", prompt)
 	ans, err := a.readLine()
 	if err != nil {
-		return &usageError{err: errNotConfirmed, hint: "answer on standard input, or pass -y"}
+		return a.noAnswer("answer y on standard input, or pass -y to confirm without a question")
 	}
 	switch strings.ToLower(ans) {
 	case "y", "yes":
@@ -102,7 +136,11 @@ func (a *app) confirmTyped(warning, name string, flagOK bool, flagName string) e
 	fprintf(a.env.Stderr, "Type the name %q to confirm: ", name)
 	ans, err := a.readLine()
 	if err != nil {
-		return &usageError{err: errNotConfirmed, hint: "type the name on standard input, or pass " + flagName}
+		hint := "type the name on standard input, or pass " + flagName
+		if flagName != "-y" {
+			hint += " (-y does not answer this question)"
+		}
+		return a.noAnswer(hint)
 	}
 	if ans != name {
 		return &abortError{"the name did not match, nothing was changed"}

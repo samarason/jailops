@@ -48,7 +48,9 @@ func TestJailLifecycle(t *testing.T) {
 	h.seed()
 	tr := h.transcript()
 	tr.ok("jail", "create", "web", "--image", "freebsd-15@stable", "--storage", "default", "--network", "lan", "--memory", "2G", "--label", "env=prod", "--autostart")
-	tr.ok("jail", "create", "db", "--image", "freebsd-15@stable", "--storage", "default", "--network", "lan", "--volume", "data:/var/db:ro", "--env", "A=1")
+	tr.ok("volume", "create", "data", "--storage", "default")
+	tr.ok("jail", "create", "db", "--image", "freebsd-15@stable", "--storage", "default", "--network", "lan", "--env", "A=1")
+	tr.ok("volume", "attach", "db", "data", "/srv/data", "--ro")
 	tr.ok("jail", "list")
 	tr.ok("jail", "start", "web")
 	tr.ok("jail", "list")
@@ -58,8 +60,13 @@ func TestJailLifecycle(t *testing.T) {
 	tr.ok("jail", "show", "web")
 	tr.ok("jail", "restart", "web", "--grace", "5")
 	tr.ok("jail", "stop", "web", "--force")
-	tr.ok("jail", "delete", "-y", "db")
-	tr.do("", "jail", "delete", "web")
+	tr.do("", "jail", "delete", "-y", "db") // data loss: -y does not answer it
+	tr.do("web\n", "jail", "delete", "db")  // the wrong name
+	if _, ok := h.srv.JailIn("main", "db"); !ok {
+		t.Fatal("db deleted without its name typed")
+	}
+	tr.do("db\n", "jail", "delete", "db")
+	tr.do("", "jail", "delete", "web") // running, no --force: refused before the question
 	tr.do("", "jail", "show", "db")
 	tr.golden("jail_lifecycle")
 	if _, ok := h.srv.JailIn("main", "db"); ok {
@@ -258,8 +265,12 @@ func TestJailEditorFlow(t *testing.T) {
 	tr.do("", "jail", "edit", "web")
 	h.env["EDITOR"] = fail
 	tr.do("", "jail", "edit", "web")
-	if m := h.mutations(); len(m) != 1 {
+	// the create, and the dry run of the rename the changed name asked about (not confirmed: no answer)
+	if m := h.mutations(); len(m) != 2 || !strings.HasSuffix(m[1], "/rename") {
 		t.Fatalf("failed edits must not write: %v", m)
+	}
+	if _, ok := h.srv.JailIn("main", "other"); ok {
+		t.Fatal("an unconfirmed rename renamed the jail")
 	}
 	h.env["EDITOR"] = sed + " " // trailing blanks are tolerated
 	tr.do("", "jail", "edit", "web", "--dry-run")
@@ -347,9 +358,9 @@ func TestDryRunSendsNothing(t *testing.T) {
 		{"jail", "copy", "web", "w2"},
 		{"network", "create", "n2", "--subnet", "10.1.0.0/24", "--gateway", "10.1.0.1", "--range", "10.1.0.5-10.1.0.9"},
 		{"network", "delete", "-y", "lan"},
-		{"image", "alias", "set", "freebsd-15", "x"},
-		{"image", "alias", "delete", "-y", "freebsd-15", "x"},
-		{"image", "delete-generation", "-y", "freebsd-15", "1"},
+		{"image", "alias", "add", "freebsd-15", "x"},
+		{"image", "alias", "remove", "-y", "freebsd-15", "x"},
+		{"image", "generation", "delete", "-y", "freebsd-15", "1"},
 		{"firewall", "address-set", "create", "s", "--address", "10.0.0.0/8"},
 		{"token", "create", "t1", "--global"},
 		{"user", "create", "bob", "--global"},

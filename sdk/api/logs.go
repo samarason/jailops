@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/url"
 	"path"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -105,11 +104,11 @@ func (q LogsQuery) Normalize() (LogsQuery, error) {
 		return q, Errorf(CodeInvalid, "at most %d jails", MaxLogSources)
 	}
 	for _, j := range q.Jails {
-		if !nameRE.MatchString(j) {
+		if !IsName(j, MaxName) {
 			return q, Errorf(CodeInvalid, "jail %q is not a jail name", j)
 		}
 	}
-	if q.App != "" && !nameRE.MatchString(q.App) {
+	if q.App != "" && !IsName(q.App, MaxName) {
 		return q, Errorf(CodeInvalid, "app %q is not an app name", q.App)
 	}
 	for k := range q.Labels {
@@ -410,7 +409,6 @@ type LogForwardTestResult struct {
 }
 
 var (
-	sinkNameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 	facilities = []string{"local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"}
 )
 
@@ -495,8 +493,8 @@ func (s LogForwardSpec) Validate() error {
 	}
 	seen := map[string]bool{}
 	for _, k := range s.Sinks {
-		if !sinkNameRE.MatchString(k.Name) {
-			return Errorf(CodeInvalid, "sink name %q must match ^[a-z][a-z0-9-]{0,31}$", k.Name)
+		if !IsName(k.Name, 32) {
+			return Errorf(CodeInvalid, "sink name %q must match "+NamePattern+" and have at most 32 characters", k.Name)
 		}
 		if seen[k.Name] {
 			return Errorf(CodeInvalid, "sink %q is listed twice", k.Name)
@@ -530,7 +528,7 @@ func (s LogForwardSpec) Validate() error {
 		src := k.Sources
 		for _, l := range [][]string{src.Projects, src.Jails, src.ExcludeJails} {
 			for _, n := range l {
-				if !nameRE.MatchString(n) {
+				if !IsName(n, MaxName) {
 					return Errorf(CodeInvalid, "sink %q: %q is not a project or jail name", k.Name, n)
 				}
 			}

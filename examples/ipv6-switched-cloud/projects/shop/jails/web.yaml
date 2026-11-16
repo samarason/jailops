@@ -14,7 +14,7 @@ spec:
       ipv4: "10.94.0.10"
       # A fixed IPv6 address inside the network's range: this is the address your AAAA record points at.
       ipv6: "2001:db8:1:2:100::80"
-  firewall: {policy: public-web}
+  firewall: {policies: [public-web]}
   resources: {cpu: 2, memory: 1G, pids: 500}
   boot: {autostart: true, priority: 10}
   update: {strategy: rebase, mode: notify, schedule: "0 4 * * 0", packages: true, os: true}

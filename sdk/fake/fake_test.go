@@ -39,7 +39,7 @@ func TestWireContract(t *testing.T) {
 	if w, env := do(t, s, "GET", "/api/v1/firewall/address-sets", "", nil); w.Code != 400 || env.Error.Code != api.CodeInvalid || !strings.Contains(env.Error.Message, "a project is required") {
 		t.Fatalf("no project: %d %s", w.Code, w.Body)
 	}
-	w, env := do(t, s, "POST", "/api/v1/firewall/address-sets?project=web", `{"metadata":{"name":"office"},"spec":{"addresses":["10.0.0.0/8"]}}`, nil)
+	w, env := do(t, s, "POST", "/api/v1/firewall/address-sets?project=web", `{"metadata":{"name":"office"},"spec":{"addresses":[{"address":"10.0.0.0/8"}]}}`, nil)
 	if w.Code != 201 || env.Type != api.ResponseSync {
 		t.Fatalf("create: %d %s", w.Code, w.Body)
 	}
@@ -47,7 +47,7 @@ func TestWireContract(t *testing.T) {
 	if w.Header().Get("ETag") != `"1"` {
 		t.Fatalf("etag %q", w.Header().Get("ETag"))
 	}
-	body := `{"metadata":{"name":"office"},"spec":{"addresses":["10.1.0.0/16"]}}`
+	body := `{"metadata":{"name":"office"},"spec":{"addresses":[{"address":"10.1.0.0/16"}]}}`
 	w, env = do(t, s, "PUT", "/api/v1/firewall/address-sets/office?project=web", body, map[string]string{"If-Match": `"7"`})
 	if w.Code != 412 || env.Type != api.ResponseError || env.Error.Code != api.CodeConflict {
 		t.Fatalf("stale put: %d %s", w.Code, w.Body)

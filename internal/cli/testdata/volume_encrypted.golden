@@ -1,0 +1,123 @@
+$ jailops volume create vault --encrypted --uid 770 --gid 770 --mode 0700 --size 5G
+! usage: standard input is not a terminal: give the passphrase with --passphrase-file FILE
+! hint: run 'jailops volume create --help' for usage
+[exit 2]
+
+$ jailops volume create vault --encrypted --uid 770 --gid 770 --mode 0700 --size 5G
+! The encrypted volume needs a passphrase. It is asked for after every host boot and cannot be recovered when lost.
+! usage: the passphrases do not match
+! hint: run 'jailops volume create --help' for usage
+[exit 2]
+
+$ jailops volume create vault --encrypted --uid 770 --gid 770 --mode 0700 --size 5G
+! The encrypted volume needs a passphrase. It is asked for after every host boot and cannot be recovered when lost.
+! usage: the passphrase must be between 12 and 512 bytes long
+! hint: run 'jailops volume create --help' for usage
+[exit 2]
+
+$ jailops volume create vault --encrypted --uid 770 --gid 770 --mode 0700 --size 5G
+volume/vault created
+! The encrypted volume needs a passphrase. It is asked for after every host boot and cannot be recovered when lost.
+
+$ jailops volume create vault2 --encrypted --passphrase-file <dir>/vault.pass
+volume/vault2 created
+! warning: <dir>/vault.pass can be read by other users; keep a passphrase file at mode 0600
+
+$ jailops volume create plain --passphrase-file <dir>/vault.pass
+! usage: --passphrase-file is given but the volume is not encrypted (--encrypted)
+! hint: run 'jailops volume create --help' for usage
+[exit 2]
+
+$ jailops jail create vault --image freebsd-15@stable --network lan --storage default
+jail/vault created
+
+$ jailops volume attach vault vault /srv/db
+volume/vault attached to jail vault
+
+$ jailops jail create vault2 --image freebsd-15@stable --network lan --storage default
+jail/vault2 created
+
+$ jailops volume attach vault2 vault2 /srv/db
+volume/vault2 attached to jail vault2
+
+$ jailops volume attach vault2 vault /srv/other
+! conflict: volume "vault" is encrypted and attached to jail "vault" already: an encrypted volume is attached to one jail
+[exit 5]
+
+$ jailops volume list
+NAME     STORAGE   USED   SIZE        OWNER     MODE   ATTACHED TO       COMMENT
+vault    default   0 B    5G          770:770   0700   vault (locked)    -
+vault2   default   0 B    unlimited   0:0       0755   vault2 (locked)   -
+
+$ jailops jail list
+NAME     STATE    IMAGE               GEN   ADDRESSES    AUTOSTART   AGE
+vault    locked   freebsd-15@stable   g1    10.20.0.10   -           3h
+vault2   locked   freebsd-15@stable   g1    10.20.0.11   -           3h
+
+$ jailops jail start vault
+! locked: jail "vault" is locked: the encrypted volume(s) vault wait for a passphrase
+! hint: jailops volume unlock vault
+[exit 5]
+
+$ jailops explain locked
+locked
+
+Cause:  An encrypted volume of the jail waits for its passphrase (after a host boot or a lock); a locked jail does not start.
+Fix:    Run 'jailops volume unlock NAME' for the volume the error names (add --start to start the jail at once); a jail due for autostart starts after the unlock.
+HTTP:   409
+Exit:   5
+
+$ jailops volume unlock vault
+! bad_passphrase: the passphrase is not correct
+! hint: Type the passphrase again. A forgotten passphrase cannot be recovered: the data of the volume is lost (docs/storage.md). (jailops explain bad_passphrase)
+[exit 3]
+
+$ jailops volume unlock vault --start
+volume/vault unlocked and its jail started
+
+$ jailops volume unlock vault2 --passphrase-file <dir>/vault.pass
+volume/vault2 unlocked
+
+$ jailops jail list --state locked
+! No jails in project main match.
+
+$ jailops jail list
+┌────────┬─────────┬──────────────────┬──────┬────────────────────────┬───────────┬─────┐
+│ NAME   │ STATE   │ IPV4             │ IPV6 │ IMAGE                  │ AUTOSTART │ AGE │
+├────────┼─────────┼──────────────────┼──────┼────────────────────────┼───────────┼─────┤
+│ vault  │ running │ 10.20.0.10 (lan) │ -    │ freebsd-15@stable (g1) │ -         │ 3h  │
+│ vault2 │ stopped │ 10.20.0.11 (lan) │ -    │ freebsd-15@stable (g1) │ -         │ 3h  │
+└────────┴─────────┴──────────────────┴──────┴────────────────────────┴───────────┴─────┘
+
+$ jailops volume lock vault
+volume/vault locked
+
+$ jailops jail list --state locked
+┌───────┬────────┬──────────────────┬──────┬────────────────────────┬───────────┬─────┐
+│ NAME  │ STATE  │ IPV4             │ IPV6 │ IMAGE                  │ AUTOSTART │ AGE │
+├───────┼────────┼──────────────────┼──────┼────────────────────────┼───────────┼─────┤
+│ vault │ locked │ 10.20.0.10 (lan) │ -    │ freebsd-15@stable (g1) │ -         │ 3h  │
+└───────┴────────┴──────────────────┴──────┴────────────────────────┴───────────┴─────┘
+
+$ jailops volume unlock vault
+volume/vault unlocked
+
+$ jailops volume passphrase vault
+volume/vault passphrase changed
+
+$ jailops volume lock vault
+volume/vault locked
+
+$ jailops volume unlock vault
+! bad_passphrase: the passphrase is not correct
+! hint: Type the passphrase again. A forgotten passphrase cannot be recovered: the data of the volume is lost (docs/storage.md). (jailops explain bad_passphrase)
+[exit 3]
+
+$ jailops volume unlock vault
+volume/vault unlocked
+
+$ jailops volume unlock vault
+! usage: standard input is not a terminal: give the passphrase with --passphrase-file FILE
+! hint: run 'jailops volume unlock --help' for usage
+[exit 2]
+

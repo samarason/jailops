@@ -54,7 +54,7 @@ func (s *Service) AppDraft(ctx context.Context, name string) (api.AppDraft, erro
 	installing := s.installing[key]
 	s.execMu.Unlock()
 	if installing {
-		return api.AppDraft{}, api.Errorf(api.CodeBusy, "jail %q is busy: the app is being installed", name).
+		return api.AppDraft{}, api.Errorf(api.CodeBusy, "jail %q is busy: packages are being installed or updated", name).
 			WithHint("wait for the installation to end; `jailops op list` shows it")
 	}
 	root := s.rootMount(key)
@@ -63,12 +63,15 @@ func (s *Service) AppDraft(ctx context.Context, name string) (api.AppDraft, erro
 		f.Volumes = append(f.Volumes, v.Mount)
 	}
 
-	argv := apps.PkgLeavesArgv(root)
+	argv := apps.PkgLeavesArgv(key)
 	res, err := s.d.Run.Run(ctx, run.Cmd{Name: argv[0], Args: argv[1:], Timeout: draftTimeout})
 	if err != nil {
 		return api.AppDraft{}, fmt.Errorf("list the packages of jail %s: %w: %s", name, err, tailOf(res.Stderr))
 	}
 	f.Packages = res.Stdout
+	if j.Spec.Shell == api.BashPath {
+		f.Packages = dropLines(f.Packages, func(l string) bool { return strings.HasPrefix(l, api.BashPackage+" ") })
+	}
 	if b, err := s.d.Files.ReadFile(ctx, apps.RcConfPath(root)); err == nil {
 		f.RcConf = b
 	} else if !errors.Is(err, os.ErrNotExist) && !api.IsCode(err, api.CodeNotFound) {
@@ -82,7 +85,8 @@ func (s *Service) AppDraft(ctx context.Context, name string) (api.AppDraft, erro
 		return res.Stdout
 	}
 	f.Sockets = inJail("sockets", apps.SockstatArgv())
-	f.Configs = inJail("config", apps.FindNewerArgv("/usr/local/etc"))
+	// the shell's prompt files belong to JailOps, not to the app
+	f.Configs = dropLines(inJail("config", apps.FindNewerArgv("/usr/local/etc")), isShellFile)
 	f.Logs = inJail("logs", apps.FindNewerArgv("/var/log"))
 	services := apps.DraftServices(apps.ParseRcConf(f.RcConf))
 	// rc.conf spells web-worker as web_worker: name the rc.d script as it is

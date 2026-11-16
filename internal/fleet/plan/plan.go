@@ -374,15 +374,18 @@ func decide(s *Session, c *sdk.Client, it Item, o *config.Object, l Live, found 
 		if msg := missingGrants(ps, it.Host, live, desired); msg != "" {
 			return fail(errors.New(msg))
 		}
-		// The mandatory policy is a project-level object: it can be set only
-		// after the policy exists. Send the project without it first and set
-		// it in a second write.
-		if ps.Firewall != "" {
-			if _, ok := live[config.Key{Kind: api.KindFirewallPolicy, Project: o.Name, Name: ps.Firewall}]; !ok {
-				full := ps
-				ps.Firewall = ""
-				it.Spec, it.Post = ps, &full
+		// The mandatory policies are a project-level object: a policy can be named only after it exists. Send the
+		// project without the ones that do not exist yet first and set them in a second write.
+		var present []string
+		for _, pn := range ps.FirewallPolicies {
+			if _, ok := live[config.Key{Kind: api.KindFirewallPolicy, Project: o.Name, Name: pn}]; ok {
+				present = append(present, pn)
 			}
+		}
+		if len(present) != len(ps.FirewallPolicies) {
+			full := ps
+			ps.FirewallPolicies = present
+			it.Spec, it.Post = ps, &full
 		}
 		if !found {
 			it.Meta.UUID = ProjectUUID(s.Fleet.Meta.ID, o.Name)
@@ -432,7 +435,7 @@ func decide(s *Session, c *sdk.Client, it Item, o *config.Object, l Live, found 
 	}
 	it.Dangers = dangers(o.Kind, l.Spec, full)
 	if it.Post != nil {
-		if lp, ok := l.Spec.(api.ProjectSpec); ok && lp.Firewall != "" {
+		if lp, ok := l.Spec.(api.ProjectSpec); ok && len(lp.FirewallPolicies) > 0 {
 			it.Dangers = append(it.Dangers, "the mandatory firewall policy is cleared until the new policy exists")
 		}
 	}

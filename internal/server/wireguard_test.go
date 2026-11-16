@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"jailops.net/jailops/internal/ipam"
 	"jailops.net/jailops/internal/sys/pfctl"
 	"jailops.net/jailops/internal/wireguard"
 	"jailops.net/jailops/sdk/api"
@@ -245,7 +246,12 @@ func wgDoctorCheck(t *testing.T, e interface {
 func TestDoctorDescriptionsAndWireGuardTools(t *testing.T) {
 	e := seeded(t)
 	c := ctxT(t)
-	mustJail(t, e, "web")
+	web := mustJail(t, e, "web")
+	if so, err := e.Admin.Jails().Start(c, "web"); err != nil {
+		t.Fatal(err)
+	} else if _, err := so.Wait(c); err != nil {
+		t.Fatal(err)
+	}
 	e.D.Reconciler().Pass(c)
 	if ch := wgDoctorCheck(t, e, "net.descriptions"); ch.Status != api.DoctorOK {
 		t.Fatalf("%+v", ch)
@@ -253,17 +259,25 @@ func TestDoctorDescriptionsAndWireGuardTools(t *testing.T) {
 	if ch := wgDoctorCheck(t, e, "wireguard.tools"); ch.Name != "" {
 		t.Fatalf("a host without a tunnel got %+v", ch)
 	}
-	n, err := e.Global().Networks().Get(c, "lan")
-	if err != nil {
+	hostEnd := ipam.EpairName(web.Metadata.UUID, 0)
+	// (the start hook makes the epair on a real host)
+	if _, _, err := e.Net.EpairCreate(c, strings.TrimSuffix(hostEnd, "a")); err != nil {
 		t.Fatal(err)
 	}
-	_ = e.Net.SetDescription(c, n.Spec.Bridge, "jailops:"+n.Metadata.UUID) // the marker of an earlier release
-	_ = e.Net.SetDescription(c, n.Spec.Bridge+"gb", "")                    // lost: not taken as ours, left to the network checks
-	ch := wgDoctorCheck(t, e, "net.descriptions")
-	if ch.Status != api.DoctorWarn || !strings.Contains(ch.Message, n.Spec.Bridge+` ("jailops:`) || strings.Contains(ch.Message, n.Spec.Bridge+"gb") {
+	_ = e.Net.SetDescription(c, hostEnd, "jailops jail=alpha/web net=lan (host side)")
+	// A pass of the daemon's own reconciler (kicked by the jail create) may land between the damage and the check and
+	// repair it, which is slow machines only (the race detector): damage it again, the window is narrow each time.
+	var ch api.DoctorCheck
+	for try := 0; try < 20; try++ {
+		_ = e.Net.SetDescription(c, hostEnd, "") // clearing leaves the bare marker: made, not described
+		if ch = wgDoctorCheck(t, e, "net.descriptions"); ch.Status == api.DoctorWarn {
+			break
+		}
+	}
+	if ch.Status != api.DoctorWarn || !strings.Contains(ch.Message, hostEnd+` ("jailops managed")`) {
 		t.Fatalf("%+v", ch)
 	}
-	_ = e.Net.SetDescription(c, n.Spec.Bridge+"gb", "jailops net=lan gateway (host side)")
+	_ = e.Net.SetDescription(c, hostEnd, "jailops jail=alpha/web net=lan (host side)")
 	e.D.Reconciler().Pass(c)
 	if ch := wgDoctorCheck(t, e, "net.descriptions"); ch.Status != api.DoctorOK {
 		t.Fatalf("after a pass: %+v", ch)

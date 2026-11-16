@@ -17,7 +17,7 @@ const (
 	encPass  = "marker-5e1f-long-passphrase"
 	encNew   = "marker-77aa-other-passphrase"
 	encWrong = "marker-dead-wrong-passphrase"
-	encVol   = "tank/jailops/projects/" + dtest.SeedProject + "/jails/vault/data/db"
+	encVol   = "tank/jailops/projects/" + dtest.SeedProject + "/volumes/vault"
 )
 
 // testClock is a clock the test moves.
@@ -42,7 +42,7 @@ func noAutostart(c *daemon.Config) { off := false; c.Reconcile.Autostart = &off 
 
 func vaultJail() api.Jail {
 	j := dtest.WebJail("vault")
-	j.Spec.Volumes = []api.VolumeMount{{Name: "db", Mount: "/var/db/app", Encrypted: true}}
+	j.Spec.Volumes = []api.VolumeAttach{{Name: "vault", Mount: "/var/db/app"}}
 	j.Spec.Boot.Autostart = true
 	return j
 }
@@ -72,8 +72,10 @@ func failedWith(t *testing.T, s *service.Service, op api.Operation, err error, c
 
 func createVault(t *testing.T, s *service.Service, ctx context.Context) {
 	t.Helper()
+	vop, err := s.CreateVolume(ctx, api.VolumeCreate{Metadata: api.ObjectMeta{Name: "vault"}, Spec: api.VolumeSpec{Encrypted: true, UID: 770, GID: 770, Mode: "0700"}, Passphrase: encPass})
+	mustOp(t, s, vop, err)
 	j := vaultJail()
-	op, err := s.CreateJailWith(ctx, api.JailCreate{Metadata: j.Metadata, Spec: j.Spec, VolumePassphrase: encPass})
+	op, err := s.CreateJail(ctx, j)
 	mustOp(t, s, op, err)
 }
 
@@ -113,24 +115,24 @@ func TestEncryptedVolumeLifecycle(t *testing.T) {
 	mustOp(t, s, op, err)
 
 	reboot(t, e, s, ctx)
-	if st := power(t, s, ctx); st.Power != api.PowerLocked || len(st.Locked) != 1 || st.Locked[0] != "db" {
+	if st := power(t, s, ctx); st.Power != api.PowerLocked || len(st.Locked) != 1 || st.Locked[0] != "vault" {
 		t.Fatalf("after a reboot: %+v", st)
 	}
 	_, err = s.JailAction(ctx, "vault", api.JailAction{Action: "start"})
 	wantCode(t, err, api.CodeLocked)
-	if !strings.Contains(hintOf(err), "jailops jail unlock vault") {
+	if !strings.Contains(hintOf(err), "jailops volume unlock vault") {
 		t.Fatalf("hint %q", hintOf(err))
 	}
 	_, err = s.JailAction(ctx, "vault", api.JailAction{Action: "restart"})
 	wantCode(t, err, api.CodeLocked)
 
-	op, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encWrong})
+	op, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encWrong})
 	failedWith(t, s, op, err, api.CodeBadPassphrase)
 	if st := power(t, s, ctx); st.Power != api.PowerLocked {
 		t.Fatalf("a wrong passphrase unlocked: %+v", st)
 	}
 	// unlocked without --start and without a boot that wanted it: stopped
-	op, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s, op, err)
 	if st := power(t, s, ctx); st.Power != api.PowerStopped || st.Locked != nil {
 		t.Fatalf("after the unlock: %+v", st)
@@ -138,49 +140,51 @@ func TestEncryptedVolumeLifecycle(t *testing.T) {
 	// lock: stopped and locked; unlock with start: running
 	op, err = s.JailAction(ctx, "vault", api.JailAction{Action: "start"})
 	mustOp(t, s, op, err)
-	op, err = s.LockJail(ctx, "vault")
+	op, err = s.LockVolume(ctx, "vault")
 	mustOp(t, s, op, err)
 	if st := power(t, s, ctx); st.Power != api.PowerLocked {
 		t.Fatalf("after the lock: %+v", st)
 	}
-	op, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass, Start: true})
+	op, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass, Start: true})
 	mustOp(t, s, op, err)
 	if st := power(t, s, ctx); st.Power != api.PowerRunning {
 		t.Fatalf("unlock --start: %+v", st)
 	}
 
 	// the passphrase changes; a locked jail cannot change it
-	op, err = s.ChangeJailPassphrase(ctx, "vault", api.JailPassphraseChange{Old: encWrong, New: encNew})
+	op, err = s.ChangeVolumePassphrase(ctx, "vault", api.VolumePassphraseChange{Old: encWrong, New: encNew})
 	failedWith(t, s, op, err, api.CodeBadPassphrase)
-	_, err = s.ChangeJailPassphrase(ctx, "vault", api.JailPassphraseChange{Old: encPass, New: "short"})
+	_, err = s.ChangeVolumePassphrase(ctx, "vault", api.VolumePassphraseChange{Old: encPass, New: "short"})
 	wantCode(t, err, api.CodeInvalid)
-	op, err = s.ChangeJailPassphrase(ctx, "vault", api.JailPassphraseChange{Old: encPass, New: encNew})
+	op, err = s.ChangeVolumePassphrase(ctx, "vault", api.VolumePassphraseChange{Old: encPass, New: encNew})
 	mustOp(t, s, op, err)
 	if e.Keys.Passphrase(encVol) != encNew {
 		t.Fatal("the passphrase did not change")
 	}
 	reboot(t, e, s, ctx)
-	op, err = s.ChangeJailPassphrase(ctx, "vault", api.JailPassphraseChange{Old: encNew, New: encPass})
+	op, err = s.ChangeVolumePassphrase(ctx, "vault", api.VolumePassphraseChange{Old: encNew, New: encPass})
 	failedWith(t, s, op, err, api.CodeLocked)
-	op, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encNew})
+	op, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encNew})
 	mustOp(t, s, op, err)
 
 	// the encryption of a volume cannot change later
-	j, _ := s.GetJail(ctx, "vault")
-	j.Spec.Volumes[0].Encrypted = false
-	_, err = s.UpdateJail(ctx, "vault", j, service.AnyGeneration)
+	v, _ := s.GetVolume(ctx, "vault")
+	v.Spec.Encrypted = false
+	_, err = s.UpdateVolume(ctx, "vault", v, service.AnyGeneration)
 	wantCode(t, err, api.CodeInvalid)
-	if !strings.Contains(hintOf(err), "encrypted") {
-		t.Fatalf("hint %q", hintOf(err))
-	}
 
-	// a jail without encrypted volumes has nothing to unlock
-	op, err = s.CreateJail(ctx, dtest.WebJail("plain"))
+	// a volume that is not encrypted has nothing to unlock
+	pop, err := s.CreateVolume(ctx, api.VolumeCreate{Metadata: api.ObjectMeta{Name: "plain"}})
+	mustOp(t, s, pop, err)
+	_, err = s.UnlockVolume(ctx, "plain", api.VolumeUnlock{Passphrase: encPass})
+	wantCode(t, err, api.CodeInvalid)
+	_, err = s.LockVolume(ctx, "plain")
+	wantCode(t, err, api.CodeInvalid)
+	// an encrypted volume is attached to one jail only
+	op, err = s.CreateJail(ctx, dtest.WebJail("second"))
 	mustOp(t, s, op, err)
-	_, err = s.UnlockJail(ctx, "plain", api.JailUnlock{Passphrase: encPass})
-	wantCode(t, err, api.CodeInvalid)
-	_, err = s.LockJail(ctx, "plain")
-	wantCode(t, err, api.CodeInvalid)
+	aop, err := s.AttachVolume(ctx, "second", api.VolumeAttachRequest{Volume: "vault", Mount: "/srv/v"})
+	failedWith(t, s, aop, err, api.CodeConflict)
 }
 
 func TestBootStartsALockedJailAfterItsUnlock(t *testing.T) {
@@ -195,15 +199,15 @@ func TestBootStartsALockedJailAfterItsUnlock(t *testing.T) {
 	if st := power(t, s, ctx); st.Power != api.PowerLocked {
 		t.Fatalf("%+v", st)
 	}
-	op, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s, op, err)
 	if st := power(t, s, ctx); st.Power != api.PowerRunning {
 		t.Fatalf("the jail the boot wanted is not started after its unlock: %+v", st)
 	}
 	// once started, the wish is gone: a later unlock after a lock leaves it stopped
-	op, err = s.LockJail(ctx, "vault")
+	op, err = s.LockVolume(ctx, "vault")
 	mustOp(t, s, op, err)
-	op, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s, op, err)
 	if st := power(t, s, ctx); st.Power != api.PowerStopped {
 		t.Fatalf("%+v", st)
@@ -220,16 +224,16 @@ func TestBootWishIsMemoryOnly(t *testing.T) {
 	e.Stop()
 	e2 := dtest.New(t, dtest.Options{Reuse: e, Mutate: noAutostart})
 	s2 := e2.D.Service()
-	op, err := s2.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err := s2.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s2, op, err)
 	if st := power(t, s2, ctx); st.Power != api.PowerStopped {
 		t.Fatalf("%+v", st)
 	}
 	// the boot pass of the restarted daemon derives the wish again from boot.autostart
-	op, err = s2.LockJail(ctx, "vault")
+	op, err = s2.LockVolume(ctx, "vault")
 	mustOp(t, s2, op, err)
 	wantCode(t, s2.StartJail(ctx, dtest.SeedProject+"_vault"), api.CodeLocked)
-	op, err = s2.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err = s2.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s2, op, err)
 	if st := power(t, s2, ctx); st.Power != api.PowerRunning {
 		t.Fatalf("%+v", st)
@@ -242,27 +246,27 @@ func TestUnlockLockout(t *testing.T) {
 	createVault(t, s, ctx)
 	reboot(t, e, s, ctx)
 	for i := 0; i < 5; i++ {
-		op, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encWrong})
+		op, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encWrong})
 		failedWith(t, s, op, err, api.CodeBadPassphrase)
 	}
-	_, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	_, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	wantCode(t, err, api.CodeRateLimited)
-	_, err = s.ChangeJailPassphrase(ctx, "vault", api.JailPassphraseChange{Old: encPass, New: encNew})
+	_, err = s.ChangeVolumePassphrase(ctx, "vault", api.VolumePassphraseChange{Old: encPass, New: encNew})
 	wantCode(t, err, api.CodeRateLimited)
 	clk.Advance(29 * time.Second)
-	_, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	_, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	wantCode(t, err, api.CodeRateLimited)
 	clk.Advance(2 * time.Second)
-	op, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s, op, err)
 	// a success forgets the failures: four wrong ones do not lock out
-	op, err = s.LockJail(ctx, "vault")
+	op, err = s.LockVolume(ctx, "vault")
 	mustOp(t, s, op, err)
 	for i := 0; i < 4; i++ {
-		op, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encWrong})
+		op, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encWrong})
 		failedWith(t, s, op, err, api.CodeBadPassphrase)
 	}
-	op, err = s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	op, err = s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	mustOp(t, s, op, err)
 }
 
@@ -279,7 +283,7 @@ func TestConcurrentUnlocks(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			op, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encWrong})
+			op, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encWrong})
 			if err == nil {
 				if op = wait(t, s, op); op.Error != nil {
 					err = &api.Error{Code: op.Error.Code}
@@ -302,10 +306,10 @@ func TestConcurrentUnlocks(t *testing.T) {
 	}
 	// exactly 5 wrong passphrases in all before the lockout
 	for ; bad < 5; bad++ {
-		op, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encWrong})
+		op, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encWrong})
 		failedWith(t, s, op, err, api.CodeBadPassphrase)
 	}
-	_, err := s.UnlockJail(ctx, "vault", api.JailUnlock{Passphrase: encPass})
+	_, err := s.UnlockVolume(ctx, "vault", api.VolumeUnlock{Passphrase: encPass})
 	wantCode(t, err, api.CodeRateLimited)
 	if st := power(t, s, ctx); st.Power != api.PowerLocked {
 		t.Fatalf("%+v", st)
@@ -315,18 +319,18 @@ func TestConcurrentUnlocks(t *testing.T) {
 func TestCreateEncryptedValidation(t *testing.T) {
 	_, s, _ := encEnv(t)
 	ctx := as(globalAdmin, dtest.SeedProject)
-	j := vaultJail()
+	enc := api.VolumeSpec{Encrypted: true}
 	for name, c := range map[string]struct {
-		in   api.JailCreate
+		in   api.VolumeCreate
 		code api.Code
 	}{
-		"no passphrase":       {api.JailCreate{Metadata: j.Metadata, Spec: j.Spec}, api.CodeInvalid},
-		"short":               {api.JailCreate{Metadata: j.Metadata, Spec: j.Spec, VolumePassphrase: "too-short"}, api.CodeInvalid},
-		"a line break":        {api.JailCreate{Metadata: j.Metadata, Spec: j.Spec, VolumePassphrase: "marker-long-enough\nx"}, api.CodeInvalid},
-		"nothing to encrypt":  {api.JailCreate{Metadata: j.Metadata, Spec: dtest.WebJail("vault").Spec, VolumePassphrase: encPass}, api.CodeInvalid},
-		"over 512 bytes long": {api.JailCreate{Metadata: j.Metadata, Spec: j.Spec, VolumePassphrase: strings.Repeat("p", 513)}, api.CodeInvalid},
+		"no passphrase":       {api.VolumeCreate{Metadata: api.ObjectMeta{Name: "v"}, Spec: enc}, api.CodeInvalid},
+		"short":               {api.VolumeCreate{Metadata: api.ObjectMeta{Name: "v"}, Spec: enc, Passphrase: "too-short"}, api.CodeInvalid},
+		"a line break":        {api.VolumeCreate{Metadata: api.ObjectMeta{Name: "v"}, Spec: enc, Passphrase: "marker-long-enough\nx"}, api.CodeInvalid},
+		"nothing to encrypt":  {api.VolumeCreate{Metadata: api.ObjectMeta{Name: "v"}, Passphrase: encPass}, api.CodeInvalid},
+		"over 512 bytes long": {api.VolumeCreate{Metadata: api.ObjectMeta{Name: "v"}, Spec: enc, Passphrase: strings.Repeat("p", 513)}, api.CodeInvalid},
 	} {
-		_, err := s.CreateJailWith(ctx, c.in)
+		_, err := s.CreateVolume(ctx, c.in)
 		if !api.IsCode(err, c.code) {
 			t.Errorf("%s: want %s, got %v", name, c.code, err)
 		}
@@ -334,7 +338,7 @@ func TestCreateEncryptedValidation(t *testing.T) {
 	// a host without the helper's key operations
 	e2 := dtest.New(t, dtest.Options{Clients: func(c *daemon.Clients) { c.Keys = nil }})
 	e2.Seed()
-	_, err := e2.D.Service().CreateJailWith(ctx, api.JailCreate{Metadata: j.Metadata, Spec: j.Spec, VolumePassphrase: encPass})
+	_, err := e2.D.Service().CreateVolume(ctx, api.VolumeCreate{Metadata: api.ObjectMeta{Name: "v"}, Spec: enc, Passphrase: encPass})
 	wantCode(t, err, api.CodeUnsupported)
 }
 

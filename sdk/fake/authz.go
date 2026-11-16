@@ -102,7 +102,9 @@ func classify(pattern string) (api.Permission, string) {
 	case strings.HasPrefix(path, "/api/v1/networks"), strings.HasPrefix(path, "/api/v1/images"),
 		strings.HasPrefix(path, "/api/v1/storage"), strings.HasPrefix(path, "/api/v1/projects"):
 		return rw(scopeHost)
-	case path == "/api/v1/events", path == "/api/v1/updates":
+	case path == "/api/v1/firewall/test":
+		return api.PermOperator, scopeProject
+	case path == "/api/v1/events", path == "/api/v1/updates", path == "/api/v1/boot":
 		return api.PermReadonly, scopeList
 	case path == "/api/v1/logs":
 		// the logs of many jails: the role that may read one jail's
@@ -142,7 +144,16 @@ func classify(pattern string) (api.Permission, string) {
 		case strings.HasSuffix(path, "/state"), strings.HasSuffix(path, "/snapshots"), strings.Contains(path, "/snapshots/"),
 			strings.HasSuffix(path, "/rollback"), strings.HasSuffix(path, "/upgrade"), strings.HasSuffix(path, "/config"), strings.HasSuffix(path, "/exec"),
 			strings.HasSuffix(path, "/access"), strings.HasSuffix(path, "/access/deny"),
-			strings.HasSuffix(path, "/unlock"), strings.HasSuffix(path, "/lock"):
+			strings.HasSuffix(path, "/unlock"), strings.HasSuffix(path, "/lock"), strings.HasSuffix(path, "/shell-setup"):
+			return api.PermOperator, scopeProject
+		}
+		return api.PermAdmin, scopeProject
+	}
+	if strings.HasPrefix(path, "/api/v1/volumes") {
+		switch {
+		case read:
+			return api.PermReadonly, scopeProject
+		case strings.HasSuffix(path, "/unlock"), strings.HasSuffix(path, "/lock"), strings.HasSuffix(path, "/snapshots"), strings.Contains(path, "/snapshots/"):
 			return api.PermOperator, scopeProject
 		}
 		return api.PermAdmin, scopeProject
@@ -275,6 +286,11 @@ func (s *Server) authorize(rc *reqInfo, pattern string, r *http.Request, authErr
 			return notFoundProject(rc.project)
 		}
 	case scopeList:
+		if strings.HasPrefix(r.URL.Path, "/api/v1/operations/") {
+			// one operation is looked up by its id, as the daemon does: the project of the request does not have to
+			// exist (a project rename is followed under the old name)
+			break
+		}
 		if q := r.URL.Query().Get("project"); q != "" && (!s.projectOK(q) || !rc.canProject(q)) {
 			return notFoundProject(q)
 		}

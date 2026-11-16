@@ -3,6 +3,7 @@ package priv
 import (
 	"context"
 	"io"
+	"maps"
 	"net/netip"
 	"os"
 	"regexp"
@@ -37,6 +38,21 @@ type Host interface {
 	ReadFile(ctx context.Context, path string) ([]byte, error)
 	WriteFile(ctx context.Context, q WriteFileReq) error
 	MkdirAll(ctx context.Context, q MkdirReq) error
+	// SetVolumeOwner sets the owner and mode of the empty root of a volume (see safefs.go).
+	SetVolumeOwner(ctx context.Context, q VolumeOwnerReq) error
+	// StaleMounts lists the mounts below the roots of jails that do not run, of a kind JailOps makes (stalemounts.go).
+	StaleMounts(ctx context.Context) ([]StaleMount, error)
+	// HealJail cleans up after one jail that does not run: the mounts below its root, and what its poststop hook removes
+	// (rctl rules, the pf anchor, its links). A running jail is refused.
+	HealJail(ctx context.Context, jail string) (HealJailRes, error)
+	// HealNetwork destroys the interfaces of the earlier network layout (a bridge, the gateway pair of a network) that
+	// no jail that runs uses (netheal.go).
+	HealNetwork(ctx context.Context) (HealNetRes, error)
+	// DNSUnbound writes the names of the running jails for the host's unbound (dnsunbound.go); without unbound-conf in
+	// priv.conf it does nothing and says it is off.
+	DNSUnbound(ctx context.Context, apply bool) (UnboundRes, error)
+	// ProbeSource says whether a host directory below an admin-host-mount directory is on a mount (see safefs.go).
+	ProbeSource(ctx context.Context, q SourceProbeReq) (SourceProbe, error)
 	Remove(ctx context.Context, path string) error
 	// RemoveAll removes a tree where that is allowed (see Config.recursiveRemovable), else it is Remove.
 	RemoveAll(ctx context.Context, path string) error
@@ -159,9 +175,18 @@ type Local struct {
 	hostNote func(msg string, a ...any) // logs what the timer and a restart do with a pending change
 
 	frozenMu sync.Mutex
-	frozen   map[string]int // directories a running command reads its configuration from: no writes meanwhile
+	// probes of host directories in flight, by path (ProbeSource), and how long a request waits for one
+	probeMu   sync.Mutex
+	probing   map[string]bool
+	probeWait time.Duration
+	probeFn   func(context.Context, SourceProbeReq) (SourceProbe, error) // tests
+	frozen    map[string]int                                             // directories a running command reads its configuration from: no writes meanwhile
 
 	wgMu sync.Mutex // one WireGuard operation at a time
+
+	keyLim keyLimiter // wrong passphrases of encrypted volumes
+
+	hostDirUID uint32 // the owner host-dir must have: root; the test user under WithoutChown
 }
 
 var _ Host = (*Local)(nil)
@@ -171,7 +196,9 @@ type LocalOption func(*Local)
 
 // WithoutChown makes failing chown calls non-fatal. For tests run as an
 // ordinary user.
-func WithoutChown() LocalOption { return func(l *Local) { l.noChown = true } }
+func WithoutChown() LocalOption {
+	return func(l *Local) { l.noChown, l.hostDirUID = true, uint32(os.Getuid()) }
+}
 
 // NewLocal returns a Local over the given dependencies.
 func NewLocal(cfg Config, d Deps, opts ...LocalOption) (*Local, error) {
@@ -195,13 +222,12 @@ func NewLocal(cfg Config, d Deps, opts ...LocalOption) (*Local, error) {
 // run.Exec. UNVERIFIED on FreeBSD.
 func NewSystem(cfg Config, opts ...LocalOption) (*Local, error) {
 	r := run.NewExec()
-	ncfg, err := cfg.Normalize()
-	if err != nil {
+	if _, err := cfg.Normalize(); err != nil {
 		return nil, err
 	}
 	return NewLocal(cfg, Deps{
 		ZFS: zfs.NewClient(r), Jails: jailos.NewCommand(r), PF: pfctl.NewCommand(r),
-		Net:    ifconfig.NewCommand(r, ifconfig.Options{Prefixes: ncfg.IfPrefixes}),
+		Net:    ifconfig.NewCommand(r, ifconfig.Options{}),
 		Runner: r, NDP: systemNDP{},
 	}, opts...)
 }
@@ -238,6 +264,23 @@ func (g zfsGuard) managed(ctx context.Context, name string) error {
 func (g zfsGuard) notRoot(name string) error {
 	if g.l.cfg.isRootDataset(name) {
 		return forbidden("a storage root cannot be changed through the helper (use storage.unregister)")
+	}
+	return nil
+}
+
+// rootMountProps are the properties that decide where and whether a storage root is mounted, and what it lets
+// through: the helper verified the root's directory (root, mode 0700) and keeps it that way, so neither the root's
+// mountpoint nor its mounting is changed through the helper.
+var rootMountProps = []string{"mountpoint", "canmount", "devices"}
+
+func (g zfsGuard) rootProps(name string, props []string) error {
+	if !g.l.cfg.isRootDataset(dsPart(name)) {
+		return nil
+	}
+	for _, p := range props {
+		if slices.Contains(rootMountProps, p) {
+			return forbidden("%s of a storage root cannot be changed through the helper", p)
+		}
 	}
 	return nil
 }
@@ -300,7 +343,13 @@ func (g zfsGuard) Set(ctx context.Context, name string, props map[string]string)
 	if len(props) == 0 {
 		return invalid("no properties")
 	}
+	if _, ok := props["jailed"]; ok {
+		return g.setJailed(ctx, name, props)
+	}
 	if err := g.l.cfg.zfsProps(ctx, props); err != nil {
+		return err
+	}
+	if err := g.rootProps(name, slices.Collect(maps.Keys(props))); err != nil {
 		return err
 	}
 	if err := g.managed(ctx, name); err != nil {
@@ -329,6 +378,9 @@ func (g zfsGuard) Inherit(ctx context.Context, name string, props ...string) err
 		if neverProps[p] {
 			return forbidden("property %s cannot be changed through the helper", p)
 		}
+	}
+	if err := g.rootProps(name, props); err != nil {
+		return err
 	}
 	if err := g.managed(ctx, name); err != nil {
 		return err
@@ -412,7 +464,7 @@ func (g zfsGuard) Destroy(ctx context.Context, name string, o zfs.DestroyOpts) e
 		return err
 	}
 	if err := g.l.d.ZFS.Destroy(ctx, name, o); err != nil {
-		return err
+		return withHolders(ctx, g.l.d.Runner, err)
 	}
 	g.l.grants.forget(name)
 	return nil
@@ -569,8 +621,12 @@ func (g zfsGuard) Send(ctx context.Context, o zfs.SendOpts, w io.Writer) error {
 }
 
 // neverReceived are properties a received stream must not carry: a stream
-// from another host could set a mountpoint over a host directory.
-var neverReceived = []string{"mountpoint", "sharenfs", "sharesmb", "jailed", "keylocation"}
+// from another host could set a mountpoint over a host directory, export the
+// data, or turn on device nodes, setuid or exec where the storage root has
+// them off. Excluded, they are inherited from the dataset's parent (devices
+// off from the root). The list holds only properties this ZFS knows: an
+// unknown name makes zfs receive fail.
+var neverReceived = []string{"mountpoint", "sharenfs", "sharesmb", "jailed", "keylocation", "devices", "setuid", "exec"}
 
 func (g zfsGuard) Receive(ctx context.Context, o zfs.ReceiveOpts, r io.Reader) error {
 	c := g.l.cfg
@@ -674,8 +730,17 @@ func (l *Local) mountOp(ctx context.Context, verb, dataset string) error {
 	if err := l.cfg.zfsDataset(dataset); err != nil {
 		return err
 	}
+	// unmounted, a root would leave its datasets to be mounted below a directory the helper did not check
+	if err := (zfsGuard{l}).notRoot(dataset); err != nil {
+		return err
+	}
 	if err := (zfsGuard{l}).managed(ctx, dataset); err != nil {
 		return err
+	}
+	if verb == "unmount" {
+		// What an earlier stop left below the root of a jail that does not run (a devfs under root/dev, stacked by each
+		// failed stop) keeps the dataset busy for good: it comes off first.
+		l.cleanStaleMountsOfDataset(ctx, dataset)
 	}
 	_, err := l.d.Runner.Run(ctx, run.Cmd{Name: "zfs", Args: []string{verb, dataset}, Timeout: 60 * time.Second})
 	if err != nil {

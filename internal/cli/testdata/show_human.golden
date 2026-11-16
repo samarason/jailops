@@ -1,0 +1,93 @@
+$ jailops list
+! No jails in project main. Create one with: jailops jail create NAME --image IMAGE --network NETWORK --storage STORAGE
+
+$ jailops network list
+! No networks. Create one with: jailops network create NAME --ipv4 10.50.0.1/24 --uplink IFACE --nat
+
+$ jailops image list
+! No images. Create one with: jailops image create freebsd-15-1 --release 15.1-RELEASE, then jailops image build freebsd-15-1
+
+$ jailops list web*
+! No jails in project main match.
+
+$ jailops storage show fast
+Storage fast
+  Dataset:      tank/jailops
+  Compression:  zstd
+  Pool:         tank (ONLINE)
+  Size:         1.0 TiB
+  Used:         1.0 GiB
+  Available:    1023.0 GiB
+  Age:          3h
+
+$ jailops network show lan
+Network lan
+  Uplink:     em0
+  IPv4:       10.20.0.0/24, gateway 10.20.0.1, NAT
+  IPv4 range: 10.20.0.10-10.20.0.20
+  IPv6:       none
+  Addresses:  0 used, 11 free
+  Age:        3h
+
+$ jailops image show freebsd-15
+Image freebsd-15
+  System:    freebsd 15.0-RELEASE (amd64)
+  Source:    pkgbase
+  Aliases:   stable -> g1
+  Keeps:     every generation
+  Age:       3h
+  Nightly:   off ('jailops image set freebsd-15 --auto-upgrade' turns it on)
+
+Generations
+  GEN   FREEBSD   PACKAGES   AGE   USED BY
+  g1    -         -          3h    -
+
+$ jailops project show main
+Project main
+  Hosts:       this host
+  Networks:    lan
+  Storage:     default
+  Firewall:    none
+  Images:      any
+  Age:         3h
+
+Usage
+  Jails:       0 (no quota)
+  CPU:         0 cores (no quota)
+  Memory:      0 B (no quota)
+  Disk:        0 B
+  Addresses:   0 (no quota)
+
+$ jailops storage show fast -o yaml
+metadata:
+  name: fast
+  uuid: <uuid>
+  host: <uuid>
+  scope: host
+  generation: 1
+  created_at: "2026-03-01T09:00:00Z"
+  updated_at: "2026-03-01T09:00:00Z"
+spec:
+  dataset: tank/jailops
+  compression: zstd
+status:
+  pool: tank
+  health: ONLINE
+  size: 1099511627776
+  used: 1073741824
+  available: 1098437885952
+
+$ jailops jail list -c name,ipv4 --sort ipv4
+NAME   IPV4
+web    10.20.0.15 (lan)
+
+$ jailops jail list -c name,ipv4,gen
+! usage: columns name, ipv4, gen are not in one table (columns of -o wide: name, state, image, gen, addresses, autostart, age)
+! hint: run 'jailops jail list --help' for usage
+[exit 2]
+
+$ jailops firewall policy list -c name,age
+! usage: unknown column "age" (columns: name, default-in, default-out, rules, raw)
+! hint: run 'jailops firewall policy list --help' for usage
+[exit 2]
+

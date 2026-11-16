@@ -21,6 +21,15 @@ with the join `token` and the `config` file: secrets, returned once, never store
 Reads need the operator role and never carry a private or preshared key; changes need a global admin. SDK:
 `c.WireGuard()`. The extension `interface_descriptions` says the host describes its interfaces (`net.descriptions`).
 
+**Firewall test** ([networking-ipv6.md](networking-ipv6.md#would-it-pass)): `POST /api/v1/firewall/test` (extension `firewall_test`, operator in the project) takes `FirewallTestRequest` (`from`, `to`, `proto`, `port`, `icmp_type`, `family`) and answers `FirewallTestResult`: `verdict` (`pass`, `block`, `unknown`), `cases` (one per address pair: the `hops` with the anchor, interface, direction, `verdict`, `decided_by`, `skipped` (the allow rules a deny rule won over, and the disabled rules the packet would have met) and `loaded_matches_rendered`) and `caveats`. It changes nothing.
+
+**Boot plan** ([operations.md](operations.md#start-at-boot)): `GET /api/v1/boot` (extension `boot_plan`, readonly) answers `BootPlan`:
+what the daemon starts after a boot of the host, in order (`order`: `position`, `project`, `jail`, `priority`, `depends`,
+`reason` `autostart` or `dependency of NAME`, `running`), and the jails it does not start with the reason (`not_started`:
+a cycle, a dependency that does not exist, an encrypted volume that waits for its passphrase, a jail that depends on one
+of those). The order is that of the whole host; a caller sees the jails of the project it names, or with `all_projects=true`
+of every project it may use, in the same order and numbered again. SDK: `c.BootPlan(ctx, allProjects)`.
+
 **Logs** ([logging.md](logging.md)): `GET /api/v1/logs` (extension `logs_unified`, operator) merges the end of one file
 (`file`, default `messages`) of the jails of `?project=` (or of every project the caller may use with `all_projects=true`)
 by time: `jail` (repeatable), `label=k=v` (repeatable), `app`, `app_logs=true`, `tail`, `since`, `grep`, and `cursor`,
@@ -30,14 +39,46 @@ the `next` map of the previous reply as JSON, to follow. Reply `LogsRead`: `line
 `LogForward`: `spec.sinks` and `status` with `origin` config or api, `generation` as ETag and each sink's state; `PUT`
 takes `LogForwardSpec` and `If-Match`, `DELETE` returns to `jailopsd.yaml`) and `POST /api/v1/logs/forward/test`
 (`{"sink": NAME}`, one tagged line). SDK: `c.Logs()` (`Read`, `Forward`, `SetForward`, `ResetForward`, `TestForward`).
-**Encrypted volumes** (extension `volume_unlock`, [storage.md](storage.md#encrypted-volumes)): a volume with `encrypted:
-true` is created when `POST /api/v1/jails` carries `volume_passphrase` next to `metadata` and `spec` (`JailCreate`).
-`POST /api/v1/jails/{name}/unlock` (`JailUnlock`: `passphrase`, `start`; operator), `POST .../lock` (operator) and
-`POST .../passphrase` (`JailPassphraseChange`: `old_passphrase`, `new_passphrase`; admin) answer operations whose result
-is the `Jail`. A locked jail has `status.power` `locked` and `status.locked` (the volume names); starting it answers
-`locked` (409), a wrong passphrase fails the operation with `bad_passphrase` (403), five in a row make the jail answer
-`rate_limited` (429) for 30 seconds. A passphrase is never in a reply. SDK: `Jails().CreateWithPassphrase`, `Unlock`,
-`Lock`, `ChangePassphrase`; the fake serves them and records the bodies with the passphrases replaced.
+**Volumes** (extension `volumes`, [storage.md](storage.md#volumes)): a volume is an object of a project, `kind: Volume`
+(`spec`: `storage`, `size`, `uid`, `gid`, `mode`, `encrypted`, `path`, `watch`, `probe`, `on_loss`, `comment`; `status`: `dataset`,
+`mountpoint`, `used`, `locked`, `state`, `detail`, `attached_to`, `warnings`). A volume with a `path` is a directory of the host
+([storage.md](storage.md#host-directories-as-volumes)): only a global administrator makes or attaches one, it has no dataset,
+snapshots, size, key or backup (those answer `invalid`), `status.state` is `ok` or `lost` with `status.detail`, and a start of a
+jail that attaches a lost one answers `busy`. The events `volume-lost`, `volume-restored` and `volume-remounted` follow its watch. `GET|POST /api/v1/volumes`, `GET|PUT|PATCH|DELETE /api/v1/volumes/{name}` (a PUT changes the
+labels, the comment and the size, and the watch of a host directory; the rest is fixed at creation; `POST` and `DELETE` answer operations; a volume that a jail
+attaches is not deleted: `busy`). `POST /api/v1/volumes` takes `VolumeCreate` (`metadata`, `spec`, `passphrase` for an
+encrypted volume). A jail attaches volumes in its spec, `volumes: [{volume, mount, read_only}]`, which a create, a PUT and a
+config change all check (the volume exists in the project, the jail is stopped, an encrypted volume has one jail);
+`GET|POST /api/v1/jails/{name}/volumes` (`VolumeAttachRequest`: `volume`, `mount`, `read_only`, `copy_existing`) and `DELETE
+/api/v1/jails/{name}/volumes/{volume}` attach and detach as operations whose result is the `Jail`. Snapshots:
+`GET|POST /api/v1/volumes/{name}/snapshots`, `DELETE .../snapshots/{snapshot}` and `POST .../rollback` (`VolumeRollback`:
+`snapshot`, `confirm_data_loss`). Encrypted volumes: `POST /api/v1/volumes/{name}/unlock` (`VolumeUnlock`: `passphrase`,
+`start`; operator), `POST .../lock` (operator) and `POST .../passphrase` (`VolumePassphraseChange`: `old_passphrase`,
+`new_passphrase`; admin) answer operations whose result is the `Volume`. A jail that attaches a locked volume has
+`status.power` `locked` and `status.locked` (the volume names); starting it answers `locked` (409), a wrong passphrase fails
+the operation with `bad_passphrase` (403), five in a row make the volume answer `rate_limited` (429) for 30 seconds. A
+passphrase is never in a reply. SDK: `c.Volumes()` (`Create`, `Get`, `List`, `Update`, `Delete`, `Unlock`, `Lock`,
+`ChangePassphrase`, `Rollback`, `Snapshots`), `Jails().AttachVolume`, `DetachVolume`, `Volumes`.
+
+**Backups of volumes** (extension `backup_run`): a volume is a backup of its own. A `Backup` has `spec.kind` (`volume`; absent for a
+jail), `spec.jail` and `spec.jail_uuid` naming the volume and its UUID, and `spec.volume` (its `VolumeSpec`). A policy backs up the
+volumes of the jails it selects and the volumes whose labels match, each once per run; `BackupPolicySpec.exclude_volumes` and
+`BackupRunRequest.no_volumes` (`POST /api/v1/backups/run`) leave them out. `POST /api/v1/restores` with a volume backup restores a
+new volume (the operation's result is the `Volume`; `as` names it, a volume is never replaced; `passphrase` makes an encrypted one
+and is never stored or logged); with a jail backup it first restores the volumes the project lacks from their newest backup, or
+restores the jail with no volume attachments with `no_volumes`.
+
+**Renames** (extension `rename`, [design.md](design.md#88-renames)): `POST /api/v1/networks/{name}/rename`,
+`/api/v1/firewall/address-sets/{name}/rename`, `/api/v1/firewall/policies/{name}/rename`, `/api/v1/profiles/{name}/rename`,
+`/api/v1/jails/{name}/rename` (a stopped jail), `/api/v1/images/{name}/rename`, `/api/v1/projects/{name}/rename` (its
+jails stopped), `/api/v1/volumes/{name}/rename` (the jails that attach it stopped), `/api/v1/storage/{name}/rename`,
+`/api/v1/backup-targets/{name}/rename`, `/api/v1/backup-policies/{name}/rename`, `/api/v1/certificates/{name}/rename`,
+`/api/v1/users/{name}/rename` and `/api/v1/wireguard/{name}/rename`, body `Rename` (`new_name`, `dry_run`), `If-Match` checked against the object's generation. A dry run
+answers at once with `RenameResult`: `changes` (`kind` object, reference, dataset, anchor, interface, file or state;
+`object`; `detail`), `counts`, `steps` and `warnings`; a rename answers an operation whose result is the same. All of it
+changes or none of it. Global admin for networks, images, projects, storage, backup targets, certificates, users and WireGuard tunnels, the project's admin for the others. An update
+(`PUT`, `PATCH`) never changes a name. SDK: `Resource.Rename` (`c.Networks().Rename`, `c.Firewall().Policies().Rename`,
+...) and `c.Jails().Rename`; the fake serves them.
 
 ## Reaching it
 
@@ -50,9 +91,30 @@ is the `Jail`. A locked jail has `status.power` `locked` and `status.locked` (th
         sdk.WithClientCert(cert)))              // pinned mTLS; or sdk.WithToken(token)
 
 Every request about something a project owns names the project (`?project=`, `sdk.WithProject`); there is no default project.
+
+Request bodies are read strictly: a member the request type does not have (a misspelled `dry_run`, say), a member spelled
+with other cases, a member twice and anything after the JSON value answer `invalid` (400) with a message that names the
+member. The `status` of an object read and sent back is ignored; maps such as `labels` and merge patches (`PATCH`) take any
+key. Answers are `Cache-Control: no-store`. An anonymous `GET /api/v1` tells the API version, the extensions and the role
+only. The credential goes in the `Authorization` header; a token in the query string authenticates nothing.
 The SDK refuses plain `http://` to anything but loopback.
 
+An error the daemon did not expect answers `internal` (500) with the text `internal error` and the id of the request in the
+hint; the cause, which can carry paths and command output of the host, is in the daemon's log under that id. A port forward
+(a redirect rule of a firewall policy, a `proxy.*` key of a jail or profile) answers `forbidden` (403) to anyone but a global
+administrator and `invalid` (400) on a host port or an address that is the host's own. The firewall objects of a project are
+bounded: a policy has at most 500 rules, an address set 5000 members, a project 200 policies, 200 address sets and 20000 set
+members together (`quota_exceeded` or `invalid`).
+
 Declarative management of everything the API can create is `jailops-sync` ([fleet-sync.md](fleet-sync.md)).
+
+## Liveness and readiness
+
+`GET /healthz` (liveness: `ok`, always 200) and `GET /readyz` (readiness: `ok` with 200 once start-up finished and the
+helper and the database answer, else 503 `not ready: CLASS` with CLASS `starting`, `stopping`, `helper`, `storage` or
+`store`, cached for 2 seconds) are plain text and public, for load balancers and monitors
+([exposure.md](exposure.md#load-balancers-and-monitors)). The state of the host itself is `GET /api/v1/doctor`, which
+needs a global identity ([operations.md](operations.md#what-to-monitor)).
 
 ## Host management
 
@@ -95,7 +157,7 @@ unless it is confirmed. The timer is the helper's own; the daemon only reads it.
 | Route | Role | What |
 |---|---|---|
 | `GET /api/v1/host/firewall` | readonly, global | kind `HostFirewall`: `spec` is what was applied last, or the default before any apply (a hand-written `pf.conf` is not read back into fields); `status`: `managed`, `config_enabled`, `helper_enabled`, `file_exists`, `file_managed`, `drift` (`pf.conf`, `pf_enable`, `pf_rules`), `applied`, `pf_enabled`, `rules` (in plain words), `warnings` (ssh open to the world), `pending`, `console_port`. Always readable |
-| `PUT /api/v1/host/firewall` | admin, global | body `{"spec": {...}, "dry_run": true, "confirm_within": 120, "i_know": false}`; reply `HostChange` with `diff`, `rules`, `actions`, `warnings` and, after a real change, `snapshot` and `pending` |
+| `PUT /api/v1/host/firewall` | admin, global | body `{"spec": {...}, "dry_run": true, "confirm_within": 120, "confirm_lockout": false}`; reply `HostChange` with `diff`, `rules`, `actions`, `warnings` and, after a real change, `snapshot` and `pending` |
 | `GET /api/v1/host/pending` | readonly, global | `HostPending`: `pending` (`id`, `module`, `snapshot`, `created`, `deadline`, `seconds_left`, `confirm_within`) and `last`, how the last one ended (`confirmed`, `reverted`, `timed_out`, `reverted_at_boot`, `revert_failed`) |
 | `POST /api/v1/host/pending/confirm` | admin, global | body `{"id": "..."}` optional; keeps the change; reply `HostPending` |
 | `POST /api/v1/host/pending/revert` | admin, global | the same; puts the snapshot back now |
@@ -120,7 +182,7 @@ the daemon. `nat` other than `none` is `unsupported`. `confirm_within` is 10 to 
 
 A real change is refused with `forbidden` (detail `guard: lockout`) when the address the request came from could reach
 neither an ssh port nor the console under the new rules, and with `invalid` (detail `guard: unknown_peer`) when that address
-is unknown (the unix socket, a request through a hub) unless `i_know` is set; a dry run reports both as `warnings`. While a
+is unknown (the unix socket, a request through a hub) unless `confirm_lockout` is set; a dry run reports both as `warnings`. While a
 change waits for its confirmation every other change of the host (`PUT` of a module, a restore) answers `busy` with the id
 of the pending change in `detail.pending`. In Go:
 

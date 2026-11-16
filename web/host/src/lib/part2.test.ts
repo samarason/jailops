@@ -8,7 +8,7 @@ import type { JailSpec, Profile } from '@jailops/shared/api/types'
 
 const msgs = { int: 'int', size: 'size', rate: 'rate', mac: 'mac', address: 'addr', listen: 'listen', bool: 'bool', name: 'name', enum: (o: string[]) => 'enum ' + o.join('|') }
 const key = (n: string) => ALL_KEYS.find((k) => k.name === n)!
-const spec: JailSpec = { image: 'freebsd-15@stable', resources: { cpu: 2, memory: '2G' }, network: [{ network: 'lan', ipv4: 'auto', mtu: 1500 }], volumes: [{ name: 'data', mount: '/var/db', quota: '10G' }], boot: { autostart: true }, packages: ['nginx'], profiles: ['web-limits'] }
+const spec: JailSpec = { image: 'freebsd-15-1', resources: { cpu: 2, memory: '2G' }, network: [{ network: 'lan', ipv4: 'auto', mtu: 1500 }], volumes: [{ volume: 'data', mount: '/var/db' }], boot: { autostart: true }, packages: ['nginx'], profiles: ['web-limits'] }
 
 describe('project scope', () => {
   it('adds ?project= only to project-level routes', () => {
@@ -45,7 +45,7 @@ describe('config keys from the registry', () => {
   it('reads and writes by path, including devices', () => {
     expect(getValue(spec, key('limits.cpu'))).toBe('2')
     expect(getValue(spec, key('nic.<device>.mtu'), 'eth0')).toBe('1500')
-    expect(getValue(spec, key('disk.<device>.quota'), 'data')).toBe('10G')
+    expect(getValue(spec, key('disk.<device>.mount'), 'data')).toBe('/var/db')
     const n = setValue(spec, key('nic.<device>.mtu'), 'eth0', '1400')
     expect(n.network![0].mtu).toBe(1400)
     expect(spec.network![0].mtu).toBe(1500) // the input is not mutated
@@ -63,7 +63,7 @@ describe('config keys from the registry', () => {
   it('lists rows per device and flattens set keys', () => {
     const names = rowsFor(spec).map((r) => r.name)
     expect(names).toContain('nic.eth0.mtu')
-    expect(names).toContain('disk.data.quota')
+    expect(names).toContain('disk.data.mount')
     expect(names).toContain('limits.memory')
     expect(flatten(spec)['boot.autostart']).toBe('true')
   })
@@ -109,7 +109,7 @@ describe('trust', () => {
     expect(scopeValid([], true)).toBe(true)
   })
   it('builds the exact remote add command', () => {
-    expect(remoteAddCommand('host.example:8443', 'jbc_x.y')).toBe('jailops remote add host.example:8443 --token jbc_x.y')
+    expect(remoteAddCommand('host.example:8443', 'jbc_x.y')).toBe('jailops remote add myhost host.example:8443 --token jbc_x.y')
   })
 })
 

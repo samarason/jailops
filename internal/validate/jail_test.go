@@ -54,23 +54,3 @@ func TestUpdatePolicyShellAndProvisionValidation(t *testing.T) {
 		}
 	}
 }
-
-func TestHostMountValidation(t *testing.T) {
-	spec := func(m ...api.HostMount) api.JailSpec { return api.JailSpec{Image: "fb@stable", HostMounts: m} }
-	if err := JailSpec("web", spec(api.HostMount{Source: "/tank/media", Target: "/mnt/media", ReadOnly: true})); err != nil {
-		t.Fatal(err)
-	}
-	for name, s := range map[string]api.JailSpec{
-		"relative source":   spec(api.HostMount{Source: "tank/media", Target: "/mnt/media"}),
-		"relative target":   spec(api.HostMount{Source: "/tank/media", Target: "mnt"}),
-		"dot dot":           spec(api.HostMount{Source: "/tank/../etc", Target: "/mnt/x"}),
-		"onto the root":     spec(api.HostMount{Source: "/tank/media", Target: "/"}),
-		"two on one target": spec(api.HostMount{Source: "/tank/a", Target: "/mnt/x"}, api.HostMount{Source: "/tank/b", Target: "/mnt/x"}),
-		"over a volume": {Image: "fb@stable", Volumes: []api.VolumeMount{{Name: "data", Mount: "/mnt/x"}},
-			HostMounts: []api.HostMount{{Source: "/tank/a", Target: "/mnt/x"}}},
-	} {
-		if err := JailSpec("web", s); err == nil {
-			t.Errorf("%s was accepted", name)
-		}
-	}
-}

@@ -38,6 +38,7 @@ async function submit(): Promise<void> {
     <form class="panel login-card" @submit.prevent="submit">
       <header><h1>{{ brand }}</h1><span class="faint mono">{{ session.info?.hostname }}</span></header>
       <div class="body">
+        <div v-if="session.demo" class="callout info" role="note" data-test="login-demo-banner"><span>{{ s.app.demoBanner }}</span></div>
         <p class="muted">{{ s.login.lead }}</p>
         <div class="tabs" role="tablist">
           <button type="button" role="tab" :aria-selected="mode === 'token'" @click="mode = 'token'">{{ s.login.tabToken }}</button>
@@ -62,7 +63,7 @@ async function submit(): Promise<void> {
         <ErrorPanel v-if="error" :error="error" />
         <div class="row" style="margin-top: 12px">
           <button class="btn btn-primary" type="submit" :disabled="busy">{{ busy ? s.login.working : s.login.submit }}</button>
-          <a v-if="!session.demo" class="btn btn-ghost" href="/?demo">{{ s.login.demo }}</a>
+          <a v-if="session.demoAvailable && !session.demo" class="btn btn-ghost" href="/?demo">{{ s.login.demo }}</a>
         </div>
       </div>
     </form>

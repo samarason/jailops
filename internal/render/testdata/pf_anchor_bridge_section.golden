@@ -1,9 +1,0 @@
-# into the jail from the host and from routed networks
-block drop out quick on jo9gb inet6 proto icmp6 from any to any icmp6-type { routeradv, redir }
-pass out quick on jo9gb inet6 proto icmp6 from any to { 2001:db8:1::100, fe80::/10, ff02::1:ff00:0/104 } icmp6-type { neighbrsol, neighbradv } label "jo-74e5ced72560"
-pass out quick on jo9gb inet6 proto icmp6 from any to 2001:db8:1::100 icmp6-type { unreach, toobig, timex, paramprob } label "jo-d5f0f28c7f14"
-# rule 1: web
-pass out quick on jo9gb inet proto tcp from any to 10.20.0.10 port 80 label "jo-a276714b31ff"
-pass out quick on jo9gb inet6 proto tcp from any to 2001:db8:1::100 port 80 label "jo-89771f88d49b"
-block drop out quick on jo9gb inet from any to 10.20.0.10
-block drop out quick on jo9gb inet6 from any to 2001:db8:1::100

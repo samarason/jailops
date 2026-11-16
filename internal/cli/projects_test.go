@@ -22,42 +22,43 @@ func TestProjectsStorageNetworks(t *testing.T) {
 	h := newHarness(t)
 	h.seed()
 	tr := h.transcript()
-	tr.ok("network", "create", "br-web", "--ipv4", "10.50.0.1/24", "--ipv6", "fd50::1/64")
+	tr.ok("network", "create", "web", "--ipv4", "10.50.0.1/24", "--ipv6", "fd50::1/64")
 	tr.do("", "network", "create", "bad", "--ipv4", "10.50.0.1/24", "--subnet", "10.1.0.0/24")
 	tr.do("", "network", "create", "bad", "--ipv4", "nonsense")
-	tr.ok("network", "show", "br-web", "-o", "yaml")
+	tr.ok("network", "show", "web", "-o", "yaml")
 	tr.ok("storage", "create", "fast", "--dataset", "tank/fast", "--compression", "zstd")
 	tr.do("", "storage", "create", "nodataset")
 	tr.do("", "storage", "create", "bad", "--dataset", "nodash")
 	tr.ok("storage", "list")
 	tr.ok("storage", "show", "fast", "-o", "name")
 
-	tr.ok("project", "create", "web", "--description", "front end")
-	tr.ok("project", "set", "web", "--network", "br-web", "--storage", "fast=500G", "--max-jails", "2", "--max-memory", "8G")
-	tr.do("", "project", "set", "web", "--network", "br-web=10.50.0.100-10.50.0.150") // a network is granted whole
+	tr.ok("project", "create", "web", "--comment", "front end")
+	tr.ok("network", "grant", "web", "--project", "web")
+	tr.ok("storage", "grant", "fast", "--project", "web", "--quota", "500G")
+	tr.ok("project", "set", "web", "--max-jails", "2", "--max-memory", "8G")
 	tr.ok("project", "show", "web")
 	tr.ok("project", "list")
 	tr.do("", "network", "grant", "lan", "--project", "web") // lan belongs to the project main
 	tr.do("", "network", "grant", "lan")
-	tr.ok("network", "revoke", "br-web", "--project", "web")
-	tr.ok("network", "grant", "br-web", "--project", "web")
-	tr.ok("project", "set", "web", "--revoke-storage", "fast")
-	tr.ok("project", "set", "web", "--storage", "fast=500G")
+	tr.ok("network", "revoke", "web", "--project", "web")
+	tr.ok("network", "grant", "web", "--project", "web")
+	tr.ok("storage", "revoke", "fast", "--project", "web")
+	tr.ok("storage", "grant", "fast", "--project", "web", "--quota", "500G")
 
 	// Jails go to the project that is named; the network and the storage are named too.
-	tr.ok("create", "nginx", "--project", "web", "--image", "freebsd-15@stable", "--memory", "1G", "--cpu", "1", "--network", "br-web", "--storage", "fast")
+	tr.ok("create", "nginx", "--project", "web", "--image", "freebsd-15@stable", "--memory", "1G", "--cpu", "1", "--network", "web", "--storage", "fast")
 	tr.ok("list", "--project", "web")
 	tr.ok("list")
 	tr.do("", "list", "--project", "nowhere")
 	tr.ok("project", "show", "web", "-o", "json")
-	tr.ok("create", "n2", "--project", "web", "--image", "freebsd-15@stable", "--memory", "1G", "--cpu", "1", "--network", "br-web", "--storage", "fast")
-	_, errs, code := tr.do("", "create", "n3", "--project", "web", "--image", "freebsd-15@stable", "--memory", "1G", "--cpu", "1", "--network", "br-web", "--storage", "fast")
+	tr.ok("create", "n2", "--project", "web", "--image", "freebsd-15@stable", "--memory", "1G", "--cpu", "1", "--network", "web", "--storage", "fast")
+	_, errs, code := tr.do("", "create", "n3", "--project", "web", "--image", "freebsd-15@stable", "--memory", "1G", "--cpu", "1", "--network", "web", "--storage", "fast")
 	if code != 5 || !strings.HasPrefix(errs, "quota_exceeded:") {
 		t.Fatalf("quota: %d %s", code, errs)
 	}
 	tr.do("", "project", "delete", "-y", "web")     // not empty
 	tr.do("", "project", "delete", "-y", "default") // there is no such project
-	tr.ok("project", "create", "shop", "--new-network", "--hosts", "h1,h2", "--storage", "fast")
+	tr.ok("project", "create", "shop", "--new-network", "--hosts", "h1,h2")
 	tr.golden("projects")
 }
 
@@ -74,8 +75,10 @@ func TestProjectSwitchPerRemote(t *testing.T) {
 	if _, errs, code := tr.do("", "create", "x", "--image", "freebsd-15@stable"); code != 2 || len(h.srv.Requests()) != before {
 		t.Fatalf("create without a project: %d %q", code, errs)
 	}
-	tr.ok("project", "create", "web", "--new-network", "--storage", "default")
-	tr.ok("project", "create", "db", "--new-network", "--storage", "default")
+	tr.ok("project", "create", "web", "--new-network")
+	tr.ok("storage", "grant", "default", "--project", "web")
+	tr.ok("project", "create", "db", "--new-network")
+	tr.ok("storage", "grant", "default", "--project", "db")
 	tr.ok("project", "switch")
 	tr.ok("project", "switch", "web")
 	tr.ok("project", "list")
@@ -112,7 +115,7 @@ func TestIdentityScopeRefused(t *testing.T) {
 	h := newHarness(t)
 	for _, args := range [][]string{
 		{"token", "create", "x"}, {"user", "create", "x"}, {"cert", "create", "x", "--fingerprint", strings.Repeat("ab", 32)},
-		{"trust", "add", "--name", "x", "--role", "operator"},
+		{"cert", "enroll", "x", "--role", "operator"},
 		{"token", "create", "x", "--projects", "default", "--global"},
 	} {
 		out, errs, code := h.run("", args...)
@@ -153,14 +156,14 @@ func TestTrustWorkflow(t *testing.T) {
 	atr := admin.transcript()
 	atr.ok("project", "create", "web")
 
-	out, errs, code := atr.do("", "trust", "add", "--name", "laptop", "--role", "operator", "--projects", "web", "--ttl", "15m")
+	out, errs, code := atr.do("", "cert", "enroll", "laptop", "--role", "operator", "--projects", "web", "--expires", "15m")
 	token := strings.TrimSpace(out)
 	if code != 0 || !strings.HasPrefix(token, sdk.TrustTokenPrefix) || strings.Count(token, "\n") != 0 || !strings.Contains(errs, "shown only once") {
-		t.Fatalf("trust add: %d %q %q", code, out, errs)
+		t.Fatalf("cert enroll: %d %q %q", code, out, errs)
 	}
-	atr.do("", "trust", "add", "--name", "laptop", "--role", "operator", "--projects", "web") // name taken? token only
-	atr.do("", "trust", "add", "--role", "operator", "--global")
-	atr.do("", "trust", "add", "--name", "ghost", "--role", "operator", "--projects", "nope")
+	atr.do("", "cert", "enroll", "laptop", "--role", "operator", "--projects", "web") // name taken? token only
+	atr.do("", "cert", "enroll", "--role", "operator", "--global")
+	atr.do("", "cert", "enroll", "ghost", "--role", "operator", "--projects", "nope")
 
 	// The new client has its own configuration and joins with the token.
 	client := &harness{t: t, srv: srv, ts: ts, dir: filepath.Join(dir, "client"), env: map[string]string{}, cfgFile: filepath.Join(dir, "client", "config.yaml")}
@@ -168,18 +171,18 @@ func TestTrustWorkflow(t *testing.T) {
 	client.env["JAILOPS_CONFIG"] = client.cfgFile
 	ctr := client.transcript()
 	host := strings.TrimPrefix(ts.URL, "https://")
-	_, errs, code = ctr.do("", "remote", "add", host, "--token", "joc_garbage")
+	_, errs, code = ctr.do("", "remote", "add", "trusting", host, "--token", "joc_garbage")
 	if code != 2 {
 		t.Fatalf("garbage token: %d %s", code, errs)
 	}
-	_, errs, code = ctr.do("", "remote", "add", host, "--token", token, "--dry-run")
+	_, errs, code = ctr.do("", "remote", "add", "trusting", host, "--token", token, "--dry-run")
 	if code != 0 {
 		t.Fatalf("dry-run: %d %s", code, errs)
 	}
 	if _, err := os.Stat(client.cfgFile); err == nil {
 		t.Fatal("dry-run wrote the config")
 	}
-	out, errs, code = ctr.do("", "remote", "add", host, "--token", token, "--name", "trusting")
+	out, errs, code = ctr.do("", "remote", "add", "trusting", host, "--token", token)
 	if code != 0 || strings.Contains(errs, "Pin this certificate") || !strings.Contains(out, "trusted as laptop (operator, web)") {
 		t.Fatalf("remote add: %d %q %q", code, out, errs)
 	}
@@ -195,7 +198,7 @@ func TestTrustWorkflow(t *testing.T) {
 	ctr.ok("whoami", "-o", "json")
 	ctr.ok("remote", "list")
 	// Single use: the token is spent.
-	_, _, code = ctr.do("", "remote", "add", host, "--token", token, "--name", "again")
+	_, _, code = ctr.do("", "remote", "add", "again", host, "--token", token)
 	if code != 3 {
 		t.Fatalf("replayed token: %d", code)
 	}
@@ -213,19 +216,19 @@ func TestTrustWorkflow(t *testing.T) {
 		t.Fatalf("other project must be not_found: %d", code)
 	}
 
-	atr.ok("trust", "list")
-	atr.ok("trust", "show", "laptop")
-	atr.ok("trust", "edit", "laptop", "-f", writeFile(t, dir, "e.yaml", "kind: Certificate\nmetadata: {name: laptop}\nspec:\n  permission: readonly\n  fingerprint: "+certFP(t, admin, "laptop")+"\n  kind: client\n  projects: [web]\n", 0o644))
+	atr.ok("cert", "list")
+	atr.ok("cert", "show", "laptop")
+	atr.ok("cert", "edit", "laptop", "-f", writeFile(t, dir, "e.yaml", "kind: Certificate\nmetadata: {name: laptop}\nspec:\n  permission: readonly\n  fingerprint: "+certFP(t, admin, "laptop")+"\n  kind: client\n  projects: [web]\n", 0o644))
 	atr.ok("whoami")
 	ctr.ok("whoami")
-	atr.do("", "trust", "revoke", "laptop") // needs an answer
-	atr.ok("trust", "revoke", "-y", "laptop")
+	atr.do("", "cert", "revoke", "laptop") // needs an answer
+	atr.ok("cert", "revoke", "-y", "laptop")
 	_, _, code = ctr.do("", "whoami")
 	if code != 3 {
 		t.Fatalf("revoked identity still works: %d", code)
 	}
-	atr.ok("trust", "list")
-	atr.do("", "trust", "revoke", "-y", "laptop")
+	atr.ok("cert", "list")
+	atr.do("", "cert", "revoke", "-y", "laptop")
 	atr.ok("sessions", "list")
 	atr.do("", "sessions", "revoke", "-y", "nosuch")
 	atr.golden("trust")

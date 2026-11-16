@@ -246,8 +246,18 @@ func TestACMEChallengeHandler(t *testing.T) {
 			t.Errorf("%s: %d", p, code)
 		}
 	}
-	if code, _ := get("/.well-known/acme-challenge/tok1", "POST"); code != 404 {
-		t.Errorf("POST: %d", code)
+	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH", "OPTIONS"} {
+		if code, _ := get("/.well-known/acme-challenge/tok1", method); code != 404 {
+			t.Errorf("%s: %d", method, code)
+		}
+	}
+	if code, _ := get("/.well-known/acme-challenge/tok1", "HEAD"); code != 200 {
+		t.Errorf("HEAD: %d", code)
+	}
+	for _, p := range []string{"/.well-known/acme-challenge/TOK1", "/.well-known/acme-challenge/tok1%2F..", "/.well-known/acme-challenge/../acme-challenge/tok2", "/x/.well-known/acme-challenge/tok1"} {
+		if code, _ := get(p, "GET"); code != 404 {
+			t.Errorf("%s: %d", p, code)
+		}
 	}
 	if err := m.selfCheck(context.Background()); err != nil {
 		t.Errorf("self-check: %v", err)

@@ -135,6 +135,8 @@ export class HttpTransport implements Transport {
       if ((e as Error).name === 'AbortError') throw e
       throw new ApiError({ code: 'unreachable' as never, message: 'The server did not answer.', hint: 'Check that jailopsd is running and reachable.' })
     }
+    // a token the server no longer accepts is forgotten, not kept for the next page load
+    if (res.status === 401 && tok) storeToken('')
     let envelope: RawResponse['envelope']
     try {
       envelope = await res.json()
@@ -239,6 +241,11 @@ export class Client {
 
   onUnauthorized(fn: Listener): void {
     this.unauthorized.push(fn)
+  }
+
+  /** A server-sent event stream whose path goes through the request filter (the project) like any request. */
+  stream(path: string, h: StreamHandlers): EventStream {
+    return this.transport.stream(this.filter ? this.filter(path) : path, h)
   }
 
   private async send(method: string, path: string, body?: unknown, opts: { etag?: string; signal?: AbortSignal } = {}): Promise<RawResponse> {

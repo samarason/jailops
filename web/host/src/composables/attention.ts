@@ -1,6 +1,7 @@
 import type { Jail, Network, Remote, Backup, PoolUsage, DoctorReport } from '@jailops/shared/api/types'
 import { s } from '@/i18n'
-import { percent } from '@jailops/shared/lib/format'
+import { percent, sentence } from '@jailops/shared/lib/format'
+import { codeText } from '@jailops/shared/lib/describe'
 
 export interface Attention {
   key: string
@@ -25,7 +26,7 @@ export function attention(i: AttentionInput): Attention[] {
     const n = j.metadata.name
     if (j.status.power === 'error') out.push({ key: 'err:' + n, tone: 'danger', text: `${n}: ${s.state.error}`, to: `/jails/${n}` })
     for (const c of j.status.conditions ?? []) {
-      if (c.status === 'False') out.push({ key: `cond:${n}:${c.type}`, tone: 'danger', text: `${n}: ${c.type}${c.message ? ' - ' + c.message : ''}`, to: `/jails/${n}` })
+      if (c.status === 'False') out.push({ key: `cond:${n}:${c.type}`, tone: 'danger', text: s.overview.condition(n, c.reason ? codeText(c.reason) : sentence(c.type), c.message ?? ''), to: `/jails/${n}` })
     }
     const d = j.status.drift?.length ?? 0
     if (d) out.push({ key: 'drift:' + n, tone: 'warn', text: `${n}: ${s.overview.drift(d)}`, to: `/jails/${n}` })
@@ -42,8 +43,8 @@ export function attention(i: AttentionInput): Attention[] {
     if (b.status.failed) out.push({ key: 'bfail:' + b.metadata.name, tone: 'danger', text: s.overview.backupFailed(b.spec.jail, b.spec.snapshot), to: '/backups' })
   }
   const latest = new Map<string, Backup>()
-  for (const b of [...(i.backups ?? [])].sort((x, y) => (x.metadata.created_at ?? '').localeCompare(y.metadata.created_at ?? ''))) latest.set(b.spec.jail, b)
-  for (const b of latest.values()) if (!b.status.failed && !b.status.verified) out.push({ key: 'bunver:' + b.spec.jail, tone: 'warn', text: s.overview.backupUnverified(b.spec.jail), to: '/backups' })
+  for (const b of [...(i.backups ?? [])].sort((x, y) => (x.metadata.created_at ?? '').localeCompare(y.metadata.created_at ?? ''))) latest.set((b.spec.kind === 'volume' ? 'volume:' : 'jail:') + b.spec.jail, b)
+  for (const b of latest.values()) if (!b.status.failed && !b.status.verified) out.push({ key: 'bunver:' + (b.spec.kind === 'volume' ? 'volume:' : '') + b.spec.jail, tone: 'warn', text: s.overview.backupUnverified(b.spec.jail), to: '/backups' })
   const fails = (i.doctor?.checks ?? []).filter((c) => c.status === 'fail').length
   const warns = (i.doctor?.checks ?? []).filter((c) => c.status === 'warn').length
   if (fails) out.push({ key: 'doctor-fail', tone: 'danger', text: s.doctor.failing(fails), to: '/doctor' })

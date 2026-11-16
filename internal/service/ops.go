@@ -30,6 +30,7 @@ type liveOp struct {
 	cancelled bool
 	runs      []string
 	actor     Actor
+	stepStart map[string]time.Time // the steps of the plans that have begun and not yet ended
 }
 
 func newOpManager(s *Service) *opManager {
@@ -224,17 +225,81 @@ func (m *opManager) setProgress(lo *liveOp, p int) {
 	m.update(lo, func(o *api.Operation) { o.Progress = p })
 }
 
-// planEvent is the plan.Executor progress callback.
+// planEvent is the plan.Executor progress callback: it keeps the progress estimate and the time of every step.
 func (m *opManager) planEvent(ev plan.Event) {
-	if ev.Phase != plan.PhaseDone || ev.Total == 0 {
+	if ev.Total == 0 {
 		return
 	}
 	m.mu.Lock()
 	lo := m.byRun[ev.ID]
 	m.mu.Unlock()
-	if lo != nil {
-		m.setProgress(lo, (ev.Index+1)*100/ev.Total)
+	if lo == nil {
+		return
 	}
+	switch ev.Phase {
+	case plan.PhaseStart:
+		lo.mu.Lock()
+		if lo.stepStart == nil {
+			lo.stepStart = map[string]time.Time{}
+		}
+		lo.stepStart[ev.ID+"/"+ev.Step] = m.s.now()
+		lo.mu.Unlock()
+	case plan.PhaseDone:
+		// the step and the progress are one update of the operation: one write and one event instead of two for each
+		// step of every operation (about a fifth of the time of a create among thousands of jails)
+		m.addStepAt(lo, ev.Step, ev.ID+"/"+ev.Step, false, 0, max(0, min((ev.Index+1)*100/ev.Total, 99)))
+	case plan.PhaseFailed:
+		m.addStep(lo, ev.Step, ev.ID+"/"+ev.Step, true, 0)
+	}
+}
+
+// addStep records the end of a step that began at lo.stepStart[key].
+func (m *opManager) addStep(lo *liveOp, name, key string, failed bool, min time.Duration) {
+	m.addStepAt(lo, name, key, failed, min, -1)
+}
+
+// addStepAt is addStep that also sets the progress (when it is not negative) in the same update.
+func (m *opManager) addStepAt(lo *liveOp, name, key string, failed bool, min time.Duration, progress int) {
+	now := m.s.now()
+	lo.mu.Lock()
+	began, ok := lo.stepStart[key]
+	delete(lo.stepStart, key)
+	lo.mu.Unlock()
+	if !ok {
+		if progress >= 0 {
+			m.setProgress(lo, progress)
+		}
+		return
+	}
+	d := now.Sub(began)
+	if d < min && !failed {
+		if progress >= 0 {
+			m.setProgress(lo, progress)
+		}
+		return
+	}
+	m.s.log.Debug("operation step", "op", lo.op.ID, "step", name, "ms", d.Milliseconds(), "failed", failed)
+	m.update(lo, func(o *api.Operation) {
+		o.Steps = append(o.Steps, api.OperationStep{Name: name, DurationMS: d.Milliseconds(), Failed: failed})
+		if progress >= 0 && !o.Status.Final() {
+			o.Progress = progress
+		}
+	})
+}
+
+// Timed runs fn as a step of the operation that is not a step of a plan (the shell of a new jail, provisioning) and
+// records how long it took.
+func (h *OpHandle) Timed(name string, fn func() error) error {
+	key := "timed/" + name
+	h.lo.mu.Lock()
+	if h.lo.stepStart == nil {
+		h.lo.stepStart = map[string]time.Time{}
+	}
+	h.lo.stepStart[key] = h.m.s.now()
+	h.lo.mu.Unlock()
+	err := fn()
+	h.m.addStep(h.lo, name, key, err != nil, 100*time.Millisecond) // a step that took no time is not listed
+	return err
 }
 
 // toAPIError converts any error into an *api.Error, keeping codes that a

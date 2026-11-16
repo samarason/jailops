@@ -6,16 +6,19 @@ import { api } from '@/api/endpoints'
 import { useLoad } from '@jailops/shared/composables/load'
 import { runOp } from '@jailops/shared/composables/ops'
 import { isHub, hasExt } from '@jailops/shared/composables/session'
-import { ApiError } from '@jailops/shared/api/client'
-import { bytes } from '@jailops/shared/lib/format'
+import { bytes, sentence } from '@jailops/shared/lib/format'
+import { codeText } from '@jailops/shared/lib/describe'
+import { confirmAction } from '@jailops/shared/composables/confirm'
+import type { Condition } from '@jailops/shared/api/types'
 import Icon from '@jailops/shared/components/Icon.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
-import Modal from '@jailops/shared/components/Modal.vue'
-import ErrorPanel from '@jailops/shared/components/ErrorPanel.vue'
 import LoadState from '@jailops/shared/components/LoadState.vue'
 import QuotaBars from '@/components/QuotaBars.vue'
 import ProjectForm from '@/components/ProjectForm.vue'
-import { isGlobalAdmin, refreshProjects } from '@/composables/project'
+import { isGlobalAdmin, projectState, refreshProjects, switchProject } from '@/composables/project'
+import RenameDialog from '@/components/RenameDialog.vue'
+import { canRename } from '@/composables/rename'
+import { renamedAddress } from '@/lib/rename'
 
 const route = useRoute()
 const router = useRouter()
@@ -28,41 +31,45 @@ const l = useLoad(async () => {
 const p = computed(() => l.data.value?.project)
 const canWrite = computed(() => isGlobalAdmin())
 const editing = ref(false)
-const deleting = ref(false)
-const typed = ref('')
-const error = ref<ApiError | null>(null)
-const busy = ref(false)
+const renaming = ref(false)
+/** After a rename the page moves to the new address; the project switcher follows when it was the current one. */
+async function renamed(to: string): Promise<void> {
+  const from = name.value
+  if (projectState.current === from) switchProject(to)
+  await refreshProjects()
+  await router.replace(renamedAddress('project', from, to, route.fullPath) ?? `/projects/${encodeURIComponent(to)}`)
+}
 const notFound = computed(() => l.error.value?.code === 'not_found')
 
-async function del(): Promise<void> {
-  busy.value = true
-  error.value = null
-  try {
-    await runOp(s.projects.deleteTitle(name.value), () => api.projects.remove(name.value))
-    await refreshProjects()
-    await router.replace('/projects')
-  } catch (e) {
-    error.value = e instanceof ApiError ? e : new ApiError({ message: String(e) })
-  } finally {
-    busy.value = false
-  }
+// Deleting a project is tier 3: the name is typed, even when it is empty.
+function del(): void {
+  const n = name.value
+  confirmAction({
+    title: s.projects.deleteTitle(n), confirmLabel: s.projects.deleteGo, danger: true, text: s.projects.deleteText, typeName: n,
+    run: () => runOp(s.projects.deleteTitle(n), () => api.projects.remove(n)),
+    done: () => void refreshProjects().then(() => router.replace('/projects')),
+  })
 }
+/** A condition in words: "Host:bsd02" names the host, a reason code becomes a sentence. */
+const condWhat = (c: Condition) => (c.type.startsWith('Host:') ? c.type.slice(5) : sentence(c.type))
+const condText = (c: Condition) => s.projects.hostCondition(codeText(c.reason) || '', c.message ?? '')
 </script>
 
 <template>
   <div>
     <router-link class="back" to="/projects"><Icon name="chevronLeft" />{{ s.projects.back }}</router-link>
-    <p v-if="notFound" class="empty">{{ s.projects.notFound }}</p>
+    <template v-if="notFound"><div class="page-head"><h1>{{ s.app.notFoundTitle }}</h1></div><p class="empty panel">{{ s.projects.notFound }}</p></template>
     <LoadState :loading="l.loading.value" :error="notFound ? null : l.error.value" :has-data="!!p" @retry="l.reload">
       <div v-if="p" class="stack" :data-project-detail="p.metadata.name">
         <div class="page-head">
           <div class="row"><h1 class="mono">{{ p.metadata.name }}</h1><span v-if="p.spec.hosts?.length" class="badge info">{{ s.projects.fleet }}</span></div>
           <div class="row">
             <button class="btn" type="button" :disabled="!canWrite" data-test="edit-project" @click="editing = true">{{ s.projects.edit }}</button>
-            <button class="btn btn-danger" type="button" :disabled="!canWrite" @click="deleting = true; typed = ''; error = null">{{ s.projects.delete }}</button>
+            <button v-if="canRename('project')" class="btn" type="button" data-test="project-rename" @click="renaming = true">{{ s.rename.open(s.rename.kinds.project) }}</button>
+            <button class="btn btn-danger" type="button" :disabled="!canWrite" data-test="project-delete" @click="del">{{ s.projects.delete }}</button>
           </div>
         </div>
-        <p v-if="p.spec.description" class="muted">{{ p.spec.description }}</p>
+        <p v-if="p.spec.comment" class="muted">{{ p.spec.comment }}</p>
 
         <section class="panel"><header><h2>{{ s.projects.quotas }}</h2></header>
           <div class="body"><QuotaBars :project="p" />
@@ -84,40 +91,33 @@ async function del(): Promise<void> {
         </div>
 
         <section class="panel"><header><h2>{{ s.projects.firewall }}</h2></header>
-          <div class="body"><span v-if="p.spec.firewall" class="mono" data-test="mandatory-policy">{{ p.spec.firewall }}</span><span v-else class="faint">-</span>
+          <div class="body"><span v-if="p.spec.firewall_policies?.length" class="mono" data-test="mandatory-policy">{{ p.spec.firewall_policies.join(', ') }}</span><span v-else class="faint">-</span>
             <p class="muted" style="margin-top: 6px">{{ s.projects.images }}: <span class="mono">{{ p.spec.images?.join(', ') || s.projects.allImages }}</span></p></div>
         </section>
 
         <section v-if="p.status.conditions?.length" class="panel"><header><h2>{{ s.projects.conditions }}</h2></header>
-          <ul class="plain body"><li v-for="c in p.status.conditions" :key="c.type"><span class="pill" :class="c.status === 'True' ? 'ok' : 'danger'">{{ c.type }}</span> <span class="muted">{{ c.message }}</span></li></ul></section>
+          <ul class="plain body"><li v-for="c in p.status.conditions" :key="c.type"><span class="pill" :class="c.status === 'True' ? 'ok' : 'danger'">{{ condWhat(c) }}</span> <span class="muted">{{ condText(c) }}</span></li></ul></section>
 
         <section v-if="p.spec.hosts?.length" class="panel" data-section="hosts">
           <header><h2>{{ s.projects.hostStatus }}</h2><span class="mono faint">{{ p.spec.hosts.join(', ') }}</span></header>
           <p v-if="!l.data.value?.agg" class="empty">{{ s.projects.hubOnly }}</p>
-          <div v-else class="table-wrap"><table data-test="host-status">
-            <thead><tr><th>{{ s.projects.host }}</th><th>{{ s.hosts.title }}</th><th>{{ s.projects.applied }}</th><th class="num">{{ s.projects.jailsUsed }}</th><th class="hide-sm">{{ s.projects.memoryUsed }}</th></tr></thead>
+          <div v-else class="table-wrap"><table data-test="host-status" class="rtable">
+            <thead><tr><th>{{ s.projects.host }}</th><th>{{ s.projects.reach }}</th><th>{{ s.projects.status }}</th><th class="num">{{ s.projects.jailsUsed }}</th><th>{{ s.projects.memoryUsed }}</th></tr></thead>
             <tbody>
               <tr v-for="h in l.data.value.agg.hosts" :key="h.host" :data-host="h.host" :class="{ drift: !!h.error || !h.online }">
-                <td class="mono">{{ h.host }}</td>
-                <td><span class="pill" :class="h.online ? 'ok' : 'danger'">{{ h.online ? s.projects.online : s.projects.offline }}</span></td>
-                <td><span class="pill" :class="h.applied ? (h.in_sync ? 'ok' : 'warn') : 'danger'">{{ !h.applied ? s.projects.notApplied : h.in_sync ? s.projects.inSync : s.projects.outOfSync }}</span>
-                  <div v-for="c in h.conditions ?? []" :key="c.type" class="faint">{{ c.type }}: {{ c.reason }} {{ c.message }}</div>
-                  <div v-if="h.error" class="err" style="color: var(--danger)"><span class="mono">{{ h.error.code }}</span> {{ h.error.message }}</div></td>
-                <td class="num mono">{{ h.status?.jails ?? '-' }}</td><td class="mono hide-sm">{{ h.status ? bytes(h.status.memory_used) : '-' }}</td>
+                <td class="mono" :data-label="s.projects.host">{{ h.host }}</td>
+                <td :data-label="s.projects.reach"><span class="pill" :class="h.online ? 'ok' : 'danger'">{{ h.online ? s.projects.online : s.projects.offline }}</span></td>
+                <td :data-label="s.projects.status"><span class="pill" :class="h.applied ? (h.in_sync ? 'ok' : 'warn') : 'danger'">{{ !h.applied ? s.projects.notApplied : h.in_sync ? s.projects.inSync : s.projects.outOfSync }}</span>
+                  <div v-for="c in h.conditions ?? []" :key="c.type" class="muted" data-test="host-cond">{{ condText(c) }}</div>
+                  <div v-if="h.error" class="err" style="color: var(--danger)" :title="`${s.error.code}: ${h.error.code}`" data-test="host-error">{{ s.projects.noAnswer(h.host, h.error.message) }}</div></td>
+                <td class="num mono" :data-label="s.projects.jailsUsed">{{ h.status?.jails ?? '-' }}</td><td class="mono" :data-label="s.projects.memoryUsed">{{ h.status ? bytes(h.status.memory_used) : '-' }}</td>
               </tr>
-              <tr><th scope="row" colspan="3">{{ s.projects.total }}</th><td class="num mono">{{ l.data.value.agg.total.jails }}</td><td class="mono hide-sm">{{ bytes(l.data.value.agg.total.memory_used) }}</td></tr>
+              <tr><th scope="row" colspan="3">{{ s.projects.total }}</th><td class="num mono" :data-label="s.projects.jailsUsed">{{ l.data.value.agg.total.jails }}</td><td class="mono" :data-label="s.projects.memoryUsed">{{ bytes(l.data.value.agg.total.memory_used) }}</td></tr>
             </tbody></table></div>
         </section>
 
+        <RenameDialog :open="renaming" kind="project" :name="p.metadata.name" :etag="l.data.value?.etag" @close="renaming = false" @done="renamed" />
         <ProjectForm :open="editing" :project="p" :etag="l.data.value?.etag" :networks="l.data.value?.networks ?? []" :storage="l.data.value?.storage ?? []" @close="editing = false" @done="l.reload" />
-        <Modal :open="deleting" :title="s.projects.deleteTitle(p.metadata.name)" @close="deleting = false">
-          <form id="dp" @submit.prevent="del">
-            <Callout tone="danger">{{ s.projects.deleteText }}</Callout>
-            <div class="field" style="margin-top: 12px"><label for="dp-typed">{{ s.projects.typeName(p.metadata.name) }}</label><input id="dp-typed" v-model="typed" class="mono" type="text" autocomplete="off" spellcheck="false" /></div>
-            <ErrorPanel v-if="error" :error="error" />
-          </form>
-          <template #footer><button class="btn" type="button" @click="deleting = false">{{ s.app.cancel }}</button><button class="btn btn-danger" type="submit" form="dp" :disabled="busy || typed !== p.metadata.name" data-test="project-delete-go">{{ s.projects.delete }}</button></template>
-        </Modal>
       </div>
     </LoadState>
   </div>

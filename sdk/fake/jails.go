@@ -17,7 +17,6 @@ import (
 func (s *Server) setupJails() {
 	k := s.jails
 	k.asyncCreate, k.asyncDelete = true, true
-	k.noCreate = true // POST is jailCreate (volkeys.go): the body may carry a passphrase
 	k.keep = func(dst, old *api.Jail) { dst.Status = old.Status }
 	k.expand = func(j *api.Jail) any { return s.jailExpanded(j) }
 	k.validate = func(j, old *api.Jail) *api.Error {
@@ -27,8 +26,11 @@ func (s *Server) setupJails() {
 		if e := s.checkJail(j, old); e != nil {
 			return e
 		}
+		if e := s.checkAttachments(j, old); e != nil {
+			return e
+		}
 		if s.images.items[imageName(j.Spec.Image)] == nil {
-			return notFound("image", imageName(j.Spec.Image)).WithHint("create or import the image first")
+			return notFound("image", imageName(j.Spec.Image)).WithHint(s.imageCreateHint(j.Spec.Image))
 		}
 		if j.Spec.Delegate && (old == nil || !old.Spec.Delegate) {
 			// Only a global admin may delegate ZFS; the check lives in guard.
@@ -39,9 +41,6 @@ func (s *Server) setupJails() {
 	k.guard = func(rc *reqInfo, j *api.Jail, verb string) *api.Error {
 		if verb != "delete" && j.Spec.Delegate && !rc.id.Global {
 			return api.Errorf(api.CodeForbidden, "only a global admin may delegate ZFS to a jail")
-		}
-		if verb != "delete" && len(j.Spec.HostMounts) > 0 && !rc.id.Global {
-			return api.Errorf(api.CodeForbidden, "mounting host directories into a jail is granted by a global administrator only")
 		}
 		return nil
 	}
@@ -110,18 +109,8 @@ func (s *Server) assignJail(j, old *api.Jail) *api.Error {
 	return nil
 }
 
-// rateLimitWarnings is what the daemon says about a rate limit in a spec: it is not enforced.
-func rateLimitWarnings(sp api.JailSpec) []string {
-	for _, n := range sp.Network {
-		if n.Ingress != "" || n.Egress != "" {
-			return []string{"rate limits (nic ingress/egress) are stored but not enforced yet: no shaper is wired"}
-		}
-	}
-	return nil
-}
-
 func (s *Server) initJailStatus(j *api.Jail) {
-	j.Status = api.JailStatus{Power: api.PowerStopped, Generation: "g1", Warnings: rateLimitWarnings(j.Spec)}
+	j.Status = api.JailStatus{Power: api.PowerStopped, Generation: "g1"}
 	if i := strings.IndexByte(j.Spec.Image, '#'); i >= 0 {
 		j.Status.Generation = j.Spec.Image[i+1:]
 	} else if g := s.gens[imageName(j.Spec.Image)]; len(g) > 0 {
@@ -206,7 +195,15 @@ func (s *Server) jailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		if l := s.jails.items[jk].Status.Locked; act.Action != "stop" && len(l) > 0 {
 			return reply{err: api.Errorf(api.CodeLocked, "jail %q is locked: the encrypted volume(s) %s wait for a passphrase", name, strings.Join(l, ", ")).
-				WithHint("jailops jail unlock " + name)}
+				WithHint("jailops volume unlock " + l[0])}
+		}
+		if act.Action != "stop" {
+			for _, a := range s.jails.items[jk].Spec.Volumes {
+				if v := s.volumes.items[rc.project+"/"+a.Name]; v != nil && v.Spec.IsHostDir() && s.vol.lostDirs[v.Spec.Path] {
+					return reply{err: api.Errorf(api.CodeBusy, "volume %q is lost: the directory is not on a mount (%s)", a.Name, v.Spec.Path).
+						WithHint("mount it again; the jail starts when it is there")}
+				}
+			}
 		}
 		op := s.startOp(rc.project, "jails."+act.Action, act.Action+" jail "+name, map[string][]string{"jails": {"/api/v1/jails/" + name}}, func() (any, *api.Error) {
 			j := s.jails.items[jk]
@@ -617,7 +614,7 @@ func (s *Server) allocate(network string, v6 bool, project, jail string) (string
 	var rng, gw string
 	var excl []string
 	if v6 && n.Spec.IPv6 != nil {
-		rng, gw, excl = n.Spec.IPv6.Range, n.Spec.IPv6.Gateway, n.Spec.IPv6.Exclude
+		rng, excl = n.Spec.IPv6.Range, n.Spec.IPv6.Exclude
 	} else if !v6 && n.Spec.IPv4 != nil {
 		rng, gw, excl = n.Spec.IPv4.Range, n.Spec.IPv4.Gateway, n.Spec.IPv4.Exclude
 	} else {
@@ -708,6 +705,11 @@ func (s *Server) setupImages() {
 		if i.Spec.OS == "" || i.Spec.Release == "" {
 			return api.Errorf(api.CodeInvalid, "spec.os and spec.release are required")
 		}
+		if au := i.Spec.AutoUpgrade; au != nil && au.At != "" {
+			if _, err := time.Parse("15:04", au.At); err != nil || len(au.At) != 5 {
+				return api.Errorf(api.CodeInvalid, "spec.auto_upgrade.at %q is not a time of day such as 03:00", au.At)
+			}
+		}
 		return nil
 	}
 	k.beforeDelete = func(i *api.Image) *api.Error {
@@ -734,7 +736,27 @@ func (s *Server) setupImages() {
 		if len(s.aliases[i.Metadata.Name]) > 0 {
 			i.Status.Aliases = maps.Clone(s.aliases[i.Metadata.Name])
 		}
+		i.Status.AutoUpgrade = nil
+		if au := i.Spec.AutoUpgrade; au != nil && au.Enabled {
+			i.Status.AutoUpgrade = &api.ImageAutoUpgradeStatus{Next: nextAt(s.now(), au.At)}
+		}
 	}
+}
+
+// nextAt is the next time of day at (HH:MM, empty for the default) after now, in now's zone.
+func nextAt(now time.Time, at string) time.Time {
+	if at == "" {
+		at = api.DefaultAutoUpgradeAt
+	}
+	t, err := time.Parse("15:04", at)
+	if err != nil {
+		return time.Time{}
+	}
+	next := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
 }
 
 func (s *Server) genRefs(image string, n int) []string {

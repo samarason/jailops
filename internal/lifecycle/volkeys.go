@@ -2,7 +2,6 @@ package lifecycle
 
 import (
 	"context"
-	"errors"
 	"path"
 	"strings"
 
@@ -10,9 +9,9 @@ import (
 )
 
 // Encrypted volumes: a volume declared encrypted is created as its own ZFS encryption root with the passphrase a
-// person typed (aes-256-gcm, keyformat=passphrase, keylocation=prompt). Every encrypted volume of a jail has the same
-// passphrase. After a host boot their keys are not loaded: the jail is locked, it does not start, and an unlock loads
-// the keys. Lock stops the jail, unmounts the volumes and unloads the keys.
+// person typed (aes-256-gcm, keyformat=passphrase, keylocation=prompt). After a host boot the key is not loaded: the
+// jail that attaches it is locked and does not start, and an unlock of the volume loads the key. Lock unmounts the
+// volume and unloads the key.
 
 // volumeName is the name of a volume dataset (its last component).
 func volumeName(ds string) string { return path.Base(ds) }
@@ -58,7 +57,7 @@ func names(l []dsInfo) []string {
 func LockedError(key string, volumes []string) error {
 	_, plain := splitKey(key)
 	return api.Errorf(api.CodeLocked, "jail %q is locked: the encrypted volume(s) %s wait for a passphrase", plain, strings.Join(volumes, ", ")).
-		WithHint("jailops jail unlock "+plain).WithDetail("volumes", strings.Join(volumes, ","))
+		WithHint("jailops volume unlock "+volumes[0]).WithDetail("volumes", strings.Join(volumes, ","))
 }
 
 func (s *Service) refuseLocked(ctx context.Context, st *jailState) error {
@@ -94,91 +93,55 @@ func (s *Service) EncryptedVolumes(ctx context.Context, name string) ([]string, 
 	return names(encryptedVolumes(st)), nil
 }
 
-func (s *Service) keyedState(ctx context.Context, name string) (*jailState, []dsInfo, error) {
+func (s *Service) needKeys() error {
 	if s.Keys == nil {
-		return nil, nil, api.Errorf(api.CodeUnsupported, "this host has no key operations for encrypted volumes")
-	}
-	st, err := s.observe(ctx, name)
-	if err != nil {
-		return nil, nil, err
-	}
-	enc := encryptedVolumes(st)
-	if len(enc) == 0 {
-		_, plain := splitKey(name)
-		return nil, nil, api.Errorf(api.CodeInvalid, "jail %q has no encrypted volume", plain)
-	}
-	return st, enc, nil
-}
-
-// UnlockVolumes loads the keys of the encrypted volumes of a jail. Nothing is mounted: the start mounts the root
-// first and the volumes over it. A wrong passphrase unloads what this call loaded and answers bad_passphrase.
-func (s *Service) UnlockVolumes(ctx context.Context, name string, passphrase []byte) error {
-	st, _, err := s.keyedState(ctx, name)
-	if err != nil {
-		return err
-	}
-	locked, err := s.lockedVolumes(ctx, st)
-	if err != nil {
-		return err
-	}
-	var loaded []string
-	for _, v := range locked {
-		if err := s.Keys.LoadKey(ctx, v.DS, passphrase); err != nil {
-			for _, ds := range loaded {
-				_ = s.Keys.UnloadKey(ctx, ds)
-			}
-			return err
-		}
-		loaded = append(loaded, v.DS)
+		return api.Errorf(api.CodeUnsupported, "this host has no key operations for encrypted volumes")
 	}
 	return nil
 }
 
-// LockVolumes stops a jail, unmounts its datasets and unloads the keys of its encrypted volumes.
-func (s *Service) LockVolumes(ctx context.Context, name string) error {
-	_, enc, err := s.keyedState(ctx, name)
-	if err != nil {
+// UnlockVolume loads the key of an encrypted volume. Nothing is mounted: the volume is mounted on the host by the
+// start of the jail that attaches it. A wrong passphrase answers bad_passphrase.
+func (s *Service) UnlockVolume(ctx context.Context, st Storage, project, name string, passphrase []byte) error {
+	if err := s.needKeys(); err != nil {
 		return err
 	}
-	if err := s.StopJail(ctx, name); err != nil {
+	ds := VolumeDS(st, project, name)
+	if ks, err := s.Keys.KeyStatus(ctx, ds); err != nil {
 		return err
+	} else if ks == "available" {
+		return nil
 	}
-	var errs []error
-	for _, v := range enc {
-		if err := s.ZFS.Unmount(ctx, v.DS); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := s.Keys.UnloadKey(ctx, v.DS); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	return s.Keys.LoadKey(ctx, ds, passphrase)
 }
 
-// ChangePassphrase changes the passphrase of every encrypted volume of an unlocked jail. When one volume fails, the
-// volumes changed before it are changed back, so all volumes keep one passphrase.
-func (s *Service) ChangePassphrase(ctx context.Context, name string, oldPass, newPass []byte) error {
-	st, enc, err := s.keyedState(ctx, name)
-	if err != nil {
+// LockVolume unmounts an encrypted volume and unloads its key. The caller has stopped the jail that attaches it.
+func (s *Service) LockVolume(ctx context.Context, st Storage, project, name string) error {
+	if err := s.needKeys(); err != nil {
 		return err
 	}
-	if err := s.refuseLocked(ctx, st); err != nil {
+	ds := VolumeDS(st, project, name)
+	if err := s.ZFS.Unmount(ctx, ds); err != nil {
 		return err
 	}
-	for i, v := range enc {
-		if err := s.Keys.ChangeKey(ctx, v.DS, oldPass, newPass); err != nil {
-			var undo []error
-			for _, d := range enc[:i] {
-				if uerr := s.Keys.ChangeKey(ctx, d.DS, newPass, oldPass); uerr != nil {
-					undo = append(undo, uerr)
-				}
-			}
-			if len(undo) > 0 {
-				return errors.Join(err, api.Errorf(api.CodeInternal, "changing the passphrase back failed; the volumes %s now have the new passphrase", strings.Join(names(enc[:i]), ", ")))
-			}
-			return err
-		}
+	return s.Keys.UnloadKey(ctx, ds)
+}
+
+// ChangeVolumePassphrase changes the passphrase of an unlocked encrypted volume.
+func (s *Service) ChangeVolumePassphrase(ctx context.Context, st Storage, project, name string, oldPass, newPass []byte) error {
+	if err := s.needKeys(); err != nil {
+		return err
 	}
-	return nil
+	ds := VolumeDS(st, project, name)
+	if ks, err := s.Keys.KeyStatus(ctx, ds); err != nil {
+		return err
+	} else if ks != "available" {
+		return VolumeLockedError(name)
+	}
+	return s.Keys.ChangeKey(ctx, ds, oldPass, newPass)
+}
+
+// VolumeLockedError is the error of an operation that needs an unlocked volume.
+func VolumeLockedError(volume string) error {
+	return api.Errorf(api.CodeLocked, "volume %q is locked: it waits for a passphrase", volume).WithHint("jailops volume unlock " + volume)
 }

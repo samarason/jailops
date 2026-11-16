@@ -42,10 +42,6 @@ func (e *NetExec) Exec(ctx context.Context, st render.Step, jail string) error {
 	switch st.Op {
 	case render.OpRequireSysctl:
 		return e.requireSysctl(ctx, st.Arg)
-	case render.OpBridgeCreate:
-		return ignore(e.Net.BridgeCreate(ctx, st.Iface), api.CodeAlreadyExists)
-	case render.OpBridgeDestroy:
-		return ignore(e.Net.BridgeDestroy(ctx, st.Iface), api.CodeNotFound)
 	case render.OpSetDescription:
 		return e.Net.SetDescription(ctx, st.Iface, st.Arg)
 	case render.OpSetMTU:
@@ -77,33 +73,14 @@ func (e *NetExec) Exec(ctx context.Context, st render.Step, jail string) error {
 		return ignore(err, api.CodeAlreadyExists)
 	case render.OpEpairDestroy:
 		return ignore(e.Net.EpairDestroy(ctx, st.Iface), api.CodeNotFound)
-	case render.OpAddMember:
-		return ignore(e.Net.BridgeAddMember(ctx, st.Iface, st.Arg, false), api.CodeAlreadyExists)
-	case render.OpRemoveMember:
-		return ignore(e.Net.BridgeDeleteMember(ctx, st.Iface, st.Arg), api.CodeNotFound)
-	case render.OpSetPrivate:
-		return e.ifconfigCmd(ctx, st.Iface, "private", st.Arg)
-	case render.OpClearPrivate:
-		return ignore(e.ifconfigCmd(ctx, st.Iface, "-private", st.Arg), api.CodeNotFound)
 	case render.OpAddHostRoute:
 		return ignore(e.Net.RouteAdd(ctx, ifconfig.Route{Dest: st.Arg, Interface: st.Iface}), api.CodeAlreadyExists)
 	case render.OpDelHostRoute:
 		return ignore(e.Net.RouteDelete(ctx, ifconfig.Route{Dest: st.Arg, Interface: st.Iface}), api.CodeNotFound)
-	case render.OpSetStaticARP:
-		return e.ifconfigCmd(ctx, st.Iface, "staticarp")
-	case render.OpAddBridgeStat:
-		return e.ifconfigCmd(ctx, st.Iface, "static", st.Arg2, st.Arg)
-	case render.OpDelBridgeStat:
-		return ignore(e.ifconfigCmd(ctx, st.Iface, "deladdr", st.Arg), api.CodeNotFound)
-	case render.OpSetNeighbor, render.OpDelNeighbor:
-		a, err := netip.ParseAddr(st.Arg)
-		if err != nil {
-			return validate.Invalid("address", "bad address %q", st.Arg)
-		}
-		if st.Op == render.OpSetNeighbor {
-			return e.Net.NeighborSet(ctx, st.Iface, a, st.Arg2)
-		}
-		return ignore(e.Net.NeighborDelete(ctx, st.Iface, a), api.CodeNotFound)
+	case render.OpAddRejectRoute:
+		return ignore(e.Net.RouteAdd(ctx, ifconfig.Route{Dest: st.Arg, Reject: true}), api.CodeAlreadyExists)
+	case render.OpDelRejectRoute:
+		return ignore(e.Net.RouteDelete(ctx, ifconfig.Route{Dest: st.Arg, Reject: true}), api.CodeNotFound)
 	case render.OpNDPProxyAdd, render.OpNDPProxyDel:
 		return nil // the proxy manager of the loop owns the answered set
 	case render.OpLoadAnchor:
@@ -278,16 +255,22 @@ func (e *NetExec) execJail(ctx context.Context, st render.Step, jail string) err
 }
 
 // Satisfied reports whether the step's effect is already present. Steps whose
-// effect cannot be observed (routes, sysctl checks) are never satisfied; they
-// are idempotent.
+// effect cannot be observed (sysctl checks, and routes when the routing table cannot be read) are never satisfied;
+// they are idempotent.
 func Satisfied(st render.Step, obs *Observed) bool {
 	if obs == nil || st.Phase == render.PhaseJail {
 		return false
 	}
 	i, exists := obs.Ifaces[st.Iface]
 	switch st.Op {
-	case render.OpBridgeCreate, render.OpEpairCreate:
+	case render.OpEpairCreate:
 		return exists
+	case render.OpAddHostRoute, render.OpAddRejectRoute:
+		p, err := netip.ParsePrefix(st.Arg)
+		if err != nil || obs.Routes == nil {
+			return false
+		}
+		return obs.HasRoute(p, st.Iface, st.Op == render.OpAddRejectRoute)
 	case render.OpSetDescription:
 		return exists && i.Description == st.Arg
 	case render.OpSetMTU:
@@ -310,20 +293,6 @@ func Satisfied(st render.Step, obs *Observed) bool {
 		return false
 	case render.OpIfaceUp:
 		return exists && i.Up()
-	case render.OpAddMember:
-		for _, m := range i.Members {
-			if m.Name == st.Arg {
-				return true
-			}
-		}
-		return false
-	case render.OpSetPrivate:
-		for _, m := range i.Members {
-			if m.Name == st.Arg {
-				return m.Private
-			}
-		}
-		return false
 	case render.OpNDPProxyAdd, render.OpNDPProxyDel:
 		return true
 	}

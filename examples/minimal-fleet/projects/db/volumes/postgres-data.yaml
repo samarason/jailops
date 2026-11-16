@@ -1,0 +1,12 @@
+apiVersion: jailops/v1
+kind: Volume
+hosts: [web1]
+metadata:
+  name: postgres-data
+spec:
+  storage: fast
+  size: 80G
+  uid: 770
+  gid: 770
+  mode: "0700"
+  comment: the PostgreSQL cluster

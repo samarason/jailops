@@ -1,0 +1,42 @@
+$ jailops create web --image freebsd-15@stable --network lan --storage default --label env=prod
+jail/web created
+
+$ jailops list --label env=prod -o name
+web
+
+$ jailops stop --selector env=prod
+jail/web stopped
+
+$ jailops token create a --role operator --projects main -o name
+a
+! warning: this secret is shown only once and cannot be retrieved again; store it now.
+
+$ jailops cert enroll b --role operator --projects main --expires 15m -o name
+b
+! warning: this trust token is shown only once and works only once; hand it to the new client now.
+! trust for b (operator, main) can be claimed until 2026-03-01 09:15:00 UTC
+
+$ jailops user create carol --role operator --projects main --password-file <dir>/pw
+user/carol created
+
+$ jailops user set-password carol --password-file -
+user/carol password set; its sessions ended
+
+$ jailops user set-password carol --password-file - --generate
+! usage: --password-file and --generate exclude each other
+! hint: run 'jailops user set-password --help' for usage
+[exit 2]
+
+$ jailops backup policy create nightly -l env=prod --schedule 0 2 * * * --target usb --dry-run
+dry-run: would create backup policy nightly
+apiVersion: jailops/v1
+kind: BackupPolicy
+metadata:
+  name: nightly
+spec:
+  selector:
+    env: prod
+  targets:
+    - usb
+  schedule: 0 2 * * *
+

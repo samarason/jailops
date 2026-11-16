@@ -1,0 +1,125 @@
+$ jailops app install postgresql db --image freebsd-151@stable
+App postgresql installed as jail db (running)
+  Version:   18.6
+  Addresses: 10.20.0.10
+  Ports:     postgres 5432/tcp at 10.20.0.10:5432 The SQL port.
+  Access:    closed: nothing reaches it until jailops app allow db --from SOURCE
+  Data:      /var/db/postgres The cluster (data18).
+  Config:    /var/db/postgres/data18/postgresql.conf (restart postgresql) Server settings.
+             /var/db/postgres/data18/pg_hba.conf (restart postgresql) Who may connect.
+  Logs:      server /var/log/messages The port logs to syslog.
+  Snapshot:  app-installed (jailops jail rollback db --all --snapshot app-installed goes back to it)
+  Steps:     13 done
+Notes:
+  Connect from inside the jail with: jailops exec NAME -- su -l postgres -c psql
+
+$ jailops app install nginx web --image freebsd-151@stable
+App nginx installed as jail web (running)
+  Version:   1.30.6,3
+  Addresses: 10.20.0.11
+  Ports:     http 80/tcp at 10.20.0.11:80 (expose: forwarding is not set up yet) HTTP, the default site.
+  Access:    closed: nothing reaches it until jailops app allow web --from SOURCE
+  Data:      /usr/local/www The sites.
+  Config:    /usr/local/etc/nginx/nginx.conf (restart nginx) The server configuration.
+  Logs:      access /var/log/nginx/access.log One line per request.
+             error /var/log/nginx/error.log
+  Snapshot:  app-installed (jailops jail rollback web --all --snapshot app-installed goes back to it)
+  Steps:     11 done
+Notes:
+  Put the site under /usr/local/www.
+
+$ jailops firewall address-set create postgresql-allow --address jail:web --comment the web jail
+address set/postgresql-allow created
+
+$ jailops firewall policy create postgres
+firewall policy/postgres created
+
+$ jailops firewall rule add postgres in --action allow --proto tcp --from set:postgresql-allow --port 5432 --comment who may reach PostgreSQL
+firewall policy/postgres: rule 1 added: allow in tcp from set:postgresql-allow port 5432
+
+$ jailops config set db firewall.policies postgres
+jail/db configuration updated
+
+$ jailops firewall test --from jail:web --to jail:db --port 5432
+tcp port 5432 10.20.0.11 -> 10.20.0.10 (inet): PASS
+  web sends: allowed by the default of the anchor
+  db takes: allowed by policy postgres rule 1 "who may reach PostgreSQL"
+
+(-v shows the rendered pf rules and what the test does not cover)
+
+$ jailops firewall test --from jail:web --to jail:db --port 5433
+tcp port 5433 10.20.0.11 -> 10.20.0.10 (inet): BLOCK
+  web sends: allowed by the default of the anchor
+  db takes: blocked by the default of the anchor
+
+(-v shows the rendered pf rules and what the test does not cover)
+[exit 1]
+
+$ jailops firewall test --from jail:web --to jail:db --proto icmp
+icmp echoreq 10.20.0.11 -> 10.20.0.10 (inet): BLOCK
+  web sends: allowed by the default of the anchor
+  db takes: blocked by the default of the anchor
+
+(-v shows the rendered pf rules and what the test does not cover)
+[exit 1]
+
+$ jailops firewall test --from jail:web --to jail:db --port 5432 -o json
+{
+  "verdict": "pass",
+  "cases": [
+    {
+      "family": "inet",
+      "from": "10.20.0.11",
+      "to": "10.20.0.10",
+      "proto": "tcp",
+      "port": 5432,
+      "verdict": "pass",
+      "hops": [
+        {
+          "side": "source",
+          "jail": "web",
+          "anchor": "jailops/main/web",
+          "direction": "in",
+          "verdict": "pass",
+          "decided_by": {
+            "stage": "default",
+            "pf": "pass in quick all (fake default)"
+          }
+        },
+        {
+          "side": "destination",
+          "jail": "db",
+          "anchor": "jailops/main/db",
+          "direction": "out",
+          "verdict": "pass",
+          "decided_by": {
+            "stage": "policy",
+            "policy": "postgres",
+            "rule": 1,
+            "comment": "who may reach PostgreSQL",
+            "pf": "pass out quick (fake rule)"
+          }
+        }
+      ]
+    }
+  ],
+  "caveats": [
+    "the answer is for a new connection: a connection that is already open (pf keeps its state) is not asked about"
+  ]
+}
+
+$ jailops firewall test --to jail:db --port 5432
+! usage: --from and --to are required
+! hint: run 'jailops firewall test --help' for usage
+[exit 2]
+
+$ jailops firewall test --from jail:web --to jail:db
+! usage: --port is required: the protocol is tcp unless --proto says otherwise (for example --port 5432, or --proto icmp to test ping)
+! hint: run 'jailops firewall test --help' for usage
+[exit 2]
+
+$ jailops firewall test --from jail:web --to jail:nobody --port 5432
+! not_found: jail "nobody" not found
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
+[exit 4]
+

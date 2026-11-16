@@ -98,6 +98,17 @@ type Operation struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	// Progress is a 0..100 estimate when the operation can compute one.
 	Progress int `json:"progress,omitempty"`
+	// Steps lists the steps the operation ran, in order, with the time each took: where the time went.
+	Steps []OperationStep `json:"steps,omitempty"`
+}
+
+// OperationStep is one step of an operation and how long it took.
+type OperationStep struct {
+	Name string `json:"name"`
+	// DurationMS is the time the step took, in milliseconds.
+	DurationMS int64 `json:"duration_ms"`
+	// Failed is set when the step failed.
+	Failed bool `json:"failed,omitempty"`
 }
 
 // EventType names an event stream class.
@@ -126,6 +137,17 @@ type LifecycleEvent struct {
 	// Project is the project of the object; empty for host-level objects,
 	// whose events only global identities see.
 	Project string `json:"project,omitempty"`
+	// Detail is one line for a person, for the events the host itself raises (a ZFS error, a link going down, a limit
+	// a jail hit).
+	Detail string `json:"detail,omitempty"`
+}
+
+// OptionalExtensions are the names a server leaves out on purpose when it does not have the feature behind them (no
+// backup backend, no sealed-secrets identity, the host modules or the certificate manager off): a client's doctor does
+// not call them missing. Service.Extensions withholds exactly these.
+var OptionalExtensions = []string{
+	"backup_pull", "backup_push", "restore_preflight", "backup_key", "backup_run", "backup_verify",
+	"sealed_secrets", "host_identity", "host_firewall", "host_pending", "host_certificate",
 }
 
 // Extensions is the capability list of this API revision. New names are
@@ -184,7 +206,11 @@ var Extensions = []string{
 	"app_access",
 	"logs_unified",
 	"log_forward",
-	"volume_unlock",
+	"volumes",
 	"setup",
 	"host_certificate",
+	"jail_shell_setup",
+	"rename",
+	"boot_plan",
+	"firewall_test",
 }

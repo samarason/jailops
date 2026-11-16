@@ -3,12 +3,10 @@ kind: Network
 metadata:
   name: mail
 spec:
-  bridge: jo41
   uplink: vtnet0
   ipv4: {subnet: 10.41.0.0/24, gateway: 10.41.0.1, range: 10.41.0.2-10.41.0.254, nat: true}
   ipv6:
     mode: routed
     subnet: "2001:db8:abcd:1:2::/80"
-    gateway: "2001:db8:abcd:1:2::1"
     range: "2001:db8:abcd:1:2::10-2001:db8:abcd:1:2::ffff"
   dns: [2a01:4ff:ff00::add:1, 1.1.1.1]

@@ -2,7 +2,7 @@ $ jailops wireguard create office --address 10.99.0.1/24 --network lan --endpoin
 wireguard/office created
 
 $ jailops wireguard create bad --mode client --address 10.98.0.2/32
-! usage: a client is made from a join token: jailops wireguard join TOKEN
+! usage: a client is made from a join token: jailops wireguard join NAME --token-file TOKEN-FILE
 ! hint: run 'jailops wireguard create --help' for usage
 [exit 2]
 
@@ -61,14 +61,25 @@ PEER     ADDRESS        HANDSHAKE   RECEIVED / SENT     ENDPOINT
 laptop   10.99.0.2/32   3h ago      1.0 MiB / 3.0 MiB   198.51.100.7:41000
 phone    10.99.0.3/32   never       0 B / 0 B           -
 
-$ jailops --dry-run wireguard join jwg1.eyJhZGRyZXNzIjpbIjEwLjk5LjAuMi8zMiJdLCJhbGxvd2VkX2lwcyI6WyIxMC45OS4wLjAvMjQiXSwiZW5kcG9pbnQiOiJ2cG4uZXhhbXBsZS5jb206NTE4MjAiLCJrZWVwYWxpdmUiOjI1LCJuYW1lIjoibGFwdG9wIiwicHJlc2hhcmVkX2tleSI6IllTSlV6ZHZvWW53UElzTFllZzRBVlJTdzE5d1Rxbk96NzNkaGptUER2REU9IiwicHJpdmF0ZV9rZXkiOiIrMERiOGMyTlhBT0tjRFpUaWVLT0oxQkF0cUtUaWNvZnk4V2NpWit5ZFAwPSIsInNlcnZlcl9wdWJsaWNfa2V5IjoidDZtUFFLRE5XOHI0empCUXdhdXU1eS9GclQ4Zm5FU28xVGd1SktPYmV6VT0ifQ
+$ jailops --dry-run wireguard join laptop --token-file <dir>/wg.token
 dry-run: would join a wireguard server
 token: (token, not shown)
+name: laptop
 
-$ jailops wireguard join jwg1.eyJhZGRyZXNzIjpbIjEwLjk5LjAuMi8zMiJdLCJhbGxvd2VkX2lwcyI6WyIxMC45OS4wLjAvMjQiXSwiZW5kcG9pbnQiOiJ2cG4uZXhhbXBsZS5jb206NTE4MjAiLCJrZWVwYWxpdmUiOjI1LCJuYW1lIjoibGFwdG9wIiwicHJlc2hhcmVkX2tleSI6IllTSlV6ZHZvWW53UElzTFllZzRBVlJTdzE5d1Rxbk96NzNkaGptUER2REU9IiwicHJpdmF0ZV9rZXkiOiIrMERiOGMyTlhBT0tjRFpUaWVLT0oxQkF0cUtUaWNvZnk4V2NpWit5ZFAwPSIsInNlcnZlcl9wdWJsaWNfa2V5IjoidDZtUFFLRE5XOHI0empCUXdhdXU1eS9GclQ4Zm5FU28xVGd1SktPYmV6VT0ifQ --name home --endpoint 203.0.113.10:51820
+$ jailops wireguard join laptop
+! usage: --token-file is required: the file with the join token, or - for standard input
+! hint: run 'jailops wireguard join --help' for usage
+[exit 2]
+
+$ jailops wireguard join
+! usage: accepts 1 arg(s), received 0
+! hint: run 'jailops wireguard join --help' for usage
+[exit 2]
+
+$ jailops wireguard join home --token-file <dir>/wg.token --endpoint 203.0.113.10:51820
 wireguard/home joined
 
-$ jailops wireguard join not-a-token
+$ jailops wireguard join broken --token-file <dir>/bad.token
 ! invalid: not a WireGuard join token
 ! hint: copy the whole token that `jailops wireguard peer add` printed; it starts with jwg1.
 [exit 2]

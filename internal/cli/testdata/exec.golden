@@ -15,7 +15,7 @@ $ jailops exec web -- nosuchprogram
 
 $ jailops exec ghost -- echo x
 ! not_found: jail "ghost" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops exec web

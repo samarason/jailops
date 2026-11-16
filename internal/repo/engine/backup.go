@@ -179,7 +179,7 @@ func (r *run) attempt(ctx context.Context, up Uploader, baseSnap *Snapshot, reas
 	var offset uint64
 	for _, st := range r.o.Streams {
 		ct := &counters{}
-		sr, slots, ms, reused, err := r.stream(ctx, pl, baseSnap, st, offset, reason, forceFull, ct)
+		sr, slots, ms, reused, err := r.streamOpened(ctx, pl, baseSnap, st, offset, reason, forceFull, ct)
 		if err != nil {
 			return nil, err
 		}
@@ -242,6 +242,22 @@ func (r *run) attempt(ctx context.Context, up Uploader, baseSnap *Snapshot, reas
 		return nil, err
 	}
 	return out, nil
+}
+
+// streamOpened is stream with the stream's own reader opened for it and closed again as soon as it has been read: every
+// file of the stream is read inside r.stream, what is left for the pipeline is chunks in memory.
+func (r *run) streamOpened(ctx context.Context, pl *pipeline, baseSnap *Snapshot, st Stream, offset uint64, reason string, forceFull bool, ct *counters) (sr StreamResult, slots []slot, ms format.Stream, reused []format.ID, err error) {
+	if st.OpenFS != nil {
+		fsys, closeFS, err := st.OpenFS(ctx)
+		if err != nil {
+			return sr, nil, ms, nil, fmt.Errorf("opening %s: %w", st.Name, err)
+		}
+		if closeFS != nil {
+			defer closeFS()
+		}
+		st.FS = fsys
+	}
+	return r.stream(ctx, pl, baseSnap, st, offset, reason, forceFull, ct)
 }
 
 // checkReused asks the repository about every distinct reused chunk, in batches,

@@ -39,12 +39,12 @@ func TestDecodeStrictRejectsUnknownKeys(t *testing.T) {
 }
 
 func TestNames(t *testing.T) {
-	for _, ok := range []string{"a", "web-1", "x_y.z", "0day"} {
+	for _, ok := range []string{"a", "web-1"} {
 		if err := CheckName(ok); err != nil {
 			t.Errorf("%q: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"", "A", "-a", ".a", "a b", "a/b", strings.Repeat("a", 129)} {
+	for _, bad := range []string{"", "A", "-a", ".a", "a b", "a/b", "x_y.z", "0day", "web-", strings.Repeat("a", 64)} {
 		if CheckName(bad) == nil {
 			t.Errorf("%q accepted", bad)
 		}

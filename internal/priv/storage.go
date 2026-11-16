@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"jailops.net/jailops/internal/sys/zfs"
 	"jailops.net/jailops/sdk/api"
 )
@@ -26,10 +28,78 @@ type RootStatus struct {
 	Error      string
 }
 
-// verifyRoot checks that ds can serve as a storage root: it exists as a
-// filesystem on an imported pool, carries jailops:managed=on set locally and
-// has an absolute mountpoint. It returns the mountpoint.
-func (l *Local) verifyRoot(ctx context.Context, ds string) (string, error) {
+// sealRoot makes a checked root safe to use: its directory belongs to root with mode 0700 (set when it is not, at
+// every start, reload and registration) and devices is off on the dataset, so every dataset below inherits it.
+func (l *Local) sealRoot(ctx context.Context, ds, mp string) error {
+	if err := l.sealRootDir(ds, mp); err != nil {
+		return err
+	}
+	if err := l.checkRootDir(ds, mp); err != nil {
+		return err
+	}
+	return l.devicesOff(ctx, ds)
+}
+
+// checkRootDir requires the directory at a root's mountpoint to belong to root with mode 0700. Jails keep setuid
+// programs and the files of their users below it; only this mode keeps the daemon's user and every other user of the
+// host from reaching them. Whatever is mounted there (the root, or nothing when it is not mounted), this holds.
+func (l *Local) checkRootDir(ds, mp string) error {
+	st, err := os.Lstat(mp)
+	if err != nil {
+		return invalid("mountpoint %s of %s: %v", mp, ds, err)
+	}
+	if !st.IsDir() {
+		return invalid("mountpoint %s of %s is not a directory", mp, ds)
+	}
+	if st.Mode().Perm() != 0o700 || st.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		return forbidden("mountpoint %s of %s has mode %04o; a storage root needs 0700 (chmod 0700 %s)", mp, ds, st.Mode().Perm(), mp)
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok && !l.cfg.noOwnerCheck && sys.Uid != 0 {
+		return forbidden("mountpoint %s of %s does not belong to root", mp, ds)
+	}
+	return nil
+}
+
+// sealRootDir gives the directory at a root's mountpoint to root with mode 0700, through a descriptor opened without
+// following a symlink.
+func (l *Local) sealRootDir(ds, mp string) error {
+	fd, err := unix.Open(mp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return invalid("mountpoint %s of %s: %v", mp, ds, err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return api.Errorf(api.CodeInternal, "stat %s: %v", mp, err)
+	}
+	if st.Uid != 0 || st.Gid != 0 {
+		if err := unix.Fchown(fd, 0, 0); err != nil && !l.noChown {
+			return api.Errorf(api.CodeInternal, "chown %s: %v", mp, err)
+		}
+	}
+	if st.Mode&0o7777 != 0o700 {
+		if err := unix.Fchmod(fd, 0o700); err != nil {
+			return api.Errorf(api.CodeInternal, "chmod %s: %v", mp, err)
+		}
+	}
+	return nil
+}
+
+// devicesOff sets devices=off on a storage root unless it is off already: every dataset below inherits it (a
+// received stream cannot set it, see neverReceived, nor can a request, see zfsProps).
+func (l *Local) devicesOff(ctx context.Context, ds string) error {
+	p, err := l.d.ZFS.Get(ctx, ds, "devices")
+	if err != nil {
+		return err
+	}
+	if v := p["devices"]; v.Value == "off" && v.Source == "local" {
+		return nil
+	}
+	return l.d.ZFS.Set(ctx, ds, map[string]string{"devices": "off"})
+}
+
+// rootMountpoint checks the properties of a storage root and returns its mountpoint.
+func (l *Local) rootMountpoint(ctx context.Context, ds string) (string, error) {
 	if err := l.cfg.checkRootName(ds); err != nil {
 		return "", err
 	}
@@ -73,7 +143,7 @@ func (l *Local) checkRootSystem(ctx context.Context, ds, mount string) error {
 		return err
 	}
 	for _, d := range list {
-		if m := d.Props["mountpoint"]; cleanAbs(m) && l.cfg.overlapsSystem(m) {
+		if m := d.Props["mountpoint"]; cleanAbs(m) && l.cfg.shadowsSystem(m) {
 			return forbidden("%s (mountpoint %s) is part of the running system; %s cannot be a storage root", d.Name, m, ds)
 		}
 	}
@@ -119,8 +189,7 @@ func (l *Local) writeStorageFile(roots []string) error {
 	if st, err := os.Lstat(path); err == nil && !st.Mode().IsRegular() {
 		return forbidden("%s exists and is not a regular file", path)
 	}
-	tmp := path + ".jotmp"
-	_ = os.Remove(tmp)
+	tmp := filepath.Join(filepath.Dir(path), tmpName(filepath.Base(path)))
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return api.Errorf(api.CodeInternal, "storage file: %v", err)
@@ -182,7 +251,7 @@ func (l *Local) reloadLocked(ctx context.Context) error {
 		return err
 	}
 	for i := range cand {
-		mp, err := l.verifyRoot(ctx, cand[i].Dataset)
+		mp, err := l.rootMountpoint(ctx, cand[i].Dataset)
 		if err == nil {
 			err = l.checkRootSystem(ctx, cand[i].Dataset, mp)
 		}
@@ -192,6 +261,9 @@ func (l *Local) reloadLocked(ctx context.Context) error {
 					err = invalid("mountpoint %s overlaps %s", mp, cand[j].Mount)
 				}
 			}
+		}
+		if err == nil {
+			err = l.sealRoot(ctx, cand[i].Dataset, mp)
 		}
 		if err != nil {
 			cand[i].Err = err.Error()
@@ -235,6 +307,7 @@ func (l *Local) Storages(ctx context.Context) ([]string, error) {
 // jailops:managed=on locally, have an absolute mountpoint, not be a pool root
 // (unless allow-pool-root), not lie inside or contain another root (by name
 // or by mountpoint), and not be or contain a dataset of the running system.
+// Its directory is then given to root with mode 0700, and devices is set off.
 func (l *Local) RegisterStorage(ctx context.Context, dataset string) error {
 	if !isAdmin(ctx) {
 		return forbidden("registering a storage root needs the admin assertion")
@@ -258,7 +331,7 @@ func (l *Local) RegisterStorage(ctx context.Context, dataset string) error {
 			return forbidden("%s contains the storage root %s", dataset, e.Dataset)
 		}
 	}
-	mp, err := l.verifyRoot(ctx, dataset)
+	mp, err := l.rootMountpoint(ctx, dataset)
 	if err != nil {
 		return err
 	}
@@ -269,6 +342,10 @@ func (l *Local) RegisterStorage(ctx context.Context, dataset string) error {
 		if e.active() && (within(e.Mount, mp) || within(mp, e.Mount)) {
 			return forbidden("mountpoint %s overlaps the mountpoint %s of %s", mp, e.Mount, e.Dataset)
 		}
+	}
+	// whatever mode the dataset was made with, 0700 from now on
+	if err := l.sealRoot(ctx, dataset, mp); err != nil {
+		return err
 	}
 	var persist []string
 	for _, e := range cur {

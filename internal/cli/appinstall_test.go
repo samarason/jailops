@@ -9,6 +9,7 @@ import (
 
 	"jailops.net/jailops/internal/cli"
 	"jailops.net/jailops/sdk/api"
+	"jailops.net/jailops/sdk/fake"
 )
 
 // An app is installed as a jail with one command; the report says how to
@@ -18,29 +19,29 @@ func TestAppInstall(t *testing.T) {
 	h := newHarness(t)
 	h.seed() // freebsd-15 is 15.0-RELEASE: too old for the definitions
 	h.srv.SeedImage(api.Image{Metadata: api.ObjectMeta{Name: "freebsd-151"},
-		Spec: api.ImageSpec{OS: api.OSFreeBSD, Release: "15.1-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}, Aliases: []string{"stable"}}})
+		Spec: api.ImageSpec{OS: api.OSFreeBSD, Release: "15.1-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}}})
 	h.srv.SeedGeneration("freebsd-151")
 	h.srv.SeedInvalidApp("broken", "title: is required")
 	tr := h.transcript()
 	tr.ok("app", "installed")
-	tr.ok("app", "install", "nginx", "--image", "freebsd-151@stable", "--dry-run")
-	tr.ok("app", "install", "nginx", "--image", "freebsd-151@stable")
-	tr.ok("app", "install", "postgresql", "--name", "db", "--image", "freebsd-151@stable", "--network", "lan", "--storage", "default", "--memory", "2G", "--disk", "20G", "--cpu", "2")
-	tr.ok("app", "install", "valkey", "--image", "freebsd-151@stable", "--no-wait")
+	tr.ok("app", "install", "nginx", "--image", "freebsd-151", "--dry-run")
+	tr.ok("app", "install", "nginx", "--image", "freebsd-151")
+	tr.ok("app", "install", "postgresql", "db", "--image", "freebsd-151", "--network", "lan", "--storage", "default", "--memory", "2G", "--disk", "20G", "--cpu", "2")
+	tr.ok("app", "install", "valkey", "--image", "freebsd-151", "--no-wait")
 	tr.ok("app", "installed")
 	tr.ok("app", "installed", "ng*")
 	tr.ok("app", "installed", "-o", "name")
 	tr.ok("list")
-	tr.do("", "app", "install", "nginx", "--image", "freebsd-151@stable")
-	tr.do("", "app", "install", "nginx", "--name", "web2")
-	tr.do("", "app", "install", "nginx", "--name", "web2", "--image", "freebsd-15@stable")
+	tr.do("", "app", "install", "nginx", "--image", "freebsd-151")
+	tr.ok("app", "install", "nginx", "web2", "--dry-run") // no --image: the highest release the host runs
+	tr.do("", "app", "install", "nginx", "web2", "--image", "freebsd-15")
 	tr.do("", "app", "install", "missing")
 	tr.do("", "app", "install", "broken")
-	tr.do("", "app", "install", "nginx", "--name", "web2", "--image", "freebsd-151@stable", "--network", "other")
+	tr.do("", "app", "install", "nginx", "web2", "--image", "freebsd-151", "--network", "other")
 	tr.do("", "app", "install")
 	tr.golden("appinstall")
 
-	out, _, code := h.run("", "app", "install", "nginx", "--name", "web3", "--image", "freebsd-151@stable", "-o", "json")
+	out, _, code := h.run("", "app", "install", "nginx", "web3", "--image", "freebsd-151", "-o", "json")
 	if code != 0 {
 		t.Fatal(out)
 	}
@@ -116,7 +117,7 @@ func TestAppInstallRollbackCommandIsReal(t *testing.T) {
 	h.srv.SeedImage(api.Image{Metadata: api.ObjectMeta{Name: "freebsd-151"},
 		Spec: api.ImageSpec{OS: api.OSFreeBSD, Release: "15.1-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}, Aliases: []string{"stable"}}})
 	h.srv.SeedGeneration("freebsd-151")
-	out, errs, code := h.run("", "app", "install", "nginx", "--image", "freebsd-151@stable")
+	out, errs, code := h.run("", "app", "install", "nginx", "--image", "freebsd-151")
 	if code != 0 {
 		t.Fatal(out, errs)
 	}
@@ -141,5 +142,36 @@ func TestAppInstallDefaultImage(t *testing.T) {
 	_, errs, code := h.run("", "app", "install", "nginx")
 	if code != 2 || !strings.Contains(errs, `image "freebsd-15" is release 15.0-RELEASE`) {
 		t.Fatalf("%d %s", code, errs)
+	}
+}
+
+// Without any image, app install and jail create say how to make the base image: the two commands, for the image of
+// the host's release when the server reports it and of 15.1-RELEASE when it does not. No alias is proposed; one the
+// request named is kept.
+func TestNoImageHintNamesTheCommands(t *testing.T) {
+	h := newHarness(t, fake.WithRelease("15.2-RELEASE-p1"))
+	_, errs, code := h.run("", "app", "install", "nginx")
+	if code != 2 || !strings.Contains(errs, "there is no FreeBSD image yet") ||
+		!strings.Contains(errs, "hint: create the base image with 'jailops image create freebsd-15-2 --release 15.2-RELEASE', then build it with 'jailops image build freebsd-15-2'") {
+		t.Fatalf("app install: %d %s", code, errs)
+	}
+	out, errs, _ := h.run("", "image", "list")
+	if !strings.Contains(out+errs, "jailops image create freebsd-15-2 --release 15.2-RELEASE, then jailops image build freebsd-15-2") {
+		t.Fatalf("image list: %s %s", out, errs)
+	}
+	h.srv.SeedNetwork(api.Network{Metadata: api.ObjectMeta{Name: "lan"}, Spec: api.NetworkSpec{IPv4: &api.IPv4Net{
+		Subnet: "10.20.0.0/24", Gateway: "10.20.0.1", Range: "10.20.0.10-10.20.0.20"}}})
+	_, errs, code = h.run("", "jail", "create", "web", "--image", "base")
+	if code == 0 || !strings.Contains(errs, "hint: create it with 'jailops image create base --release 15.2-RELEASE', then build it with 'jailops image build base'") {
+		t.Fatalf("jail create: %d %s", code, errs)
+	}
+	_, errs, _ = h.run("", "jail", "create", "web", "--image", "base@lts")
+	if !strings.Contains(errs, "'jailops image create base --release 15.2-RELEASE --alias lts'") {
+		t.Fatalf("jail create with an alias: %s", errs)
+	}
+	h = newHarness(t, fake.WithRelease(""))
+	_, errs, _ = h.run("", "app", "install", "nginx")
+	if !strings.Contains(errs, "jailops image create freebsd-15-1 --release 15.1-RELEASE'") {
+		t.Fatalf("no release: %s", errs)
 	}
 }

@@ -16,7 +16,6 @@
 #   JAILOPS_FLEET_PATH    where the clone lives (default /var/db/jailops-fleet)
 #   JAILOPS_FLEET_BRANCH  branch to follow (default: the remote's default branch)
 #   JAILOPS_AGE_KEY_FILE  an age identity file that opens the fleet's SOPS secrets (copied to /root/.config/jailops-sync)
-#   JAILOPS_NDP_PROXY     "<uplink>=<prefix>[,<prefix>]" for IPv6 proxy mode, written to priv.conf (see networking-ipv6.md)
 #   JAILOPS_HOST_MOUNTS   comma-separated directories a global admin may host-mount into jails (admin-host-mount)
 #   JAILOPS_ADMIN_USER    name of a JailOps administrator to create (a JailOps user, not a Unix user); without
 #                         JAILOPS_ADMIN_PASSWORD_FILE a password is generated and written to /root/jailops-admin-password (0600)
@@ -48,8 +47,8 @@ fi
 zpool list -H -o name "$pool" >/dev/null 2>&1 || die "no ZFS pool named $pool (set JAILOPS_POOL)"
 
 step "kernel modules"
-kldload -n if_bridge if_epair nullfs pf
-sysrc -f /boot/loader.conf if_bridge_load=YES if_epair_load=YES nullfs_load=YES pf_load=YES >/dev/null
+kldload -n if_epair nullfs pf
+sysrc -f /boot/loader.conf if_epair_load=YES nullfs_load=YES pf_load=YES >/dev/null
 
 step "packages"
 if [ -n "${JAILOPS_PKG_DIR:-}" ]; then
@@ -98,7 +97,6 @@ step "priv.conf: what the host operator approves"
 add_priv() { # add_priv KEY VALUE: append "KEY = VALUE" unless that exact line exists
 	grep -qxF "$1 = $2" "$priv_conf" || printf '%s = %s\n' "$1" "$2" >> "$priv_conf"
 }
-if [ -n "${JAILOPS_NDP_PROXY:-}" ]; then add_priv ndp-proxy "$JAILOPS_NDP_PROXY"; fi
 if [ -n "${JAILOPS_HOST_MOUNTS:-}" ]; then
 	for d in $(echo "$JAILOPS_HOST_MOUNTS" | tr ',' ' '); do add_priv admin-host-mount "$d"; done
 fi
@@ -124,7 +122,7 @@ if [ -n "${JAILOPS_ADMIN_USER:-}" ]; then
 	if "$jops" user show "$JAILOPS_ADMIN_USER" >/dev/null 2>&1; then
 		echo "user $JAILOPS_ADMIN_USER exists"
 	elif [ -n "${JAILOPS_ADMIN_PASSWORD_FILE:-}" ]; then
-		"$jops" user create "$JAILOPS_ADMIN_USER" --admin --password-stdin < "$JAILOPS_ADMIN_PASSWORD_FILE"
+		"$jops" user create "$JAILOPS_ADMIN_USER" --admin --password-file - < "$JAILOPS_ADMIN_PASSWORD_FILE"
 	else
 		# the generated password goes to a root-only file, not to the (world-readable) bootstrap log
 		(umask 077; "$jops" user create "$JAILOPS_ADMIN_USER" --admin 2>/dev/null > /root/jailops-admin-password)

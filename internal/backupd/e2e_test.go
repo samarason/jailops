@@ -403,7 +403,7 @@ func TestLeaseExpiryOverTheNetwork(t *testing.T) {
 	}
 	sid := body[strings.Index(body, `"id":"`)+6:]
 	sid = sid[:strings.Index(sid, `"`)]
-	time.Sleep(400 * time.Millisecond)
+	r.Clock.Advance(400 * time.Millisecond) // the lease runs on the clock of the node
 	st, body = post("/api/v1/repo/sessions/"+sid+"/heartbeat", "")
 	if st != 410 || !strings.Contains(body, "lease_expired") {
 		t.Fatalf("a heartbeat after the lease: %d %s", st, body)
@@ -429,7 +429,26 @@ func TestClientHeartbeatKeepsTheLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(3 * time.Second) // two and a half leases of silence from the engine
+	// two and a half leases pass on the clock of the node while the engine is silent: only the heartbeats of the client
+	// renew the lease, so the clock moves a third of a lease at a time and waits for the renewal before it moves again
+	lease := func() time.Time {
+		row, err := r.DB.Session(ctx, s.ID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row.LeaseUntil
+	}
+	for range 8 {
+		before := lease()
+		r.Clock.Advance(400 * time.Millisecond)
+		deadline := time.Now().Add(30 * time.Second)
+		for lease().Equal(before) {
+			if time.Now().After(deadline) {
+				t.Fatal("the client did not renew the lease")
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 	if err := s.PutIndex(ctx, b.Index); err != nil {
 		t.Fatalf("the session died although the client heartbeats: %v", err)
 	}

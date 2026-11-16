@@ -75,7 +75,7 @@ func (w *world) handle(argv []string) ([]byte, error) {
 		return []byte("FreeBSD:15:amd64\n"), nil
 	}
 	root := argv[2]
-	sub := argv[9]
+	sub := argv[11]
 	switch sub {
 	case "install", "upgrade":
 		w.roots[root] = w.repoPkgs()

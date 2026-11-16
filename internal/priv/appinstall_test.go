@@ -52,6 +52,11 @@ func TestAppInstallThroughTheHelper(t *testing.T) {
 	ok(apps.PkgInstallArgv(root, "ports", []string{"postfix", "dovecot"})...)
 	ok(apps.PkgVersionArgv(root, "nginx")...)
 	ok(apps.PkgVersionArgv(root, "py311-prometheus_client")...)
+	// the download cache of the host, shared by every install: below the storage roots, nowhere else
+	ok(apps.PkgInstallCachedArgv(root, "ports", e.cfg.MountBase+"/cache/pkg", []string{"bash"})...)
+	ok(apps.PkgInstallCachedArgv(root, "jailops", e.cfg.MountBase+"/cache/pkg", []string{"isms"})...)
+	bad(api.CodeForbidden, apps.PkgInstallCachedArgv(root, "ports", "/etc", []string{"bash"})...)
+	bad(api.CodeForbidden, apps.PkgInstallCachedArgv(root, "ports", "/tmp/cache", []string{"bash"})...)
 	// not a jail root: the storage root itself, outside it, climbing out, relative
 	bad(api.CodeForbidden, apps.PkgInstallArgv(e.cfg.MountBase, "ports", []string{"nginx"})...)
 	bad(api.CodeForbidden, apps.PkgInstallArgv("/usr/local", "ports", []string{"nginx"})...)
@@ -170,7 +175,7 @@ func TestAppDraftThroughTheHelper(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	argv := apps.PkgLeavesArgv(root)
+	argv := apps.PkgLeavesArgv("alpha_cache")
 	if _, out, err := c.CheckCommandCtx(ctx, argv); err != nil || out[0] != "/usr/sbin/pkg" || !slices.Equal(out[1:], argv[1:]) {
 		t.Fatalf("%q: %q %v", argv, out, err)
 	}
@@ -194,9 +199,10 @@ func TestAppDraftThroughTheHelper(t *testing.T) {
 	}
 	// the exact form still needs a jail root
 	bad(api.CodeInvalid, "pkg", "query", "-e", apps.PkgLeavesQuery, apps.PkgLeavesFormat)
-	bad(api.CodeForbidden, apps.PkgLeavesArgv("/usr/local")...)
-	bad(api.CodeForbidden, apps.PkgLeavesArgv(e.cfg.MountBase)...)
-	bad(api.CodeForbidden, apps.PkgLeavesArgv(root+"/../../../../../..")...)
+	bad(api.CodeInvalid, apps.PkgLeavesArgv("/usr/local")...)
+	bad(api.CodeInvalid, apps.PkgLeavesArgv(e.cfg.MountBase)...)
+	bad(api.CodeInvalid, apps.PkgLeavesArgv(root+"/../../../../../..")...)
+	bad(api.CodeInvalid, apps.PkgLeavesArgv("cache")...)
 	bad(api.CodeForbidden, "pkg", "-o", "REPOS_DIR=/etc", "-r", root, "query", "-e", apps.PkgLeavesQuery, apps.PkgLeavesFormat)
 
 	// the in-jail reads run in a managed jail only, as argv

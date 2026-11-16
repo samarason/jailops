@@ -25,6 +25,10 @@ type Config struct {
 	Attrs catalog.Attrs
 	// MaxRequests bounds the requests a read agent works on at once (default 64).
 	MaxRequests int
+	// Special lets a write agent make device nodes and setuid or setgid files. The helper sets it only for a tree
+	// a jail controls (its root or a volume mounted in it), which no user of the host can reach; elsewhere such a
+	// file is refused (a device node) or written without the bits.
+	Special bool
 }
 
 // Serve answers the client on rw until it hangs up (nil) or sends something it must not (an error).
@@ -302,7 +306,7 @@ func serveWrite(rw io.ReadWriter, cfg Config) error {
 			_ = out.fail(f.id, fmt.Errorf("bad request: %w", err))
 			continue
 		}
-		if err := handleWrite(out, br, sink, f.id, req); err != nil {
+		if err := handleWrite(out, br, sink, f.id, req, cfg.Special); err != nil {
 			return err // the stream is out of step: end the session
 		}
 	}
@@ -310,7 +314,7 @@ func serveWrite(rw io.ReadWriter, cfg Config) error {
 
 // handleWrite does one request. It returns an error only when the connection can no longer be trusted
 // to be in step; the operation's own failure is an X reply.
-func handleWrite(out *sender, br *bufio.Reader, sink catalog.Sink, id uint32, req request) error {
+func handleWrite(out *sender, br *bufio.Reader, sink catalog.Sink, id uint32, req request, special bool) error {
 	reply := func(err error, v any) error {
 		if err != nil {
 			return out.fail(id, err)
@@ -330,17 +334,25 @@ func handleWrite(out *sender, br *bufio.Reader, sink catalog.Sink, id uint32, re
 	case opLink:
 		return reply(sink.Link(req.Rel, req.Target), nil)
 	case opMknod:
+		if t := req.Mode & unix.S_IFMT; !special && (t == unix.S_IFCHR || t == unix.S_IFBLK) {
+			return reply(fmt.Errorf("mknod %s: device nodes are restored only into a jail's root", req.Rel), nil)
+		}
 		return reply(sink.Mknod(req.Rel, req.Mode, req.Major, req.Minor), nil)
 	case opApply:
 		var e catalog.Entry
 		if err := json.Unmarshal(req.Entry, &e); err != nil {
 			return reply(fmt.Errorf("bad entry: %w", err), nil)
 		}
+		var dropped []string
+		if bits := specialBits(&e); !special && e.Mode&bits != 0 {
+			dropped = append(dropped, fmt.Sprintf("%s: mode %04o restored without setuid and setgid (not in a jail's root)", req.Rel, e.Mode&0o7777))
+			e.Mode &^= bits
+		}
 		skipped, err := sink.Apply(req.Rel, &e, req.Link, catalog.MetaOptions{NoChown: req.NoChown, Lenient: req.Lenient})
 		if err != nil {
 			return reply(err, nil)
 		}
-		return reply(nil, applyReply{Skipped: skipped})
+		return reply(nil, applyReply{Skipped: append(dropped, skipped...)})
 	case opWrite:
 		in := &dataReader{br: br, id: id}
 		err := sink.WriteFile(req.Rel, req.Size, req.Sum, in)
@@ -354,6 +366,15 @@ func handleWrite(out *sender, br *bufio.Reader, sink catalog.Sink, id uint32, re
 		return reply(err, nil)
 	}
 	return reply(fmt.Errorf("a write agent does not do %q", req.Op), nil)
+}
+
+// specialBits are the mode bits a write agent drops outside a jail's root: setuid, and setgid except on a
+// directory (where it only steers the group of new files).
+func specialBits(e *catalog.Entry) uint32 {
+	if e.Kind == catalog.KDir {
+		return 0o4000
+	}
+	return 0o6000
 }
 
 // dataReader reads the D frames of a write up to the E frame.

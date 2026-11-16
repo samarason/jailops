@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -29,9 +27,6 @@ var unsupportedRoutes = []struct{ method, pattern, what string }{
 	{"PUT", "/api/v1/jails/{name}/files/{path...}", "file access"},
 	{"POST", "/api/v1/jails/{name}/move", "cold moves"},
 	{"POST", "/api/v1/jails/{name}/snapshots/{snapshot}", "snapshot rename"},
-	{"GET", "/api/v1/jails/{name}/volumes", "volume management"},
-	{"POST", "/api/v1/jails/{name}/volumes", "volume management"},
-	{"DELETE", "/api/v1/jails/{name}/volumes/{volume}", "volume management"},
 	{"GET", "/api/v1/jails/{name}/bundle", "bundle download"},
 	{"GET", "/api/v1/jail-templates", "jail templates"},
 	{"POST", "/api/v1/jail-templates", "jail templates"},
@@ -183,15 +178,46 @@ func (s *Server) routeTable() []route {
 	// Server.
 	add(
 		route{method: "GET", pattern: "/api/v1", h: func(c *rc) error {
-			a := "untrusted"
-			if c.actor.Perm != "" {
-				a = "trusted"
+			if c.actor.Perm == "" {
+				// a caller that proved nothing learns what a client negotiates with, not the host's name, id,
+				// software version or pool
+				i := svc.Info("untrusted")
+				c.sync(200, api.ServerInfo{APIVersion: i.APIVersion, APIExtensions: i.APIExtensions, Role: i.Role, Auth: i.Auth}, 0)
+				return nil
 			}
-			c.sync(200, svc.Info(a), 0)
+			c.sync(200, svc.Info("trusted"), 0)
+			return nil
+		}},
+		// Readiness for load balancers and monitors: a fixed class only, never an error text.
+		route{method: "GET", pattern: "/readyz", local: true, h: func(c *rc) error {
+			reason := svc.Ready(c.r.Context())
+			h := c.w.Header()
+			h.Set("Content-Type", "text/plain; charset=utf-8")
+			h.Set("Cache-Control", "no-store")
+			if reason != "" {
+				c.status = http.StatusServiceUnavailable
+				c.w.WriteHeader(c.status)
+				_, _ = io.WriteString(c.w, "not ready: "+reason+"\n")
+				return nil
+			}
+			c.status = http.StatusOK
+			_, _ = io.WriteString(c.w, "ok\n")
 			return nil
 		}},
 		route{method: "GET", pattern: "/api/v1/doctor", h: func(c *rc) error {
 			c.sync(200, svc.Doctor(c.r.Context()), 0)
+			return nil
+		}},
+		route{method: "POST", pattern: "/api/v1/doctor/fix", h: func(c *rc) error {
+			var req api.DoctorFixRequest
+			if err := c.decodeOptional(&req); err != nil {
+				return err
+			}
+			res, err := svc.DoctorFix(c.r.Context(), req.DryRun)
+			if err != nil {
+				return err
+			}
+			c.sync(200, res, 0)
 			return nil
 		}},
 		route{method: "GET", pattern: "/api/v1/resources", h: func(c *rc) error {
@@ -295,7 +321,10 @@ func (s *Server) routeTable() []route {
 	)
 
 	add(s.jailRoutes()...)
+	add(s.volumeRoutes()...)
 	add(s.logRoutes()...)
+	add(s.bootRoutes()...)
+	add(s.firewallTestRoutes()...)
 
 	// Networks and firewall.
 	add(resource[api.Network]{base: "/api/v1/networks", param: "name",
@@ -510,6 +539,18 @@ func (s *Server) routeTable() []route {
 			c.async(op)
 			return nil
 		}},
+		route{method: "POST", pattern: "/api/v1/jails/{name}/shell-setup", h: func(c *rc) error {
+			var in api.ShellSetupRequest
+			if err := c.decodeOptional(&in); err != nil {
+				return err
+			}
+			op, err := svc.ShellSetupJail(c.r.Context(), c.pathArg("name"), in)
+			if err != nil {
+				return err
+			}
+			c.async(op)
+			return nil
+		}},
 		route{method: "POST", pattern: "/api/v1/jails/{name}/config", h: func(c *rc) error {
 			var ch api.ConfigChange
 			if err := c.decodeOptional(&ch); err != nil {
@@ -707,7 +748,7 @@ func (s *Server) routeTable() []route {
 			if err != nil {
 				return err
 			}
-			c.detail = "acme " + strings.Join(in.Domains, ",")
+			c.detail = "acme " + auditValue(strings.Join(in.Domains, ","))
 			c.sync(200, v, 0)
 			return nil
 		}},
@@ -751,6 +792,7 @@ func (s *Server) routeTable() []route {
 		}},
 	)
 	add(s.appAccessRoutes()...)
+	add(s.renameRoutes()...)
 
 	// Projects, storage, trust and sessions.
 	add(resource[api.Project]{base: "/api/v1/projects", param: "name",
@@ -892,15 +934,7 @@ func (c *rc) decodeOptional(v any) error {
 			return err
 		}
 	}
-	err := json.NewDecoder(c.r.Body).Decode(v)
-	if err == nil || errors.Is(err, io.EOF) {
-		return nil
-	}
-	var mb *http.MaxBytesError
-	if errors.As(err, &mb) {
-		return err
-	}
-	return api.Errorf(api.CodeInvalid, "invalid request body: %v", err)
+	return c.decodeBody(v, true)
 }
 
 var _ = http.StatusOK

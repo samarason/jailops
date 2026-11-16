@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -42,7 +43,7 @@ func (s *Service) validateCreate(j *api.Jail) error {
 	}
 	sp := &j.Spec
 	if sp.Image == "" {
-		return api.Errorf(api.CodeInvalid, "spec.image is required")
+		return api.Errorf(api.CodeInvalid, "a jail needs an image: name one with --image NAME (spec.image)")
 	}
 	if sp.Encrypted {
 		return api.Errorf(api.CodeUnsupported, "native ZFS encryption of jails is not implemented").
@@ -58,59 +59,21 @@ func (s *Service) validateCreate(j *api.Jail) error {
 	if sp.Resources.DiskReservation != "" && !sizeRe.MatchString(sp.Resources.DiskReservation) {
 		return api.Errorf(api.CodeInvalid, "bad disk reservation %q", sp.Resources.DiskReservation)
 	}
-	seen := map[string]bool{}
-	used := map[string]bool{}
-	for _, p := range s.Cfg.persistent() {
-		used[path.Clean(p.Path)] = true
+	vols, err := s.Cfg.CheckVolumes(sp.Volumes)
+	if err != nil {
+		return err
 	}
-	for i, v := range sp.Volumes {
-		if err := validName("volume", v.Name); err != nil {
-			return err
-		}
-		if seen[v.Name] {
-			return api.Errorf(api.CodeInvalid, "volume %q is declared twice", v.Name)
-		}
-		seen[v.Name] = true
-		m, ok := cleanMount(v.Mount)
-		if !ok {
-			return api.Errorf(api.CodeInvalid, "volume %q has a bad mount path %q", v.Name, v.Mount)
-		}
-		if used[m] {
-			return api.Errorf(api.CodeInvalid, "volume %q mounts over a persistent path (%s)", v.Name, m)
-		}
-		used[m] = true
-		sp.Volumes[i].Mount = m
-		if v.Quota != "" && !sizeRe.MatchString(v.Quota) {
-			return api.Errorf(api.CodeInvalid, "volume %q has a bad quota %q", v.Name, v.Quota)
-		}
-		if v.Encrypted && s.Keys == nil {
-			return api.Errorf(api.CodeUnsupported, "volume %q is encrypted and this host has no key operations", v.Name)
-		}
-	}
+	sp.Volumes = vols
 	return nil
-}
-
-func hasEncrypted(sp api.JailSpec) bool {
-	for _, v := range sp.Volumes {
-		if v.Encrypted {
-			return true
-		}
-	}
-	return false
 }
 
 // CreateJail creates a jail from an image generation. Thin jails get a clone
 // of the generation as root plus the persistent datasets, thick jails a full
 // copy. The whole jail lives below one container dataset, so undoing the
-// first step removes everything a failed creation made.
+// first step removes everything a failed creation made. The volumes the jail attaches exist already: they are
+// made with CreateVolume and are not part of the jail's datasets.
 func (s *Service) CreateJail(ctx context.Context, j api.Jail, dryRun bool) (CreateResult, error) {
-	return s.CreateJailKeyed(ctx, j, dryRun, nil)
-}
-
-// CreateJailKeyed is CreateJail for a jail with encrypted volumes: passphrase is their passphrase. It is used by the
-// creating step and then dropped: no record, journal entry or plan description holds it.
-func (s *Service) CreateJailKeyed(ctx context.Context, j api.Jail, dryRun bool, passphrase []byte) (CreateResult, error) {
-	p, res, err := s.planCreate(ctx, j, false, passphrase)
+	p, res, err := s.planCreate(ctx, j, false)
 	if err != nil {
 		return res, err
 	}
@@ -129,26 +92,13 @@ func (s *Service) CreateJailKeyed(ctx context.Context, j api.Jail, dryRun bool, 
 // set, the existence checks are skipped so the plan can be rebuilt after a
 // crash to roll the interrupted creation back; j must be the same request.
 func (s *Service) PlanCreate(ctx context.Context, j api.Jail, recovering bool) (*plan.Plan, CreateResult, error) {
-	return s.planCreate(ctx, j, recovering, nil)
+	return s.planCreate(ctx, j, recovering)
 }
 
-func (s *Service) planCreate(ctx context.Context, j api.Jail, recovering bool, passphrase []byte) (*plan.Plan, CreateResult, error) {
+func (s *Service) planCreate(ctx context.Context, j api.Jail, recovering bool) (*plan.Plan, CreateResult, error) {
 	var res CreateResult
 	if err := s.validateCreate(&j); err != nil {
 		return nil, res, err
-	}
-	// A rebuilt plan only rolls back: it never creates a volume and needs no passphrase.
-	if !recovering {
-		switch enc := hasEncrypted(j.Spec); {
-		case enc && len(passphrase) == 0:
-			return nil, res, api.Errorf(api.CodeInvalid, "a jail with an encrypted volume needs a passphrase")
-		case !enc && len(passphrase) > 0:
-			return nil, res, api.Errorf(api.CodeInvalid, "a passphrase was given but no volume is encrypted")
-		case enc:
-			if err := api.CheckPassphrase(string(passphrase)); err != nil {
-				return nil, res, err
-			}
-		}
 	}
 	key, _ := KeyOf(j)
 	name, id := key, j.Metadata.UUID
@@ -209,19 +159,22 @@ func (s *Service) planCreate(ctx context.Context, j api.Jail, recovering bool, p
 		return m
 	}
 	pl := plan.New("create-jail " + name)
+	// The disk limit is the quota of the container: it covers the root, the persistent datasets and the snapshots of
+	// all of them. The volumes a jail attaches are datasets of the project, outside the container.
+	contProps := map[string]string{"mountpoint": cMP, PropLayout: string(layout), PropImage: imageName, PropComplete: "off"}
+	if q := j.Spec.Resources.Disk; q != "" {
+		contProps["quota"] = q
+	}
+	if r := j.Spec.Resources.DiskReservation; r != "" {
+		contProps["reservation"] = r
+	}
 	pl.Add(plan.Step{Name: "create-container", Describe: fmt.Sprintf("zfs create -o mountpoint=%s %s", cMP, c),
 		Do: func(ctx context.Context) error {
-			return z.Create(ctx, c, base(KindContainer, map[string]string{"mountpoint": cMP, PropLayout: string(layout), PropImage: imageName, PropComplete: "off"}))
+			return z.Create(ctx, c, base(KindContainer, contProps))
 		}, Undo: owned})
 
 	rootProps := base(KindRoot, map[string]string{"mountpoint": rootMP, "canmount": "on", PropGen: strconv.Itoa(gen.Number),
 		PropImage: imageName, PropManifest: gen.Manifest})
-	if q := j.Spec.Resources.Disk; q != "" {
-		rootProps["quota"] = q
-	}
-	if r := j.Spec.Resources.DiskReservation; r != "" {
-		rootProps["reservation"] = r
-	}
 	genRO := gen.Dataset + "@" + roSnap
 	if layout == api.LayoutThin {
 		pl.Add(plan.Step{Name: "clone-root", Describe: fmt.Sprintf("zfs clone %s %s", genRO, rootDS),
@@ -321,35 +274,16 @@ func (s *Service) planCreate(ctx context.Context, j api.Jail, recovering bool, p
 			}})
 	}
 
-	if len(j.Spec.Volumes) > 0 {
-		vp := s.Cfg.at(name).volumesDS()
-		pl.Add(plan.Step{Name: "create-volumes", Describe: "zfs create " + vp,
+	if j.Spec.Delegate {
+		// The jail manages this dataset itself: it is never mounted on the host (jailed=on) and jail(8) attaches it at the
+		// start (zfs.dataset). Not under JailOps' mountpoint rules: root in the jail sets its own.
+		ds := s.Cfg.at(name).delegatedDS()
+		pl.Add(plan.Step{Name: "create-delegated", Describe: "zfs create " + ds,
 			Do: func(ctx context.Context) error {
-				return z.Create(ctx, vp, base(KindVolumes, map[string]string{"canmount": "off", "mountpoint": "none"}))
-			}})
-		for _, v := range j.Spec.Volumes {
-			v := v
-			ds := s.Cfg.at(name).volumeDS(v.Name)
-			// canmount=noauto: the dataset is mounted by mountTree after the root and the persistent datasets. Created
-			// mounted, it would land in the container's directory below the root before the root is mounted, and the
-			// root would then hide it (a start would find it mounted already and the jail would write underneath).
-			props := base(KindVolume, map[string]string{PropClass: string(ClassData), PropPath: v.Mount, "mountpoint": rootMP + v.Mount, "canmount": "noauto"})
-			if v.Quota != "" {
-				props["quota"] = v.Quota
-			}
-			if v.ReadOnly {
-				props["readonly"] = "on"
-			}
-			if v.Encrypted {
-				// The key stays loaded after the creation: the new jail starts without an unlock.
-				props[PropEncrypted] = "on"
-				pl.Add(plan.Step{Name: "create-volume-" + v.Name, Describe: "zfs create -o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=prompt " + ds,
-					Do: func(ctx context.Context) error { return s.Keys.CreateEncrypted(ctx, ds, props, passphrase) }})
-				continue
-			}
-			pl.Add(plan.Step{Name: "create-volume-" + v.Name, Describe: "zfs create " + ds,
-				Do: func(ctx context.Context) error { return z.Create(ctx, ds, props) }})
-		}
+				return z.Create(ctx, ds, base(KindDelegated, map[string]string{"mountpoint": "none", "canmount": "noauto"}))
+			}},
+			plan.Step{Name: "delegate-dataset", Describe: "zfs set jailed=on " + ds,
+				Do: func(ctx context.Context) error { return z.Set(ctx, ds, map[string]string{"jailed": "on"}) }})
 	}
 
 	specB := marshal(rec)
@@ -371,4 +305,35 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// CheckVolumes checks the volumes a jail attaches against each other and against the persistent paths of its root:
+// one attachment per volume, one volume per path, and no path that is a persistent dataset itself (a path below one
+// is fine). It returns the attachments with clean mount paths.
+func (c Config) CheckVolumes(vs []api.VolumeAttach) ([]api.VolumeAttach, error) {
+	seen := map[string]bool{}
+	used := map[string]bool{}
+	for _, p := range c.persistent() {
+		used[path.Clean(p.Path)] = true
+	}
+	out := slices.Clone(vs)
+	for i, v := range out {
+		if err := validName("volume", v.Name); err != nil {
+			return nil, err
+		}
+		if seen[v.Name] {
+			return nil, api.Errorf(api.CodeInvalid, "volume %q is attached twice", v.Name)
+		}
+		seen[v.Name] = true
+		m, ok := cleanMount(v.Mount)
+		if !ok {
+			return nil, api.Errorf(api.CodeInvalid, "volume %q has a bad mount path %q", v.Name, v.Mount)
+		}
+		if used[m] {
+			return nil, api.Errorf(api.CodeInvalid, "volume %q mounts over a persistent path (%s) or another volume", v.Name, m)
+		}
+		used[m] = true
+		out[i].Mount = m
+	}
+	return out, nil
 }

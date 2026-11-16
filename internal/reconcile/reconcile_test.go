@@ -129,14 +129,39 @@ func newWorld(t *testing.T, cfg reconcile.Config) *world {
 		locks: map[string]bool{}, fail: map[string]error{}, netSt: map[string]api.NetworkStatus{},
 		jailSt: map[string][]api.Condition{}, drift: map[string][]string{},
 		clock: &fakeClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}}
-	w.R = reconcile.New(cfg, reconcile.Env{Source: w, Sink: w, Actions: w, Net: w.Net, PF: w.PF, Jails: w.Jails, Run: privateRunner(), Sysctl: sysctl, Clock: w.clock})
+	w.R = reconcile.New(cfg, reconcile.Env{Source: w, Sink: w, Actions: w, Net: w.Net, PF: w.PF, Jails: w.Jails, Run: privateRunner(), Sysctl: sysctl, Clock: w.clock, Routes: routeTable(w.Net)})
 	t.Cleanup(w.R.Close)
 	return w
 }
 
+// routeTable reads the routes of the fake interface table the way the daemon reads netstat: host routes through an
+// interface, reject routes through the loopback.
+func routeTable(f *ifconfig.Fake) func(context.Context) ([]ifconfig.RouteEntry, error) {
+	return func(context.Context) ([]ifconfig.RouteEntry, error) {
+		var out []ifconfig.RouteEntry
+		for _, r := range f.Routes() {
+			w := strings.Fields(r)
+			p, err := netip.ParsePrefix(w[1])
+			if err != nil {
+				a, _ := netip.ParseAddr(w[1])
+				p = netip.PrefixFrom(a, a.BitLen())
+			}
+			e := ifconfig.RouteEntry{Dest: p, Flags: "UHS"}
+			switch {
+			case len(w) >= 4 && w[3] == "-reject":
+				e.Iface, e.Flags = "lo0", "URS"
+			case len(w) >= 4 && w[2] == "-interface":
+				e.Iface = w[3]
+			}
+			out = append(out, e)
+		}
+		return out, nil
+	}
+}
+
 func lan() reconcile.NetworkDesired {
-	spec := api.NetworkSpec{Bridge: "jo0", IPv4: &api.IPv4Net{Subnet: "10.20.0.0/24", Gateway: "10.20.0.1", Range: "10.20.0.10-10.20.0.50"}}
-	steps, err := render.NetworkPlan(render.NetworkInput{ID: netID, Name: "lan", Bridge: "jo0", Spec: spec})
+	spec := api.NetworkSpec{IPv4: &api.IPv4Net{Subnet: "10.20.0.0/24", Gateway: "10.20.0.1", Range: "10.20.0.10-10.20.0.50"}}
+	steps, err := render.NetworkPlan(render.NetworkInput{ID: netID, Name: "lan", Spec: spec})
 	if err != nil {
 		panic(err)
 	}
@@ -144,7 +169,7 @@ func lan() reconcile.NetworkDesired {
 	if err != nil {
 		panic(err)
 	}
-	return reconcile.NetworkDesired{Name: "lan", ID: netID, Bridge: "jo0", Spec: spec, Steps: steps, Allocated: 2, Free: 39,
+	return reconcile.NetworkDesired{Name: "lan", ID: netID, Spec: spec, Steps: steps, Allocated: 2, Free: 39,
 		Anchors: map[string]string{render.NetAnchor("lan"): anchor}}
 }
 
@@ -157,70 +182,31 @@ func find(l []ifconfig.Iface, name string) (ifconfig.Iface, bool) {
 	return ifconfig.Iface{}, false
 }
 
-func TestNetworkPassCreatesAndConverges(t *testing.T) {
+func TestNetworkPassAppliesAndConverges(t *testing.T) {
 	w := newWorld(t, reconcile.Config{})
 	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{lan()}}
 	rep := w.R.Pass(bg)
 	if rep.Err != nil || len(rep.Failures) != 0 {
 		t.Fatalf("%+v", rep)
 	}
-	ifs, _ := w.Net.List(bg)
-	br, ok := find(ifs, "jo0")
-	if !ok || !br.Up() || br.Description != "jailops net=lan bridge" || len(br.Inet) != 0 || len(br.Members) != 1 || br.Members[0].Name != "jo0ga" {
-		t.Fatalf("the bridge carries no address and has the gateway port as its only member: %+v", br)
+	if got := w.Net.Routes(); len(got) != 1 || got[0] != "-inet 10.20.0.0/24 127.0.0.1 -reject" {
+		t.Fatalf("the subnet is rejected for the addresses no jail has: %q", got)
 	}
-	gw, ok := find(ifs, "jo0gb")
-	if !ok || !gw.Up() || gw.Description != "jailops net=lan gateway (host side)" || len(gw.Inet) != 1 || gw.Inet[0].String() != "10.20.0.1/24" {
-		t.Fatalf("the gateway addresses are on the l3 end of the gateway pair: %+v", gw)
-	}
-	if ga, ok := find(ifs, "jo0ga"); !ok || !ga.Up() {
-		t.Fatalf("%+v", ga)
+	if ifs, _ := w.Net.List(bg); len(ifs) != 1 { // the loopback only: a network has no interface of its own
+		t.Fatalf("a network made interfaces: %+v", ifs)
 	}
 	st := w.netSt["lan"]
-	if !st.BridgeUp || st.Allocated != 2 || st.Free != 39 || len(st.Conditions) != 1 || st.Conditions[0].Status != api.ConditionTrue {
+	if st.Allocated != 2 || st.Free != 39 || len(st.Conditions) != 1 || st.Conditions[0].Status != api.ConditionTrue {
 		t.Fatalf("%+v", st)
 	}
 	// A second pass has nothing to do.
 	if rep2 := w.R.Pass(bg); len(rep2.Applied) != 0 {
 		t.Fatalf("not idempotent: %v", rep2.Applied)
 	}
-	// Drift: the address disappears and an extra one appears; both are fixed.
-	_ = w.Net.AddrRemove(bg, "jo0gb", netip.MustParsePrefix("10.20.0.1/24"))
-	_ = w.Net.AddrAdd(bg, "jo0gb", netip.MustParsePrefix("192.0.2.9/24"))
-	_ = w.Net.AddrAdd(bg, "jo0", netip.MustParsePrefix("192.0.2.10/24")) // an address on the bridge (the old layout) goes too
-	rep3 := w.R.Pass(bg)
-	ifs, _ = w.Net.List(bg)
-	br, _ = find(ifs, "jo0")
-	gw, _ = find(ifs, "jo0gb")
-	if len(gw.Inet) != 1 || gw.Inet[0].String() != "10.20.0.1/24" || len(br.Inet) != 0 || len(rep3.Applied) < 3 {
-		t.Fatalf("%+v %+v %v", gw.Inet, br.Inet, rep3.Applied)
-	}
-	// The whole gateway pair is repaired when it disappears.
-	_ = w.Net.EpairDestroy(bg, "jo0ga")
-	rep4 := w.R.Pass(bg)
-	ifs, _ = w.Net.List(bg)
-	if gw, ok = find(ifs, "jo0gb"); !ok || len(gw.Inet) != 1 || len(rep4.Applied) == 0 {
-		t.Fatalf("the gateway pair was not recreated: %+v %v", gw, rep4.Applied)
-	}
-	if br, _ = find(ifs, "jo0"); len(br.Members) != 1 || br.Members[0].Name != "jo0ga" {
-		t.Fatalf("the gateway port is not back on the bridge: %+v", br.Members)
-	}
-}
-
-func TestNetworkPassNeverTouchesForeignBridge(t *testing.T) {
-	w := newWorld(t, reconcile.Config{})
-	w.Net.AddForeign("jo0", true)
-	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{lan()}}
-	rep := w.R.Pass(bg)
-	if len(rep.Applied) != 0 || rep.Failures["network/lan"] == "" {
-		t.Fatalf("%+v", rep)
-	}
-	ifs, _ := w.Net.List(bg)
-	if br, _ := find(ifs, "jo0"); len(br.Inet) != 0 || br.Description != "" {
-		t.Fatalf("a bridge JailOps does not own was changed: %+v", br)
-	}
-	if c := w.netSt["lan"].Conditions; len(c) != 1 || c[0].Reason != "ForeignBridge" || c[0].Status != api.ConditionFalse {
-		t.Fatalf("%+v", c)
+	// Drift: the route disappears and is put back.
+	_ = w.Net.RouteDelete(bg, ifconfig.Route{Dest: "10.20.0.0/24", Reject: true})
+	if rep3 := w.R.Pass(bg); len(rep3.Applied) != 1 || len(w.Net.Routes()) != 1 {
+		t.Fatalf("%v %q", rep3.Applied, w.Net.Routes())
 	}
 }
 
@@ -238,7 +224,7 @@ func TestNetworkPassSkipsBusyNetworkAndReportsPrecondition(t *testing.T) {
 		Sysctl: func(context.Context, string) (string, error) { return "0", nil }, Clock: w2.clock})
 	routed := lan()
 	routed.Spec.Uplink = "em0" // routing needs forwarding, which reads 0 here
-	routed.Steps, _ = render.NetworkPlan(render.NetworkInput{ID: netID, Name: "lan", Bridge: "jo0", Spec: routed.Spec})
+	routed.Steps, _ = render.NetworkPlan(render.NetworkInput{ID: netID, Name: "lan", Spec: routed.Spec})
 	w2.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{routed}}
 	rep := w2.R.Pass(bg)
 	c := w2.netSt["lan"].Conditions
@@ -255,42 +241,36 @@ func epairOf(jid string, i int) (string, string) {
 func jailDesired(name string) reconcile.JailDesired {
 	host, jail := epairOf(jailID, 0)
 	_ = jail
-	steps, _ := render.AttachPlan(render.AttachInput{JailID: jailID, JailUUID: jailID, Index: 0, Bridge: "jo0",
-		IPv4: netip.MustParsePrefix("10.20.0.10/24"), Gateway4: netip.MustParseAddr("10.20.0.1")})
+	steps, _ := render.AttachPlan(render.AttachInput{JailID: jailID, JailUUID: jailID, Index: 0,
+		IPv4: netip.MustParsePrefix("10.20.0.10/32"), Gateway4: netip.MustParseAddr("10.20.0.1")})
 	var hostSteps []render.Step
 	for _, s := range steps {
 		if s.Phase == render.PhaseHost {
 			hostSteps = append(hostSteps, s)
 		}
 	}
-	return reconcile.JailDesired{Name: name, ID: jailID, Attach: [][]render.Step{hostSteps}, Bridges: []string{"jo0"}, Epairs: []string{host},
+	return reconcile.JailDesired{Name: name, ID: jailID, Attach: [][]render.Step{hostSteps}, Networks: []string{"lan"}, Epairs: []string{host},
 		AnchorName: "jailops/" + name, Ruleset: "pass in all\n"}
 }
 
 func TestOrphanEpairCleanup(t *testing.T) {
 	w := newWorld(t, reconcile.Config{})
 	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{lan()}, Jails: []reconcile.JailDesired{jailDesired("web")}}
-	w.R.Pass(bg) // bridge exists
+	w.R.Pass(bg)
 	ctx := bg
-	mk := func(id string, idx int, member bool) string {
+	mk := func(id string, idx int) string {
 		h, _ := epairOf(id, idx)
 		if _, _, err := w.Net.EpairCreate(ctx, h[:len(h)-1]); err != nil {
 			t.Fatal(err)
 		}
-		_ = w.Net.SetDescription(ctx, h, "jailops:"+id)
-		if member {
-			_ = w.Net.BridgeAddMember(ctx, "jo0", h, false)
-		}
+		_ = w.Net.SetDescription(ctx, h, "jailops jail=p/"+id[:4]+" net=lan (host side)")
 		return h
 	}
-	orphan := mk("33333333-3333-4333-8333-333333333333", 0, true)
-	stale := mk(jailID, 0, false) // jail "web" exists but is stopped
+	orphan := mk("33333333-3333-4333-8333-333333333333", 0)
+	stale := mk(jailID, 0) // jail "web" exists but is stopped
 	// An interface with a JailOps looking name but a foreign description is left alone.
 	fh, _ := epairOf("44444444-4444-4444-8444-444444444444", 0)
-	if _, _, err := w.Net.EpairCreate(ctx, fh[:len(fh)-1]); err != nil {
-		t.Fatal(err)
-	}
-	_ = w.Net.SetDescription(ctx, fh, "someone else's")
+	w.Net.AddIface(ifconfig.Iface{Name: fh, Groups: []string{"epair"}, Description: "someone else's"})
 	rep := w.R.Pass(bg)
 	if len(rep.Cleaned) != 2 {
 		t.Fatalf("%+v", rep)
@@ -307,7 +287,7 @@ func TestOrphanEpairCleanup(t *testing.T) {
 	}
 	// An epair of a jail whose lock is held (a start in flight) is kept.
 	w.locks["jail/web"] = true
-	keep := mk(jailID, 0, false)
+	keep := mk(jailID, 0)
 	if rep := w.R.Pass(bg); len(rep.Cleaned) != 0 {
 		t.Fatalf("%+v", rep)
 	}
@@ -346,7 +326,7 @@ func TestDriftAndAnchorHeal(t *testing.T) {
 	// Create the epair as a start would; the next pass is clean.
 	h := j.Epairs[0]
 	_, _, _ = w.Net.EpairCreate(bg, h[:len(h)-1])
-	_ = w.Net.SetDescription(bg, h, "jailops:"+jailID)
+	_ = w.Net.SetDescription(bg, h, "jailops jail=p/web net=lan (host side)")
 	rep = w.R.Pass(bg)
 	if len(rep.Drift["web"]) != 0 {
 		t.Fatalf("%+v", rep.Drift)
@@ -354,11 +334,20 @@ func TestDriftAndAnchorHeal(t *testing.T) {
 	if w.jailSt["web"][1].Status != api.ConditionTrue {
 		t.Fatalf("%+v", w.jailSt["web"])
 	}
-	// The membership of the epair is repaired.
+	// The host end is given its gateway address and its route to the jail, and is brought up.
 	ifs, _ := w.Net.List(bg)
-	br, _ := find(ifs, "jo0")
-	if len(br.Members) != 2 || br.Members[1].Name != h { // the gateway port and the jail's
-		t.Fatalf("%+v", br.Members)
+	he, _ := find(ifs, h)
+	if len(he.Inet) != 1 || he.Inet[0].String() != "10.20.0.1/32" || !he.Up() {
+		t.Fatalf("%+v", he)
+	}
+	if got := w.Net.Routes(); len(got) != 2 || got[1] != "-inet 10.20.0.10/32 -interface "+h {
+		t.Fatalf("%q", got)
+	}
+	// A route that went missing (the routing table was flushed) is put back.
+	_ = w.Net.RouteDelete(bg, ifconfig.Route{Dest: "10.20.0.10/32", Interface: h})
+	w.R.Pass(bg)
+	if got := w.Net.Routes(); len(got) != 2 {
+		t.Fatalf("the route to the jail was not put back: %q", got)
 	}
 }
 
@@ -450,7 +439,7 @@ func TestAutostartOnFirstPassOnly(t *testing.T) {
 func TestAutostartSkipsALockedJail(t *testing.T) {
 	w := newWorld(t, reconcile.Config{Autostart: true})
 	w.des = reconcile.Desired{Jails: []reconcile.JailDesired{jd("vault", 0), jd("app", 0, "vault"), jd("cache", 5)}}
-	w.fail["vault"] = api.Errorf(api.CodeLocked, "jail \"vault\" is locked").WithHint("jailops jail unlock vault")
+	w.fail["vault"] = api.Errorf(api.CodeLocked, "jail \"vault\" is locked").WithHint("jailops volume unlock vault")
 	rep := w.R.Pass(bg)
 	if _, failed := rep.Failures["jail/vault"]; failed {
 		t.Fatalf("a locked jail is skipped, not failed: %+v", rep.Failures)
@@ -464,7 +453,7 @@ func TestAutostartSkipsALockedJail(t *testing.T) {
 			c = x
 		}
 	}
-	if c.Reason != "Locked" || !strings.Contains(c.Message, "jailops jail unlock") {
+	if c.Reason != "Locked" || !strings.Contains(c.Message, "jailops volume unlock") {
 		t.Fatalf("%+v", c)
 	}
 	for _, x := range w.jailSt["app"] {
@@ -482,12 +471,14 @@ type fakeNDP struct {
 	shut    bool
 	openErr string
 	closes  int
+	// floods is what Status reports as dropped over the limits in the last hour.
+	floods uint64
 }
 
 func (f *fakeNDP) Status() ndproxy.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return ndproxy.Status{Open: !f.shut, Err: f.openErr}
+	return ndproxy.Status{Open: !f.shut, Err: f.openErr, FloodsLastHour: f.floods}
 }
 func (f *fakeNDP) Close() error { f.mu.Lock(); f.closes++; f.mu.Unlock(); return nil }
 
@@ -508,12 +499,12 @@ func (f *fakeNDP) last() []ndproxy.Entry {
 }
 
 func proxyNet() reconcile.NetworkDesired {
-	spec := api.NetworkSpec{Bridge: "jo0", Uplink: "em0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1::/64", Gateway: "fe80::1", Range: "2001:db8:1::10-2001:db8:1::20"}}
-	steps, err := render.NetworkPlan(render.NetworkInput{ID: netID, Name: "lan", Bridge: "jo0", Spec: spec})
+	spec := api.NetworkSpec{Uplink: "em0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1::/64", Range: "2001:db8:1::10-2001:db8:1::20"}}
+	steps, err := render.NetworkPlan(render.NetworkInput{ID: netID, Name: "lan", Spec: spec})
 	if err != nil {
 		panic(err)
 	}
-	return reconcile.NetworkDesired{Name: "lan", ID: netID, Bridge: "jo0", Spec: spec, Steps: steps}
+	return reconcile.NetworkDesired{Name: "lan", ID: netID, Spec: spec, Steps: steps}
 }
 
 func TestNDPProxyManagement(t *testing.T) {
@@ -521,7 +512,7 @@ func TestNDPProxyManagement(t *testing.T) {
 	var built []string
 	w := newWorld(t, reconcile.Config{NDP: func(up string) (reconcile.NDP, error) { built = append(built, up); return ndp, nil }})
 	j := jailDesired("web")
-	j.Proxy = []reconcile.ProxyAddr{{Addr: "2001:db8:1::10", Bridge: "jo0", Uplink: "em0"}}
+	j.Proxy = []reconcile.ProxyAddr{{Addr: "2001:db8:1::10", Iface: "jo0ha", Uplink: "em0"}}
 	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{proxyNet()}, Jails: []reconcile.JailDesired{j}}
 	// A stopped jail is not answered for.
 	w.R.Pass(bg)
@@ -532,7 +523,7 @@ func TestNDPProxyManagement(t *testing.T) {
 	_ = w.Jails.Create(bg, "/etc/jailops/jails/web/jail.conf", "web")
 	w.R.Pass(bg)
 	got := ndp.last()
-	if len(got) != 1 || got[0].Addr.String() != "2001:db8:1::10" || got[0].Bridge != "jo0" {
+	if len(got) != 1 || got[0].Addr.String() != "2001:db8:1::10" || got[0].Iface != "jo0ha" {
 		t.Fatalf("%+v", got)
 	}
 	var cond api.Condition
@@ -585,7 +576,7 @@ func TestRunLoopTriggers(t *testing.T) {
 	go func() { w.R.Run(ctx); close(done) }()
 	waitFor := func(what string, cond func() bool) {
 		t.Helper()
-		for i := 0; i < 400; i++ {
+		for i := 0; i < 6000; i++ { // 30 s: a slow CI machine
 			if cond() {
 				return
 			}
@@ -637,7 +628,7 @@ func TestProjectJailAnchorsAndParent(t *testing.T) {
 		t.Fatalf("jail anchor: %q", live)
 	}
 	parent, _ := w.PF.Read(bg, "jailops/web")
-	if !strings.Contains(parent, `anchor "*"`) || !strings.Contains(parent, `nat-anchor "*"`) {
+	if !strings.Contains(parent, `anchor "*"`) || strings.Contains(parent, `nat-anchor`) {
 		t.Fatalf("parent anchor: %q", parent)
 	}
 	// A foreign parent anchor is healed like the jail's own.
@@ -725,7 +716,7 @@ func TestAJustStartedProxyGetsASecondLookBeforeTheInterval(t *testing.T) {
 	go func() { w.R.Run(ctx); close(done) }()
 	waitFor := func(what string, cond func() bool) {
 		t.Helper()
-		for i := 0; i < 400; i++ {
+		for i := 0; i < 6000; i++ { // 30 s: a slow CI machine
 			if cond() {
 				return
 			}
@@ -759,4 +750,89 @@ func TestAJustStartedProxyGetsASecondLookBeforeTheInterval(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the loop did not stop")
 	}
+}
+
+// A proxy that dropped solicitations over its limits in the last hour says so on the network, next to the condition that
+// says it answers; without drops there is no such condition.
+func TestNDPProxyReportsDroppedSolicitations(t *testing.T) {
+	ndp := &fakeNDP{run: make(chan struct{})}
+	w := newWorld(t, reconcile.Config{NDP: func(string) (reconcile.NDP, error) { return ndp, nil }})
+	j := jailDesired("web")
+	j.Proxy = []reconcile.ProxyAddr{{Addr: "2001:db8:1::10", Iface: "jo0ha", Uplink: "em0"}}
+	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{proxyNet()}, Jails: []reconcile.JailDesired{j}}
+	_ = w.Jails.Create(bg, "/etc/jailops/jails/web/jail.conf", "web")
+	w.R.Pass(bg)
+	<-ndp.run
+	flood := func() *api.Condition {
+		for _, c := range w.netSt["lan"].Conditions {
+			if c.Type == reconcile.CondProxyFlood {
+				return &c
+			}
+		}
+		return nil
+	}
+	w.R.Pass(bg)
+	if c := flood(); c != nil {
+		t.Fatalf("a condition without drops: %+v", c)
+	}
+	ndp.mu.Lock()
+	ndp.floods = 4321
+	ndp.mu.Unlock()
+	w.R.Pass(bg)
+	c := flood()
+	if c == nil || c.Status != api.ConditionFalse || c.Reason != "Flooded" || !strings.Contains(c.Message, "4321") {
+		t.Fatalf("%+v", w.netSt["lan"].Conditions)
+	}
+	for _, cd := range w.netSt["lan"].Conditions {
+		if cd.Type == reconcile.CondProxy && cd.Status != api.ConditionTrue {
+			t.Fatalf("drops must not stop the proxy from answering: %+v", cd)
+		}
+	}
+}
+
+// service pf restart empties every anchor: the watch notices that the anchor of a running jail is empty and asks for a
+// pass, so the jails are unfiltered for seconds and not for the minute of the loop.
+func TestWatchKicksAPassWhenPFWasFlushed(t *testing.T) {
+	w := newWorld(t, reconcile.Config{Interval: time.Hour, Debounce: time.Second, PFWatch: 10 * time.Millisecond})
+	j := jailDesired("web_nginx")
+	j.Project = "web"
+	j.AnchorName = render.JailAnchor("web_nginx")
+	j.ParentAnchors = map[string]string{render.ProjectAnchor("web"): render.ProjectAnchorRules()}
+	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{lan()}, Jails: []reconcile.JailDesired{j}}
+	w.R.Pass(bg)
+	_ = w.Jails.Create(bg, "/etc/jailops/jails/web_nginx/jail.conf", "web_nginx")
+	h := j.Epairs[0]
+	_, _, _ = w.Net.EpairCreate(bg, h[:len(h)-1])
+	_ = w.Net.SetDescription(bg, h, "jailops:"+jailID)
+	w.R.Pass(bg) // the running jail's anchor is loaded and remembered
+	if live, _ := w.PF.Read(bg, j.AnchorName); live != j.Ruleset {
+		t.Fatalf("the anchor is not loaded: %q", live)
+	}
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan struct{})
+	go func() { w.R.Run(ctx); close(done) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		for i := 0; i < 6000; i++ {
+			if cond() {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("timed out: %s", what)
+	}
+	waitFor("the loop's first pass and its timer", func() bool { return w.clock.Pending() > 0 })
+	if err := w.PF.Flush(bg, j.AnchorName); err != nil { // service pf restart
+		t.Fatal(err)
+	}
+	waitFor("the debounce of the pass the watch asked for", func() bool { return w.clock.Pending() >= 2 })
+	w.clock.Advance(time.Second)
+	waitFor("the anchor is loaded again", func() bool {
+		live, _ := w.PF.Read(bg, j.AnchorName)
+		return live == j.Ruleset
+	})
 }

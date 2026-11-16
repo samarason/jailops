@@ -17,7 +17,6 @@ func TestJailUsage(t *testing.T) {
 	e, s := newEnv(t)
 	ctx := as(globalAdmin, dtest.SeedProject)
 	j := dtest.WebJail("web")
-	j.Spec.Volumes = []api.VolumeMount{{Name: "db", Mount: "/srv/db"}}
 	op, err := s.CreateJail(ctx, j)
 	if err != nil {
 		t.Fatal(err)
@@ -39,8 +38,7 @@ func TestJailUsage(t *testing.T) {
 		t.Fatalf("disk without numbers: %+v", u.Disk)
 	}
 
-	// The root counts by itself; the persistent datasets and the volumes
-	// parent are the data.
+	// The root counts by itself; the persistent datasets are the data.
 	rows, err := e.ZFS.List(context.Background(), zfs.ListOpts{Root: container, Recursive: true, Props: []string{lifecycle.PropKind}})
 	if err != nil {
 		t.Fatal(err)
@@ -53,10 +51,6 @@ func TestJailUsage(t *testing.T) {
 		case r.Props[lifecycle.PropKind] == lifecycle.KindPersistent:
 			e.ZFS.SetSpace(r.Name, 1000, 1000)
 			persistent++
-		case r.Name == container+"/data":
-			e.ZFS.SetSpace(r.Name, 5000, 100)
-		case r.Name == container+"/data/db":
-			e.ZFS.SetSpace(r.Name, 4900, 4900)
 		default:
 			e.ZFS.SetSpace(r.Name, 1<<40, 1<<40) // the container and anything else: never counted
 		}
@@ -65,7 +59,7 @@ func TestJailUsage(t *testing.T) {
 		t.Fatalf("no persistent datasets: %+v", rows)
 	}
 	u, _ = s.JailUsage(ctx, "web")
-	if u.Disk.Error != "" || u.Disk.RootBytes != 123456 || u.Disk.RootReferencedBytes != 2_000_000 || u.Disk.DataBytes != int64(persistent*1000+5000) {
+	if u.Disk.Error != "" || u.Disk.RootBytes != 123456 || u.Disk.RootReferencedBytes != 2_000_000 || u.Disk.DataBytes != int64(persistent*1000) {
 		t.Fatalf("disk: %+v (persistent %d)", u.Disk, persistent)
 	}
 

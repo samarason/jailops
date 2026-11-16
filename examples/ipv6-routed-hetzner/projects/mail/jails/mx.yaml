@@ -9,5 +9,5 @@ spec:
   storage: default
   network:
     - {name: eth0, network: mail, ipv4: auto, ipv6: "2001:db8:abcd:1:2::25"}
-  firewall: {policy: mx}
+  firewall: {policies: [mx]}
   resources: {memory: 2G}

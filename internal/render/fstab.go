@@ -121,8 +121,8 @@ func LinuxMounts(root string, devfsRuleset int, shmBytes uint64) []LinuxMount {
 }
 
 // LinuxDevfsRuleArgv returns the `devfs rule -s <n> ...` argument lists that
-// load the ruleset of LinuxDevfsRuleset into the kernel, for callers that
-// have no devfs.rules file (the image builder).
+// load the ruleset of a Linux jail into the kernel under the number n: the
+// rules of LinuxDevfsRuleset, and of the image build jail.
 func LinuxDevfsRuleArgv(n int, devices []string) ([][]string, error) {
 	s := fmt.Sprint(n)
 	out := [][]string{{"devfs", "rule", "-s", s, "add", "hide"}}

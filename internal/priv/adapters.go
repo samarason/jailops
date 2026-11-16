@@ -190,18 +190,6 @@ var _ ifconfig.Client = netClient{}
 func (n netClient) List(ctx context.Context) ([]ifconfig.Iface, error) {
 	return callJSON[[]ifconfig.Iface](ctx, n.c, OpNetList, empty{}, callOpts{})
 }
-func (n netClient) BridgeCreate(ctx context.Context, name string) error {
-	return callNone(ctx, n.c, OpNetBridgeCreate, netArgs{Name: name})
-}
-func (n netClient) BridgeDestroy(ctx context.Context, name string) error {
-	return callNone(ctx, n.c, OpNetBridgeDestroy, netArgs{Name: name})
-}
-func (n netClient) BridgeAddMember(ctx context.Context, bridge, member string, private bool) error {
-	return callNone(ctx, n.c, OpNetBridgeAddMember, netArgs{Bridge: bridge, Member: member, Private: private})
-}
-func (n netClient) BridgeDeleteMember(ctx context.Context, bridge, member string) error {
-	return callNone(ctx, n.c, OpNetBridgeDelMember, netArgs{Bridge: bridge, Member: member})
-}
 func (n netClient) SetDescription(ctx context.Context, iface, desc string) error {
 	return callNone(ctx, n.c, OpNetSetDescription, netArgs{Iface: iface, Desc: desc})
 }
@@ -232,12 +220,6 @@ func (n netClient) RouteAdd(ctx context.Context, r ifconfig.Route) error {
 }
 func (n netClient) RouteDelete(ctx context.Context, r ifconfig.Route) error {
 	return callNone(ctx, n.c, OpNetRouteDelete, netArgs{Route: r})
-}
-func (n netClient) NeighborSet(ctx context.Context, iface string, a netip.Addr, mac string) error {
-	return callNone(ctx, n.c, OpNetNeighborSet, netArgs{Iface: iface, Addr: a, MAC: mac})
-}
-func (n netClient) NeighborDelete(ctx context.Context, iface string, a netip.Addr) error {
-	return callNone(ctx, n.c, OpNetNeighborDelete, netArgs{Iface: iface, Addr: a})
 }
 func (n netClient) IPv6Forwarding(ctx context.Context) (bool, error) {
 	r, err := callJSON[boolRes](ctx, n.c, OpNetIPv6Forwarding, empty{}, callOpts{})

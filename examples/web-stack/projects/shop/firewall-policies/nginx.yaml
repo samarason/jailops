@@ -3,8 +3,20 @@ kind: FirewallPolicy
 metadata:
   name: nginx
 spec:
+  comment: "The web front of the shop: open to the world on the web ports, ssh only for the administrators."
   default_in: deny
   default_out: allow
   rules:
-    - {name: https, action: allow, direction: in, proto: tcp, ports: ["80", "443"]}
-    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["@admins"]}
+    - name: https
+      comment: "the shop's pages, for everyone"
+      action: allow
+      direction: in
+      proto: tcp
+      ports: ["80", "443"]
+    - name: ssh-admins
+      comment: "administration, from the admins set only"
+      action: allow
+      direction: in
+      proto: tcp
+      ports: ["22"]
+      from: ["set:admins"]

@@ -1,0 +1,430 @@
+#!/bin/sh
+# jailops-setup: sets a FreeBSD host up for JailOps after `pkg install jailops`, as root, in one command.
+#
+#   jailops-setup [-pool POOL] [-n|--dry-run] [-y|--yes]
+#
+# It does what docs/install.md sections 1 to 6 describe, in this order, and only what is not done yet (safe to run
+# twice): the kernel modules, the one-time init of the pool, IP forwarding, the host resolver (local-unbound, which gives
+# the jails names; asked), the anchor line in pf.conf, the service
+# (jailopsd, with the web console; it starts the helper), `jailops doctor`, the first administrator. Every action is
+# printed in one line, starting with "> ", before it runs; -n prints them and changes nothing.
+#
+# pf: lines of pf.conf that exist are never changed or moved. Missing lines are inserted where pf wants them (options,
+# normalisation, translation, filtering), a timestamped copy of the file is kept next to it, the new text is checked
+# with `pfctl -nf` before anything is written, and loaded with `pfctl -f` (open connections keep their states) only
+# after the check passed. pf is never restarted. Starting pf, which can cut an ssh session when the rules block it, is
+# said first and asked (or needs -y).
+#
+# Environment, for tests (nothing else reads it):
+#   JAILOPS_SETUP_ROOT   prefix of every file path it reads or writes (pf.conf, loader.conf, the daemon's socket)
+#   JAILOPS_SETUP_PRIV   the jailops-priv binary (default /usr/local/libexec/jailops-priv)
+#   JAILOPS_SETUP_WAIT   seconds to wait for the daemon's socket (default 20)
+# Every command (sysrc, sysctl, zpool, kldstat, kldload, pfctl, service, jailops, id, hostname) is taken from PATH.
+set -u
+
+ROOT=${JAILOPS_SETUP_ROOT:-}
+PRIV=${JAILOPS_SETUP_PRIV:-/usr/local/libexec/jailops-priv}
+WAIT=${JAILOPS_SETUP_WAIT:-20}
+ANCHOR='"jailops/*"'
+WEB_PORT=39110
+
+usage() {
+	cat <<'EOF'
+usage: jailops-setup [-pool POOL] [-n|--dry-run] [-y|--yes]
+
+Sets this host up for JailOps after `pkg install jailops`: the kernel modules,
+the one-time init of the pool, IP forwarding, the host resolver (local-unbound,
+which gives the jails names; asked), the JailOps anchor line in pf.conf, the
+service, jailops doctor and the first administrator. Run it as root. It is
+safe to run again; what is done already is left as it is.
+
+  -pool POOL    the ZFS pool for JailOps (needed when the host has more than one)
+  -n, --dry-run print what would be done, change nothing
+  -y, --yes     do not ask: also load and start pf (read what it prints first)
+EOF
+}
+
+pool="" dry=0 yes=0
+while [ $# -gt 0 ]; do
+	case $1 in
+	-pool|--pool) [ $# -ge 2 ] || { echo "x -pool needs a pool name" >&2; exit 2; }; pool=$2; shift ;;
+	-pool=*|--pool=*) pool=${1#*=} ;;
+	-n|-dry-run|--dry-run) dry=1 ;;
+	-y|-yes|--yes) yes=1 ;;
+	-h|-help|--help) usage; exit 0 ;;
+	*) echo "x unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+	shift
+done
+
+problems=0
+say() { printf '%s\n' "$*"; }
+ok() { say "ok: $*"; }
+warn() { say "! $*"; }
+fail() { say "x $*"; problems=$((problems + 1)); }
+step() { say ""; say "== $*"; }
+# run CMD...: print the command, then run it unless this is a dry run
+run() {
+	say "> $*"
+	[ "$dry" = 1 ] && return 0
+	"$@"
+}
+# ask QUESTION DEFAULT(y|n): yes with -y; otherwise the answer read from standard input (an empty line is the
+# default, end of input is no). A dry run never asks.
+ask() {
+	[ "$yes" = 1 ] && return 0
+	printf '%s ' "$1"
+	if [ "$2" = y ]; then printf '[Y/n] '; else printf '[y/N] '; fi
+	if ! read -r answer; then
+		say ""
+		return 1
+	fi
+	[ -t 0 ] || say "$answer"
+	case $answer in
+	[Yy]|[Yy][Ee][Ss]) return 0 ;;
+	"") [ "$2" = y ] ;;
+	*) return 1 ;;
+	esac
+}
+# yes VALUE: rc.conf's idea of yes
+isyes() { case ${1:-} in [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]|1) return 0 ;; esac; return 1; }
+rcvar() { sysrc -n "$1" 2>/dev/null; }
+
+# ── checks before anything ───────────────────────────────────────────────────────────────────────────────────────
+if [ "$(id -u)" != 0 ]; then
+	say "x jailops-setup must run as root (log in as root, or su -, and run it again)"
+	exit 1
+fi
+if [ ! -x "$PRIV" ]; then
+	say "x $PRIV is missing: install the package first: pkg install jailops"
+	exit 1
+fi
+if isyes "$(rcvar jailops_appliance)"; then
+	say "x jailops_appliance is YES in rc.conf: this host is set up from the web console (docs/install.md, The appliance path)"
+	exit 1
+fi
+[ "$dry" = 1 ] && say "Dry run: the lines starting with > are what would run; nothing is changed."
+
+# ── the pool ─────────────────────────────────────────────────────────────────────────────────────────────────────
+pools=$(zpool list -H -o name 2>/dev/null)
+if [ -z "$pools" ]; then
+	say "x no ZFS pool is imported: JailOps needs one (zpool list)"
+	exit 1
+fi
+if [ -z "$pool" ]; then
+	if [ "$(printf '%s\n' "$pools" | wc -l | tr -d ' ')" -gt 1 ]; then
+		say "x this host has more than one pool; choose the one for JailOps with -pool:"
+		printf '%s\n' "$pools" | sed 's/^/    jailops-setup -pool /'
+		exit 2
+	fi
+	pool=$pools
+fi
+case $pool in
+""|-*|*[!A-Za-z0-9_.:-]*) say "x -pool names a pool (for example -pool zroot), not \"$pool\""; exit 2 ;;
+esac
+if ! printf '%s\n' "$pools" | grep -qx -- "$pool"; then
+	say "x there is no pool $pool; the pools are: $(printf '%s ' $pools)"
+	exit 2
+fi
+say "pool: $pool"
+
+# ── 1. kernel modules (docs/install.md section 1) ───────────────────────────────────────────────────────────────
+step "kernel modules"
+missing="" boot=""
+for m in if_epair pf zfs; do
+	kldstat -q -n "$m" 2>/dev/null || missing="$missing $m"
+	isyes "$(sysrc -f "$ROOT/boot/loader.conf" -n "${m}_load" 2>/dev/null)" || boot="$boot ${m}_load=YES"
+done
+# loading pf does not start it: it filters nothing until pfctl -e
+[ -n "$missing" ] && { run kldload -n $missing || fail "kldload$missing"; }
+[ -n "$boot" ] && { run sysrc -f "$ROOT/boot/loader.conf" $boot || fail "loader.conf"; }
+[ -z "$missing$boot" ] && ok "if_epair, pf and zfs are loaded and load at boot"
+
+# ── 2. jailops-priv init (section 5) ────────────────────────────────────────────────────────────────────────────
+step "jailops-priv init (the user, the datasets, the configuration; what exists is left as it is)"
+if [ "$dry" = 1 ]; then
+	say "> $PRIV init -pool $pool"
+	"$PRIV" init -pool "$pool" -dry-run 2>&1 | sed '/^$/,$d; s/^/    /'
+else
+	say "> $PRIV init -pool $pool"
+	if ! out=$("$PRIV" init -pool "$pool" 2>&1); then
+		printf '%s\n' "$out" | sed 's/^/    /'
+		say "x jailops-priv init failed: nothing after it is done; fix the cause and run jailops-setup again"
+		exit 1
+	fi
+	# its closing advice is what this script does next
+	printf '%s\n' "$out" | sed '/^$/,$d; s/^/    /'
+fi
+
+# ── 3. forwarding (section 4) ────────────────────────────────────────────────────────────────────────────────────
+step "IP forwarding"
+set_rc="" set_now=""
+isyes "$(rcvar gateway_enable)" || set_rc="$set_rc gateway_enable=YES"
+isyes "$(rcvar ipv6_gateway_enable)" || set_rc="$set_rc ipv6_gateway_enable=YES"
+[ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null)" = 1 ] || set_now="$set_now net.inet.ip.forwarding=1"
+[ "$(sysctl -n net.inet6.ip6.forwarding 2>/dev/null)" = 1 ] || set_now="$set_now net.inet6.ip6.forwarding=1"
+[ -n "$set_rc" ] && { run sysrc $set_rc || fail "sysrc$set_rc"; }
+[ -n "$set_now" ] && { run sysctl $set_now || fail "sysctl$set_now"; }
+[ -z "$set_rc$set_now" ] && ok "forwarding is on and persistent"
+
+# ── names for the jails (docs/dns.md) ────────────────────────────────────────────────────────────────────────────
+# The base system's local-unbound answers the DNS of the jails and gives them names, postgres.PROJECT.internal; JailOps
+# writes the names into its conf.d by itself. It is enabled by default (the question is answered yes with Enter, -y
+# yes, -n only prints). Nothing is changed when it is already enabled (but its conf.d is made root's, which the helper
+# insists on), when another resolver already listens on port 53, or when local-unbound is not part of the system.
+step "names for the jails: the host resolver (local-unbound)"
+unbound_dir="$ROOT/var/unbound/conf.d"
+if ! command -v local-unbound-setup >/dev/null 2>&1; then
+	ok "local-unbound is not part of this system: the jails do not resolve each other by name"
+elif isyes "$(rcvar local_unbound_enable)"; then
+	ok "local_unbound is enabled: the jails get names (jailops doctor, dns.unbound)"
+	if [ -d "$unbound_dir" ] && [ "$(stat -f %u "$unbound_dir" 2>/dev/null)" != 0 ]; then
+		run chown root:wheel "$unbound_dir" || fail "chown root:wheel $unbound_dir"
+	fi
+elif command -v sockstat >/dev/null 2>&1 && [ -n "$(sockstat -l -p 53 2>/dev/null | sed 1d)" ]; then
+	# some resolver already answers on port 53 here (an unbound of its own, dnsmasq, a name server): never touched
+	say "a resolver already listens on port 53 on this host: left alone, and the jails get no names from it."
+	say "To use it, give a network its nameservers (dns: in jailops network edit); or stop it and run jailops-setup again."
+else
+	say "The host resolver (local-unbound) answers the DNS of the jails and gives them names (postgres.PROJECT.internal)."
+	say "It is the way the jails resolve each other and the rest of the world; it keeps the nameservers the host uses now."
+	if [ "$dry" = 1 ] || ask "Enable the host resolver (local_unbound)?" y; then
+		if run sysrc local_unbound_enable=YES && run local-unbound-setup && run service local_unbound start; then
+			[ -d "$unbound_dir" ] && { run chown root:wheel "$unbound_dir" || fail "chown root:wheel $unbound_dir"; }
+		else
+			fail "enabling local_unbound: the jails get no names (see the messages above)"
+		fi
+	else
+		say "skipped: the jails do not resolve each other by name (run jailops-setup again, or sysrc local_unbound_enable=YES and local-unbound-setup)"
+	fi
+fi
+
+# ── 4. pf (section 3) ────────────────────────────────────────────────────────────────────────────────────────────
+step "pf: the JailOps anchor line"
+# pfplan FILE: one line of shell assignments, what FILE has and where missing lines go (line numbers; 0: not
+# needed, -1: at the end). pfedit FILE PLAN...: FILE with the missing lines inserted, every existing line unchanged.
+# Only statements at the top level count: not continuation lines, not lines inside { } (inline anchors, lists).
+PFAWK='
+function bare(s) { gsub(/"[^"]*"/, "\"\"", s); sub(/#.*/, "", s); return s }
+{
+	line = $0; s = bare(line); t = s; sub(/^[ \t]+/, "", t)
+	if (!cont && depth == 0 && t != "") {
+		split(t, w, /[ \t]+/); k = w[1]; cls = ""
+		if (k == "set") { cls = "opt"; if (w[2] == "state-policy") { sp = 1; if (w[3] != "if-bound") spother = 1 } }
+		else if (k == "scrub") { cls = "norm"; scrub = 1 }
+		else if (k == "altq" || k == "queue") cls = "queue"
+		else if (k ~ /^(nat|rdr|binat|nat-anchor|rdr-anchor|binat-anchor|no)$/) cls = "trans"   # rules of the older translation ruleset stay where they are
+		else if (k ~ /^(pass|block|anchor|match|antispoof)$/) { cls = "filter"; if (k == "match" && t ~ /[ \t]scrub([ \t(]|$)/) scrub = 1 }
+		else if (k == "include") inc = 1
+		if (k == "block") blk = 1
+		if (line ~ /^[ \t]*anchor[ \t]+"jailops\/\*"/) ha = 1
+		if (cls != "" && cls != "opt" && !frule) frule = NR
+		if (cls ~ /^(queue|trans|filter)$/ && !fpost) fpost = NR
+		if (cls == "filter" && !ffil) ffil = NR
+	}
+	depth += gsub(/\{/, "{", s) - gsub(/\}/, "}", s); if (depth < 0) depth = 0
+	cont = (line ~ /\\[ \t]*$/)
+	if (mode == "edit") { put(NR); print line }
+}
+function at(n) { return n ? n : -1 }
+function put(n) {
+	if (n == psp) { print "# jailops-setup: bind states to their interface (the NAT of the jails needs it)"; print "set state-policy if-bound" }
+	if (n == pscrub) { print "# jailops-setup: normalise packets"; print "scrub in all fragment reassemble" }
+	if (n == panc) { print "# jailops-setup: the rules and the NAT of the jails, before your own filter rules"; print "anchor \"jailops/*\"" }
+}
+END {
+	if (mode == "edit") { put(-1); exit }
+	printf "has_sp=%d sp_other=%d has_scrub=%d has_include=%d has_block=%d has_anchor=%d ", sp, spother, scrub, inc, blk, ha
+	printf "at_sp=%d at_scrub=%d at_anchor=%d\n", sp ? 0 : at(frule), scrub ? 0 : at(fpost), ha ? 0 : at(ffil)
+}'
+pfplan() { awk -v mode=plan "$PFAWK" "$1"; }
+pfedit() {
+	awk -v mode=edit -v psp="$at_sp" -v pscrub="$at_scrub" -v panc="$at_anchor" "$PFAWK" "$1"
+}
+
+conf=$(rcvar pf_rules)
+conf=$ROOT${conf:-/etc/pf.conf}
+cand=$(mktemp "${TMPDIR:-/tmp}/jailops-setup.XXXXXX") || exit 1
+trap 'rm -f "$cand"' EXIT
+pf_ok=1 changed=0 created=0 has_block=0
+if [ ! -e "$conf" ]; then
+	created=1 changed=1
+	cat > "$cand" <<EOF
+# $conf, written by jailops-setup: the JailOps anchor, and every other packet passes, as before pf ran.
+# Add your own rules after the anchor line. Check with pfctl -nf $conf, load with pfctl -f $conf.
+set skip on lo0
+set state-policy if-bound
+scrub in all fragment reassemble
+anchor $ANCHOR
+pass all
+EOF
+	say "$conf does not exist: a minimal one is written (the anchor, then pass all: nothing is blocked)"
+	sed 's/^/    + /' "$cand"
+elif [ ! -r "$conf" ]; then
+	fail "$conf cannot be read"; pf_ok=0
+else
+	eval "$(pfplan "$conf")"
+	if [ "$at_sp$at_scrub$at_anchor" = 000 ]; then
+		ok "$conf has the anchor line, set state-policy and a scrub rule"
+	elif [ "$has_include" = 1 ] && [ "$at_anchor" != 0 ]; then
+		fail "$conf includes other files, so jailops-setup does not edit it: add the line of docs/install.md section 3 yourself"
+		pf_ok=0
+	else
+		pfedit "$conf" > "$cand"
+		changed=1
+		[ "$at_anchor" != 0 ] && say "the JailOps anchor line is missing from $conf: it is added where pf wants it"
+		[ "$at_sp" != 0 ] && say "$conf has no set state-policy: set state-policy if-bound is added (jails behind NAT need it)"
+		[ "$at_scrub" != 0 ] && say "$conf has no scrub rule: scrub in all fragment reassemble is added (pf.scrub of jailops doctor)"
+		say "every line that is there stays as it is; the change:"
+		diff -u "$conf" "$cand" | sed '1,2d; s/^/    /'
+	fi
+	[ "${sp_other:-0}" = 1 ] && warn "$conf sets another state-policy, left as it is: jails behind NAT want if-bound (docs/install.md section 3)"
+fi
+[ "$changed" = 1 ] || cp "$conf" "$cand" 2>/dev/null
+grep -q '^[[:space:]]*block' "$cand" 2>/dev/null && has_block=1
+
+if [ "$pf_ok" = 1 ]; then
+	running=0 loaded=0
+	pfctl -s info 2>/dev/null | grep -q '^Status: Enabled' && running=1
+	if pfctl -s rules 2>/dev/null | grep -qF "anchor $ANCHOR"; then
+		loaded=1
+	fi
+	need_load=0 need_enable=0 need_rc=0
+	{ [ "$changed" = 1 ] || [ "$loaded" = 0 ]; } && need_load=1
+	[ "$running" = 0 ] && need_enable=1
+	isyes "$(rcvar pf_enable)" || need_rc=1
+	if [ "$need_load$need_enable$need_rc" = 000 ]; then
+		ok "pf runs with the JailOps anchor and starts at boot"
+	else
+		# the check comes first: a file pf refuses is never written, never loaded
+		say "> pfctl -nf $conf    (the new text, checked before anything is written or loaded)"
+		if ! out=$(pfctl -nf "$cand" 2>&1); then
+			printf '%s\n' "$out" | sed 's/^/    /'
+			fail "pfctl refuses the text of $conf (above): nothing was written, nothing loaded, the running rules are unchanged"
+			pf_ok=0
+		fi
+	fi
+	if [ "$pf_ok" = 1 ] && [ "$need_load$need_enable$need_rc" != 000 ]; then
+		if [ "$need_load" = 1 ] && [ "$running" = 1 ]; then
+			say "Loading with pfctl -f replaces the rules and keeps the states: open connections (this ssh session) stay."
+		fi
+		if [ "$need_enable" = 1 ] || [ "$need_rc" = 1 ]; then
+			when="now and at every boot"
+			[ "$need_enable" = 0 ] && when="at every boot (it runs now)"
+			[ "$need_rc" = 0 ] && when="now (it is enabled at boot already)"
+			if [ "$has_block" = 1 ]; then
+				warn "pf starts filtering $when with the rules of $conf, which BLOCK traffic: if they do not pass ssh,"
+				warn "this session and every later ssh login are cut. Check that a pass rule admits ssh before you answer yes."
+			else
+				say "pf starts filtering $when with the rules of $conf; it has no block rule, so ssh is not cut."
+			fi
+		fi
+		if [ "$dry" = 1 ] || ask "Apply these pf changes?" n; then
+			backup="$conf.jailops-setup-$(date +%Y%m%d-%H%M%S)"
+			[ -e "$backup" ] && backup="$backup-$$"
+			if [ "$changed" = 1 ] && [ "$created" = 1 ]; then
+				run install -m 644 "$cand" "$conf" || { fail "writing $conf"; pf_ok=0; }
+			elif [ "$changed" = 1 ]; then
+				run cp -p "$conf" "$backup" || { fail "the copy $backup could not be made: $conf is unchanged"; pf_ok=0; }
+				if [ "$pf_ok" = 1 ]; then
+					say "> write $conf (the lines marked + above; the old text is in $backup)"
+					if [ "$dry" = 0 ]; then
+						# the new file takes the mode and owner of the old one, then replaces it in one rename
+						if ! { cp -p "$conf" "$conf.jailops-setup.tmp" && cat "$cand" > "$conf.jailops-setup.tmp" && mv -f "$conf.jailops-setup.tmp" "$conf"; }; then
+							rm -f "$conf.jailops-setup.tmp"
+							fail "writing $conf: it is unchanged (the copy $backup is not needed)"
+							pf_ok=0
+						fi
+					fi
+				fi
+			fi
+			if [ "$pf_ok" = 1 ] && [ "$need_load" = 1 ]; then
+				if ! run pfctl -f "$conf"; then
+					# pfctl loads in one transaction: a refused load leaves the old rules in place
+					if [ "$changed" = 1 ] && [ "$created" = 0 ]; then
+						run cp -p "$backup" "$conf"
+						fail "pfctl -f failed: the loaded rules are unchanged and $conf is back as it was"
+					else
+						fail "pfctl -f failed: the loaded rules are unchanged"
+					fi
+					pf_ok=0
+				fi
+			fi
+			if [ "$pf_ok" = 1 ]; then
+				[ "$need_rc" = 1 ] && { run sysrc pf_enable=YES || fail "sysrc pf_enable=YES"; }
+				[ "$need_enable" = 1 ] && { run pfctl -e || fail "pfctl -e"; }
+			fi
+		else
+			say "pf left as it is. Do it later: run jailops-setup again, or follow docs/install.md section 3."
+			pf_ok=0
+			problems=$((problems + 1))
+		fi
+	fi
+fi
+
+# ── 5. the service (section 6) ───────────────────────────────────────────────────────────────────────────────────
+# One service: jailopsd starts the privileged helper it needs (and stops it with itself), so the helper has no line of
+# its own in rc.conf and is never started here.
+step "service"
+set_rc="" web_changed=0
+isyes "$(rcvar jailopsd_enable)" || set_rc="$set_rc jailopsd_enable=YES"
+web=$(rcvar jailopsd_web)
+if [ -z "$web" ]; then
+	set_rc="$set_rc jailopsd_web=YES"
+	web=YES web_changed=1
+fi
+[ -n "$set_rc" ] && { run sysrc $set_rc || fail "sysrc$set_rc"; }
+[ -z "$set_rc" ] && ok "jailopsd is enabled"
+started=1
+if service jailopsd status >/dev/null 2>&1; then
+	if [ "$web_changed" = 1 ]; then
+		run service jailopsd restart || { fail "service jailopsd restart"; started=0; }
+	else
+		ok "jailopsd is running"
+	fi
+elif ! run service jailopsd start; then
+	fail "service jailopsd start: see /var/log/messages"
+	started=0
+fi
+
+# ── 6. doctor and the first administrator ────────────────────────────────────────────────────────────────────────
+step "jailops doctor"
+if [ "$dry" = 1 ]; then
+	say "> jailops doctor"
+elif [ "$started" = 1 ]; then
+	sock=$ROOT/var/run/jailops/jailops.sock
+	i=0
+	while [ ! -e "$sock" ] && [ "$i" -lt "$WAIT" ]; do sleep 1; i=$((i + 1)); done
+	say "> jailops doctor"
+	jailops doctor || warn "jailops doctor reports a problem: its lines say what to do (docs/troubleshooting.md)"
+fi
+
+step "the first administrator"
+users=$(jailops user list -o name 2>/dev/null)
+if [ -n "$users" ]; then
+	ok "users exist already: $(printf '%s ' $users)"
+elif [ "$dry" = 1 ]; then
+	say "> jailops user create admin --admin --password-prompt"
+elif [ "$started" = 0 ]; then
+	say "jailopsd does not run; create the administrator once it does: jailops user create admin --admin --password-prompt"
+elif [ ! -t 0 ]; then
+	say "Create it on a terminal: jailops user create admin --admin --password-prompt"
+elif ask "Create the administrator admin now (the password is asked)?" y; then
+	run jailops user create admin --admin --password-prompt || fail "jailops user create admin"
+else
+	say "Later: jailops user create admin --admin --password-prompt"
+fi
+
+# ── done ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+say ""
+if isyes "$web"; then
+	say "The web console: https://$(hostname):$WEB_PORT/ (a self-signed certificate; open port $WEB_PORT in your firewall for the machines that use it)"
+fi
+say "Next: the first image, network and jail, docs/install.md section 7 (jailops image create freebsd-15-1 --release 15.1-RELEASE);"
+say "the application catalog: jailops app list."
+if [ "$problems" -gt 0 ]; then
+	say "x $problems step(s) are not done; the lines starting with x above say which. Run jailops-setup again after fixing them."
+	exit 1
+fi
+[ "$dry" = 1 ] && say "Dry run: nothing was changed." || say "Done."
+exit 0

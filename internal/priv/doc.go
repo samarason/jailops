@@ -30,7 +30,7 @@
 // IPv6 neighbor discovery. The built-in proxy needs two privileged things, and the helper offers them as two typed
 // operations (ndp.go): ndp.open hands the daemon a read-only, locked BPF capture of an approved uplink that delivers
 // neighbor discovery frames only, and ndp.answer sends one Neighbor Advertisement that the helper builds itself.
-// Both work only for the uplinks and prefixes the operator approved in the configuration (ndp-proxy); the daemon
+// Both work only for the uplinks and subnets of the networks in IPv6 proxy mode that JailOps has stored; the daemon
 // cannot widen that. The /128 host routes go through the ordinary network steps of the reconcile loop. Joining the
 // solicited-node multicast group of an address needs no helper operation: it is an ordinary IPV6_JOIN_GROUP on a
 // UDP socket the daemon opens itself (unprivileged on FreeBSD; checked on FreeBSD 15.1).

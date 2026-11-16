@@ -3,5 +3,9 @@ kind: AddressSet
 metadata:
   name: admins
 spec:
-  # Where administrators connect from (documentation addresses: replace them).
-  addresses: [203.0.113.7, "2001:db8:ffff::/48"]
+  comment: "Where the administrators connect from (documentation addresses: replace them)."
+  addresses:
+    - address: 203.0.113.7
+      comment: the administrator's home
+    - address: "2001:db8:ffff::/48"
+      comment: "the office (IPv6)"

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"log/slog"
-	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -28,8 +28,14 @@ type Config struct {
 	Interval time.Duration
 	// Debounce coalesces bursts of triggers (default 250ms).
 	Debounce time.Duration
-	// Autostart starts jails with boot.autostart on the first pass.
+	// PFWatch is how often the loop looks at whether pf was flushed (default 5s).
+	PFWatch time.Duration
+	// Autostart starts jails with boot.autostart on the first pass after the host booted.
 	Autostart bool
+	// BootStateFile remembers the boot of the host (kern.boottime) that the boot pass ran for. A daemon that starts
+	// again while the host stays up (a restart, a package upgrade) starts no jails: an operator may have stopped
+	// them on purpose. Empty: every daemon start is a boot.
+	BootStateFile string
 	// NDP builds the neighbor discovery proxies of networks in IPv6 proxy mode; without it those networks report
 	// that no proxy is available.
 	NDP NDPFactory
@@ -48,31 +54,28 @@ type Env struct {
 	Sysctl func(ctx context.Context, name string) (string, error)
 	Clock  Clock
 	Log    *slog.Logger
-	// HostRoutes reads the IPv6 /128 host routes (address to interface). Optional: without it stale routes of
-	// proxy-mode networks are not collected.
-	HostRoutes func(ctx context.Context) (map[netip.Addr]string, error)
-	// HostNeighbors reads the permanent link-local neighbor entries. Optional: without it stale entries are not collected.
-	HostNeighbors func(ctx context.Context) ([]ifconfig.Neighbor, error)
+	// Routes reads the routing table. Optional: without it the loop does not look at routes, and a route that went
+	// missing is not put back.
+	Routes func(ctx context.Context) ([]ifconfig.RouteEntry, error)
 	// Trigger is an optional extra trigger (state watch events).
 	Trigger <-chan struct{}
 	// WG configures WireGuard interfaces (optional: without it tunnels are reported as not applied).
 	WG wireguard.Host
+	// AfterPass is called once after each pass of Run (optional): the names of the jails for the host's resolver follow
+	// what the pass found running.
+	AfterPass func(ctx context.Context)
 }
 
 // Report summarises one pass; tests and `doctor` read it.
 type Report struct {
-	At      time.Time
-	Err     error
-	Applied []string            // steps executed
-	Drift   map[string][]string // by jail
-	Orphans []string            // epairs found without a jail
-	Cleaned []string            // orphans removed
-	// StaleRoutes are the /128 host routes of proxy-mode networks that belonged to no jail and were removed.
-	StaleRoutes []string
-	// StaleNeighbors are the link-local static neighbor entries of jails that are gone, removed.
-	StaleNeighbors []string
-	Started        []string          // autostarted jails
-	Failures       map[string]string // resource -> reason
+	At       time.Time
+	Err      error
+	Applied  []string            // steps executed
+	Drift    map[string][]string // by jail
+	Orphans  []string            // epairs found without a jail
+	Cleaned  []string            // orphans removed
+	Started  []string            // autostarted jails
+	Failures map[string]string   // resource -> reason
 }
 
 // Reconciler is the loop.
@@ -94,6 +97,11 @@ type Reconciler struct {
 	setSysctl map[string]bool
 	// jailSideOK maps a jail to the JID whose jail-side descriptions were found right (checked once per start).
 	jailSideOK map[string]int
+	// pipeRates is the bandwidth this daemon last set on each dummynet pipe of JailOps's range.
+	pipeRates map[int]uint64
+	// sentinel is the anchor of a running jail the last pass found in place: when it is empty, pf was flushed
+	// (service pf restart runs pfctl -F all) and the watch asks for a pass at once.
+	sentinel string
 }
 
 // New builds a Reconciler.
@@ -103,6 +111,9 @@ func New(cfg Config, env Env) *Reconciler {
 	}
 	if cfg.Debounce <= 0 {
 		cfg.Debounce = 250 * time.Millisecond
+	}
+	if cfg.PFWatch <= 0 {
+		cfg.PFWatch = defaultPFWatch
 	}
 	if env.Clock == nil {
 		env.Clock = SystemClock{}
@@ -130,11 +141,54 @@ func (r *Reconciler) Last() Report {
 	return r.last
 }
 
+// debounceWait is the wait before a pass that a kick asked for: the configured one, or three times what the last pass
+// took when that is longer, up to maxDebounce.
+func debounceWait(base, took time.Duration) time.Duration {
+	if t := 3 * took; t > base {
+		return min(t, maxDebounce)
+	}
+	return base
+}
+
+// maxDebounce is the longest wait between two passes that kicks cause.
+const maxDebounce = 10 * time.Second
+
+// defaultPFWatch is how often the loop looks at whether pf still holds the anchors it loaded.
+const defaultPFWatch = 5 * time.Second
+
+// watchPF asks for a pass at once when the anchor of a running jail is empty: starting or restarting pf flushes every
+// anchor (rc.d/pf runs pfctl -F all), and the jails would be unfiltered until the next pass a minute later.
+func (r *Reconciler) watchPF(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(r.cfg.PFWatch): // wall time, not the injected clock: the watch is about the host, not about the loop's timers
+		}
+		r.mu.Lock()
+		an := r.sentinel
+		r.mu.Unlock()
+		if an == "" || r.env.PF == nil {
+			continue
+		}
+		if live, err := r.env.PF.Read(ctx, an); err == nil && len(pfctl.RuleLines(live)) == 0 {
+			r.log.Warn("reconcile: the firewall anchor of a running jail is empty (pf was flushed): loading the anchors again", "anchor", an)
+			r.Kick()
+		}
+	}
+}
+
 // Run loops until ctx ends.
 func (r *Reconciler) Run(ctx context.Context) error {
 	defer r.stopProxies()
+	go supervise.Run(ctx, r.log, "pf-watch", r.watchPF)
 	for {
+		began := r.env.Clock.Now()
 		r.Pass(ctx)
+		if r.env.AfterPass != nil {
+			r.env.AfterPass(ctx)
+		}
+		took := r.env.Clock.Now().Sub(began)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -143,11 +197,14 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-r.env.Clock.After(r.cfg.Interval):
 			continue
 		}
-		// Debounce: let a burst settle, then drain what arrived meanwhile.
+		// Debounce: let a burst settle, then drain what arrived meanwhile. A pass of a host with thousands of jails
+		// takes a second: under a steady stream of kicks (a bulk create) passes would follow each other at once and
+		// take a third of the machine, so the wait grows with the time a pass took (a quarter of the time at most).
+		wait := debounceWait(r.cfg.Debounce, took)
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-r.env.Clock.After(r.cfg.Debounce):
+		case <-r.env.Clock.After(wait):
 		}
 		select {
 		case <-r.kick:
@@ -175,7 +232,8 @@ func (r *Reconciler) Pass(ctx context.Context) Report {
 		return rep
 	}
 	r.hostPass(ctx, des.Host, &rep)
-	obs, err := Observe(ctx, r.env.Net, r.env.Jails)
+	r.pipePass(ctx, des, &rep)
+	obs, err := r.observe(ctx)
 	if err != nil {
 		rep.Err = err
 		r.log.Warn("reconcile: observation failed", "err", err)
@@ -196,7 +254,7 @@ func (r *Reconciler) Pass(ctx context.Context) Report {
 	}
 	// Networks changed interfaces; look again before judging jails.
 	if len(rep.Applied) > 0 {
-		if o2, err := Observe(ctx, r.env.Net, r.env.Jails); err == nil {
+		if o2, err := r.observe(ctx); err == nil {
 			obs = o2
 		}
 	}
@@ -204,10 +262,29 @@ func (r *Reconciler) Pass(ctx context.Context) Report {
 	for _, j := range des.Jails {
 		jailConds[j.Name] = r.jailPass(ctx, j, obs, ex, &rep, now)
 	}
+	for _, j := range des.Jails {
+		if _, up := obs.Running[j.Name]; !up {
+			continue
+		}
+		for idx, ep := range j.Epairs {
+			if idx < len(j.Networks) {
+				if st := netStatus[j.Networks[idx]]; st != nil {
+					st.Links = append(st.Links, ep)
+				}
+			}
+		}
+	}
+	for _, st := range netStatus {
+		if st != nil {
+			slices.Sort(st.Links)
+		}
+	}
+	r.pipeCleanup(ctx, des, &rep) // after the anchors: no anchor names a pipe that goes away
 	r.orphanPass(ctx, des, obs, ex, netStatus, &rep)
-	r.staleRoutePass(ctx, des, obs, ex, &rep)
 	if r.cfg.Autostart && !r.bootDone {
-		r.bootPass(ctx, des, obs, &rep, now)
+		if r.hostBooted(ctx) {
+			r.bootPass(ctx, des, obs, &rep, now)
+		}
 		r.bootDone = true
 	}
 	r.proxyPass(ctx, des, obs, netStatus, &rep, now)
@@ -231,6 +308,20 @@ func (r *Reconciler) Pass(ctx context.Context) Report {
 	return rep
 }
 
+// observe reads the interfaces, the running jails and, when the loop can, the routing table.
+func (r *Reconciler) observe(ctx context.Context) (*Observed, error) {
+	o, err := Observe(ctx, r.env.Net, r.env.Jails)
+	if err != nil {
+		return nil, err
+	}
+	if r.env.Routes != nil {
+		if rt, err := r.env.Routes(ctx); err == nil {
+			o.Routes = rt
+		}
+	}
+	return o, nil
+}
+
 // ---- networks ----
 
 func (r *Reconciler) networkPass(ctx context.Context, n NetworkDesired, obs *Observed, ex *NetExec, rep *Report, now time.Time) *api.NetworkStatus {
@@ -242,15 +333,6 @@ func (r *Reconciler) networkPass(ctx context.Context, n NetworkDesired, obs *Obs
 	}
 	if n.Problem != "" {
 		return fail("Invalid", n.Problem)
-	}
-	gwMember, gwL3, _ := ipam.GatewayNames(n.Bridge)
-	for _, name := range []string{n.Bridge, gwMember, gwL3} {
-		if i, ok := obs.Ifaces[name]; ok && name != "" && !ownedBy(i, n.ID, n.Steps) {
-			if i.Description == "" || !ours(i) {
-				return fail("ForeignBridge", fmt.Sprintf("interface %s exists and is not managed by JailOps; it is left untouched", name))
-			}
-			return fail("ForeignBridge", fmt.Sprintf("interface %s belongs to another JailOps object (%s)", name, i.Description))
-		}
 	}
 	unlock, err := r.env.Actions.TryLock("reconcile "+n.Name, "network/"+n.Name)
 	if err != nil {
@@ -269,81 +351,17 @@ func (r *Reconciler) networkPass(ctx context.Context, n NetworkDesired, obs *Obs
 		if step.Op == render.OpRequireSysctl {
 			// A precondition, checked every pass; it changes nothing.
 			if err := ex.Exec(ctx, step, ""); err != nil {
-				return r.networkStatusFrom(n, obs, st, fail("Precondition", err.Error()), ctx, now)
+				return fail("Precondition", err.Error())
 			}
 			continue
 		}
 		if err := ex.Exec(ctx, step, ""); err != nil {
 			rep.Applied = append(rep.Applied, step.Describe()+" (failed)")
-			return r.networkStatusFrom(n, obs, st, fail("ApplyFailed", fmt.Sprintf("%s: %v", step.Describe(), err)), ctx, now)
+			return fail("ApplyFailed", fmt.Sprintf("%s: %v", step.Describe(), err))
 		}
 		rep.Applied = append(rep.Applied, step.Describe())
 	}
-	// Remove addresses on our own interfaces that the spec no longer asks for. The bridge itself carries none (an
-	// older layout put the gateway addresses on it, and a stray address there would be answered outside the
-	// gateway's pf rules).
-	for _, name := range []string{n.Bridge, gwL3} {
-		i, ok := obs.Ifaces[name]
-		if !ok || !ownedBy(i, n.ID, n.Steps) {
-			continue
-		}
-		want := map[netip.Prefix]bool{}
-		for _, s := range n.Steps {
-			if s.Op == render.OpAddAddr && s.Iface == name {
-				if p, err := netip.ParsePrefix(s.Arg); err == nil {
-					want[p] = true
-				}
-			}
-		}
-		for _, list := range [][]netip.Prefix{i.Inet, i.Inet6} {
-			for _, p := range list {
-				if want[p] || p.Addr().IsLinkLocalUnicast() || p.Addr().IsLoopback() {
-					continue
-				}
-				s := render.Step{Op: render.OpRemoveAddr, Phase: render.PhaseHost, Iface: name, Arg: p.String()}
-				if err := ex.Exec(ctx, s, ""); err != nil {
-					rep.Failures["network/"+n.Name] = err.Error()
-					continue
-				}
-				rep.Applied = append(rep.Applied, s.Describe())
-			}
-		}
-	}
-	return r.networkStatusFrom(n, obs, st, nil, ctx, now)
-}
-
-// networkStatusFrom verifies the network against a fresh observation.
-func (r *Reconciler) networkStatusFrom(n NetworkDesired, obs *Observed, st, failed *api.NetworkStatus, ctx context.Context, now time.Time) *api.NetworkStatus {
-	if failed != nil {
-		st = failed
-	}
-	fresh := obs
-	if o2, err := Observe(ctx, r.env.Net, nil); err == nil {
-		fresh = &Observed{Ifaces: o2.Ifaces, Running: obs.Running}
-	}
-	if i, ok := fresh.Ifaces[n.Bridge]; ok {
-		st.BridgeUp = i.Up()
-		gm, _, _ := ipam.GatewayNames(n.Bridge)
-		for _, m := range i.Members {
-			if m.Name != gm { // the host's own port is not a jail
-				st.Members = append(st.Members, m.Name)
-			}
-		}
-		slices.Sort(st.Members)
-	}
-	if failed != nil {
-		return st
-	}
-	for _, s := range n.Steps {
-		if s.Op == render.OpRequireSysctl || s.Op == render.OpLoadAnchor || s.Op == render.OpAddHostRoute {
-			continue
-		}
-		if !Satisfied(s, fresh) {
-			st.Conditions = append(st.Conditions, cond(CondReady, false, "VerifyFailed", "not in effect after apply: "+s.Describe(), now))
-			return st
-		}
-	}
-	st.Conditions = append(st.Conditions, cond(CondReady, true, "Applied", "bridge "+n.Bridge+" with its gateway interface is configured", now))
+	st.Conditions = append(st.Conditions, cond(CondReady, true, "Applied", "the network is configured", now))
 	return st
 }
 
@@ -358,40 +376,43 @@ func (r *Reconciler) jailPass(ctx context.Context, j JailDesired, obs *Observed,
 		return []api.Condition{cond(CondReady, true, "Stopped", "the jail is stopped", now)}
 	}
 	var drift []string
-	// Interfaces: the host end of every epair must exist and be a bridge member.
+	// Interfaces: the host end of every epair must exist, carry the gateway addresses, be up and have the routes to
+	// the jail's addresses.
 	for idx, ep := range j.Epairs {
-		i, ok := obs.Ifaces[ep]
-		if !ok {
+		if _, ok := obs.Ifaces[ep]; !ok {
 			drift = append(drift, fmt.Sprintf("epair %s is missing; restart the jail to recreate it", ep))
 			continue
 		}
-		if idx < len(j.Attach) {
-			for _, s := range j.Attach[idx] {
-				switch s.Op {
-				case render.OpAddMember, render.OpSetPrivate, render.OpIfaceUp, render.OpSetDescription:
-				default:
-					continue
-				}
-				if Satisfied(s, obs) {
-					continue
-				}
-				unlock, err := r.env.Actions.TryLock("reconcile "+j.Name, "jail/"+j.Name)
-				if err != nil {
-					break
-				}
-				if err := ex.Exec(ctx, s, j.Name); err != nil {
-					drift = append(drift, fmt.Sprintf("%s: %v", s.Describe(), err))
-				} else {
-					rep.Applied = append(rep.Applied, s.Describe())
-				}
-				unlock()
-			}
+		if idx >= len(j.Attach) {
+			continue
 		}
-		_ = i
+		for _, s := range j.Attach[idx] {
+			switch s.Op {
+			case render.OpAddAddr, render.OpIfaceUp, render.OpSetDescription, render.OpAddHostRoute:
+			default:
+				continue
+			}
+			if s.Phase != render.PhaseHost || Satisfied(s, obs) {
+				continue
+			}
+			unlock, err := r.env.Actions.TryLock("reconcile "+j.Name, "jail/"+j.Name)
+			if err != nil {
+				break
+			}
+			if err := ex.Exec(ctx, s, j.Name); err != nil {
+				drift = append(drift, fmt.Sprintf("%s: %v", s.Describe(), err))
+			} else {
+				rep.Applied = append(rep.Applied, s.Describe())
+			}
+			unlock()
+		}
 	}
 	drift = append(drift, r.jailSidePass(ctx, j, obs, ex, rep)...)
 	// Firewall anchor, and the parent anchors that lead to it.
 	if j.Ruleset != "" && r.env.PF != nil {
+		r.mu.Lock()
+		r.sentinel = j.AnchorName
+		r.mu.Unlock()
 		for _, an := range sortedAnchors(j.ParentAnchors) {
 			pj := JailDesired{Name: j.Name, AnchorName: an, Ruleset: j.ParentAnchors[an]}
 			if r.anchorDrift(ctx, pj) == "" {
@@ -622,37 +643,20 @@ func normMembers(in []string) []string {
 // ---- orphans ----
 
 func (r *Reconciler) orphanPass(ctx context.Context, des Desired, obs *Observed, ex *NetExec, netStatus map[string]*api.NetworkStatus, rep *Report) {
-	byID := map[string]JailDesired{}
-	for _, j := range des.Jails {
-		byID[j.ID] = j
-	}
-	bridgeNet := map[string]string{}
-	for _, n := range des.Networks {
-		bridgeNet[n.Bridge] = n.Name
-	}
 	// An epair is a jail's when its name carries the jail's prefix (ipam.EpairNames); the description says only
-	// that it is JailOps's (either format).
+	// that it is JailOps's.
 	byBase := map[string]JailDesired{}
 	for _, j := range des.Jails {
 		if h, _, err := ipam.EpairNames(j.ID, 0); err == nil {
 			byBase[h[:len(h)-3]] = j
 		}
 	}
-	gateways := map[string]bool{}
-	for _, n := range des.Networks {
-		if gm, gl3, err := ipam.GatewayNames(n.Bridge); err == nil {
-			gateways[gm], gateways[gl3] = true, true
-		}
-	}
 	for _, name := range sortedIfaces(obs) {
 		i := obs.Ifaces[name]
-		if !ipam.IsEpairName(name) || !ours(i) || !strings.HasSuffix(name, "a") || gateways[name] {
+		if !ipam.IsEpairName(name) || !ours(i) || !strings.HasSuffix(name, "a") {
 			continue
 		}
 		j, known := byBase[name[:len(name)-3]]
-		if id, legacy := strings.CutPrefix(i.Description, "jailops:"); legacy {
-			j, known = byID[id]
-		}
 		orphan := !known
 		if known {
 			if _, up := obs.Running[j.Name]; !up && !r.env.Actions.IsLocked("jail/"+j.Name) {
@@ -663,15 +667,9 @@ func (r *Reconciler) orphanPass(ctx context.Context, des Desired, obs *Observed,
 			continue
 		}
 		rep.Orphans = append(rep.Orphans, name)
-		for bn, b := range bridgeNet {
-			if bi, ok := obs.Ifaces[bn]; ok {
-				for _, m := range bi.Members {
-					if m.Name == name {
-						if st := netStatus[b]; st != nil {
-							st.Orphans = append(st.Orphans, name)
-						}
-					}
-				}
+		if nw := netOfDesc(i.Description); nw != "" {
+			if st := netStatus[nw]; st != nil {
+				st.Orphans = append(st.Orphans, name)
 			}
 		}
 		step := render.Step{Op: render.OpEpairDestroy, Phase: render.PhaseHost, Iface: name}
@@ -682,6 +680,17 @@ func (r *Reconciler) orphanPass(ctx context.Context, des Desired, obs *Observed,
 		rep.Cleaned = append(rep.Cleaned, name)
 		rep.Applied = append(rep.Applied, step.Describe())
 	}
+}
+
+// netOfDesc names the network the host end of a jail's epair was made for: its description is
+// "jailops jail=PROJECT/JAIL net=NAME (host side)". "" for any other description.
+func netOfDesc(d string) string {
+	_, rest, ok := strings.Cut(d, " net=")
+	if !ok {
+		return ""
+	}
+	name, _, _ := strings.Cut(rest, " ")
+	return name
 }
 
 func sortedIfaces(o *Observed) []string {

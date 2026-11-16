@@ -147,3 +147,22 @@ func Modify[T any](ctx context.Context, r Modifiable[T], name string, fn func(*T
 		}
 	}
 }
+
+// Rename gives an object a new name and rewrites everything that refers to it, in one operation or not at all
+// (extension "rename"). A non-empty etag is sent as If-Match. With req.DryRun the server answers at once with the
+// plan and changes nothing; otherwise Wait returns what was changed.
+func (r *Resource[T]) Rename(ctx context.Context, name string, req api.Rename, etag string) (*Operation[api.RenameResult], error) {
+	return renameAt(ctx, r.c, r.item(name), req, etag)
+}
+
+func renameAt(ctx context.Context, c *Client, item string, req api.Rename, etag string) (*Operation[api.RenameResult], error) {
+	if err := c.need("rename"); err != nil {
+		return nil, err
+	}
+	h := http.Header{}
+	if etag != "" {
+		h.Set("If-Match", quoteETag(etag))
+	}
+	op, _, err := sendOp[api.RenameResult](ctx, c, request{method: http.MethodPost, path: item + "/rename", body: req, header: h}, nil)
+	return op, err
+}

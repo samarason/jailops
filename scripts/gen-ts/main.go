@@ -29,16 +29,16 @@ const defaultOut = "web/shared/src/api/types.gen.ts"
 // roots are the types the UI uses directly. Everything they reference is emitted too.
 var roots = []any{
 	api.ServerInfo{}, api.Response{}, api.Operation{}, api.Event{}, api.LifecycleEvent{}, api.Error{},
-	api.Jail{}, api.JailCreate{}, api.JailUnlock{}, api.JailPassphraseChange{}, api.JailAction{}, api.JailRollback{}, api.JailUpgrade{}, api.JailSnapshot{}, api.JailUsage{}, api.JailLogFile{}, api.JailLogRead{},
+	api.Jail{}, api.JailAction{}, api.JailRollback{}, api.JailUpgrade{}, api.JailSnapshot{}, api.JailUsage{}, api.JailLogFile{}, api.JailLogRead{},
 	api.Image{}, api.ImageBuild{}, api.ImageUpgrade{}, api.ImageUpgradeResult{}, api.ImageAliasSet{},
 	api.Network{}, api.Lease{},
 	api.WireGuard{}, api.WireGuardPeerAdd{}, api.WireGuardPeerCreated{}, api.WireGuardJoin{}, api.WireGuardKeys{},
-	api.FirewallPolicy{}, api.AddressSet{},
+	api.FirewallPolicy{}, api.AddressSet{}, api.Volume{}, api.VolumeCreate{}, api.VolumeUnlock{}, api.VolumePassphraseChange{}, api.VolumeRollback{}, api.VolumeAttachRequest{}, api.VolumeSnapshot{}, api.FirewallTestRequest{}, api.FirewallTestResult{},
 	api.BackupTarget{}, api.BackupPolicy{}, api.Backup{}, api.RestoreRequest{}, api.RestorePreflight{},
 	api.Token{}, api.Certificate{}, api.User{}, api.Remote{},
 	api.Document{},
 	api.Project{}, api.ProjectAggregate{}, api.ProjectHostStatus{}, api.Storage{}, api.Session{}, api.Identity{}, api.TrustTokenRequest{}, api.TrustToken{}, api.TrustClientRequest{}, api.Profile{}, api.ConfigKey{}, api.JailExpanded{}, api.ConfigChange{}, api.UpdateReport{}, api.UpdateRecord{}, api.UpdateCheckRequest{}, api.UpdateApplyRequest{},
-	api.Provision{}, api.ProvisionRequest{}, api.ProvisionResult{}, api.ExecRequest{}, api.BackupRun{}, api.BackupRunRequest{}, api.BackupVerifyRequest{},
+	api.Provision{}, api.ProvisionRequest{}, api.ProvisionResult{}, api.ShellSetupRequest{}, api.ShellSetupResult{}, api.ExecRequest{}, api.BackupRun{}, api.BackupRunRequest{}, api.BackupVerifyRequest{},
 	api.BackupKeyStatus{}, api.BackupKeyCreate{}, api.BackupKeyCreated{}, api.BackupKeyEscrow{},
 	api.AuditEntry{}, api.PoolUsage{}, api.DoctorReport{}, api.RepositoryStatus{}, api.UserCreate{}, api.UserCreated{}, api.PasswordSet{},
 	api.AppSummary{}, api.AppDetail{}, api.AppInstall{}, api.AppInstallResult{}, api.AppDraft{},
@@ -48,16 +48,18 @@ var roots = []any{
 	api.LogsRead{}, api.LogForward{}, api.LogForwardTest{}, api.LogForwardTestResult{},
 	api.HostCertificate{}, api.HostCertificateUpload{}, api.ACMESpec{},
 	api.SetupStatus{}, api.SetupRequest{}, api.SetupResult{}, api.SetupToken{},
+	api.Rename{}, api.RenameResult{},
 }
 
 // enums lists the typed string constants. Keep in sync with sdk/api.
 var enums = map[reflect.Type][]string{
-	reflect.TypeFor[api.Code]():            {"invalid", "not_found", "already_exists", "conflict", "unauthorized", "forbidden", "unsupported", "busy", "internal", "ip_conflict", "pool_exhausted", "image_in_use", "data_loss_unconfirmed", "version_skew", "not_leader", "no_quorum", "unverified_platform", "zfs_incompatible", "chain_broken", "merge_conflict", "quota_exceeded", "rate_limited", "key_not_escrowed", "plaintext_denied", "maintenance", "missing_chunks", "lease_expired", "not_managed", "locked", "bad_passphrase"},
+	reflect.TypeFor[api.Code]():            {"invalid", "not_found", "already_exists", "conflict", "unauthorized", "forbidden", "unsupported", "busy", "internal", "ip_conflict", "pool_exhausted", "image_in_use", "data_loss_unconfirmed", "version_skew", "not_leader", "no_quorum", "unverified_platform", "zfs_incompatible", "chain_broken", "merge_conflict", "quota_exceeded", "rate_limited", "key_not_escrowed", "plaintext_denied", "maintenance", "missing_chunks", "lease_expired", "not_managed", "locked", "bad_passphrase", "stop_forced"},
 	reflect.TypeFor[api.Permission]():      {string(api.PermReadonly), string(api.PermOperator), string(api.PermAdmin), string(api.PermBackupPush), string(api.PermBackupPull), string(api.PermRestore), string(api.PermBackupAdmin)},
 	reflect.TypeFor[api.Role]():            {string(api.RoleHost), string(api.RoleBackup)},
 	reflect.TypeFor[api.OS]():              {string(api.OSFreeBSD), string(api.OSLinux)},
 	reflect.TypeFor[api.Layout]():          {string(api.LayoutThin), string(api.LayoutThick)},
 	reflect.TypeFor[api.UpdateStrategy]():  {string(api.UpdateRebase), string(api.UpdateInPlace), string(api.UpdateManual)},
+	reflect.TypeFor[api.DNSSource]():       {string(api.DNSFromNetwork), string(api.DNSFromHost), string(api.DNSFromGateway), string(api.DNSNone)},
 	reflect.TypeFor[api.PowerState]():      {string(api.PowerStopped), string(api.PowerStarting), string(api.PowerRunning), string(api.PowerStopping), string(api.PowerError), string(api.PowerLocked)},
 	reflect.TypeFor[api.RollbackScope]():   {string(api.RollbackRoot), string(api.RollbackData), string(api.RollbackAll)},
 	reflect.TypeFor[api.IPv6Mode]():        {string(api.IPv6Routed), string(api.IPv6Proxy), string(api.IPv6None)},
@@ -65,7 +67,7 @@ var enums = map[reflect.Type][]string{
 	reflect.TypeFor[api.ResponseType]():    {string(api.ResponseSync), string(api.ResponseAsync), string(api.ResponseError)},
 	reflect.TypeFor[api.OperationStatus](): {string(api.OpPending), string(api.OpRunning), string(api.OpSuccess), string(api.OpFailure), string(api.OpCancelled)},
 	reflect.TypeFor[api.EventType]():       {string(api.EventLifecycle), string(api.EventOperation), string(api.EventLogging)},
-	reflect.TypeFor[api.Kind]():            {string(api.KindJail), string(api.KindImage), string(api.KindNetwork), string(api.KindFirewallPolicy), string(api.KindAddressSet), string(api.KindBackupPolicy), string(api.KindBackupTarget), string(api.KindHostGroup), string(api.KindRollout), string(api.KindJailTemplate), string(api.KindRemote), string(api.KindUser), string(api.KindToken), string(api.KindCertificate), string(api.KindHost), string(api.KindImageGeneration), string(api.KindJailSnapshot), string(api.KindBackup), string(api.KindOperation), "Project", "Storage", string(api.KindHostIdentity), string(api.KindWireGuard), string(api.KindLogForward), string(api.KindHostFirewall), string(api.KindHostCertificate)},
+	reflect.TypeFor[api.Kind]():            {string(api.KindJail), string(api.KindImage), string(api.KindNetwork), string(api.KindFirewallPolicy), string(api.KindAddressSet), string(api.KindBackupPolicy), string(api.KindBackupTarget), string(api.KindHostGroup), string(api.KindRollout), string(api.KindJailTemplate), string(api.KindRemote), string(api.KindUser), string(api.KindToken), string(api.KindCertificate), string(api.KindHost), string(api.KindImageGeneration), string(api.KindJailSnapshot), string(api.KindBackup), string(api.KindOperation), "Project", "Storage", string(api.KindHostIdentity), string(api.KindWireGuard), string(api.KindVolume), string(api.KindLogForward), string(api.KindHostFirewall), string(api.KindHostCertificate)},
 	reflect.TypeFor[api.UpdateMode]():      {string(api.UpdateModeManual), string(api.UpdateModeNotify), string(api.UpdateModeManaged)},
 	reflect.TypeFor[api.UpdateReboot]():    {string(api.RebootManual), string(api.RebootAuto)},
 	reflect.TypeFor[api.DoctorStatus]():    {string(api.DoctorOK), string(api.DoctorWarn), string(api.DoctorFail), string(api.DoctorUnknown), string(api.DoctorInfo)},

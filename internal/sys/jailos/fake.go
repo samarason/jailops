@@ -47,6 +47,17 @@ func (f *Fake) Calls() []FakeCall {
 	return append([]FakeCall(nil), f.calls...)
 }
 
+// Put adds or replaces a running jail as it is given (a path, parameters), for tests of what depends on them.
+func (f *Fake) Put(j Jail) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if j.JID == 0 {
+		j.JID = f.next
+		f.next++
+	}
+	f.jails[j.Name] = j
+}
+
 // Create implements Controller.
 func (f *Fake) Create(_ context.Context, confPath, name string) error {
 	if err := ValidateName(name); err != nil {

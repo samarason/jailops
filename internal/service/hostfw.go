@@ -37,8 +37,8 @@ type HostFirewallRequest struct {
 	ConfirmWithin int `json:"confirm_within,omitempty"`
 	// Peer is the address the request came from, as the daemon's listener saw it; empty when it is unknown (the
 	// unix socket, a hub). The lock-out check uses it.
-	Peer  string `json:"peer,omitempty"`
-	IKnow bool   `json:"i_know,omitempty"`
+	Peer           string `json:"peer,omitempty"`
+	ConfirmLockout bool   `json:"confirm_lockout,omitempty"`
 }
 
 // HostFirewallState is what the helper reads.
@@ -54,7 +54,13 @@ type HostFirewallState struct {
 	Pending   *api.HostPendingChange `json:"pending,omitempty"`
 	// Modules are the modules priv.conf lets the helper change.
 	Modules []string `json:"modules,omitempty"`
+	// StatePolicyIfBound says whether /etc/pf.conf has `set state-policy if-bound`; the helper (root) reads the file,
+	// which the daemon often cannot (mode 0600). Nil when there is no such file.
+	StatePolicyIfBound *bool `json:"state_policy_if_bound,omitempty"`
 }
+
+// PFBindsStates says whether the text of a pf.conf has `set state-policy if-bound` (comments do not count).
+func PFBindsStates(text string) bool { return reStatePolicy.MatchString(stripPFComments(text)) }
 
 func (s *Service) hostFirewallSystem() (HostFirewallSystem, error) {
 	if _, err := s.hostSystem(); err != nil {
@@ -161,7 +167,7 @@ func (s *Service) ApplyHostFirewall(ctx context.Context, in api.HostFirewallAppl
 		return api.HostChange{}, err
 	}
 	defer unlock()
-	res, err := fw.HostFirewallApply(ctx, HostFirewallRequest{Spec: spec.Canonical(), DryRun: in.DryRun, ConfirmWithin: in.ConfirmWithin, Peer: peerOf(ctx), IKnow: in.IKnow})
+	res, err := fw.HostFirewallApply(ctx, HostFirewallRequest{Spec: spec.Canonical(), DryRun: in.DryRun, ConfirmWithin: in.ConfirmWithin, Peer: peerOf(ctx), ConfirmLockout: in.ConfirmLockout})
 	if err != nil {
 		return api.HostChange{}, notManagedByHelper(err, api.HostModuleFirewall)
 	}

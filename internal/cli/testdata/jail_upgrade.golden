@@ -9,7 +9,6 @@ jail/web upgraded to g2
 
 $ jailops jail upgrade web
 ! invalid: jail "web" is already on generation g2
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops jail show web

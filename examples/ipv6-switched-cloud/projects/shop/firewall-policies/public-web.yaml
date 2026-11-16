@@ -8,5 +8,5 @@ spec:
   rules:
     # The public web jail: HTTP and HTTPS from anywhere (the one deliberate "from anywhere" of this fleet).
     - {name: http, action: allow, direction: in, proto: tcp, ports: ["80", "443"]}
-    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["@admins"]}
+    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["set:admins"]}
     - {name: ping6, action: allow, direction: in, proto: icmp6}

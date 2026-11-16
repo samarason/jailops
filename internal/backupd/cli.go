@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -44,7 +45,8 @@ Administration (through the admin socket of the running daemon; root or the admi
   maintenance [online|read-only|offline]
   protect GROUP SNAPSHOT | unprotect GROUP SNAPSHOT
   delete request GROUP SNAPSHOT [--delay 72h] | delete cancel GROUP SNAPSHOT | delete execute GROUP SNAPSHOT
-  quarantine list
+  quarantine list | quarantine add CHUNK
+  escrow list | escrow delete DOMAIN
   reconcile                        rebuild the snapshot index from the repository
   jobs [ID]                        recent jobs, or one job with its result
 
@@ -87,7 +89,10 @@ var verbs = []verb{
 	{"unprotect", "unprotect GROUP SNAPSHOT", "remove the protection of a snapshot", nil, nil},
 	{"delete", "delete request|cancel|execute GROUP SNAPSHOT", "deletion of a snapshot: requested, cancelled, or executed once the delay has passed", []string{"request", "cancel", "execute"}, nil},
 	{"delete request", "delete request GROUP SNAPSHOT [--delay 72h]", "request the deletion of a snapshot", nil, []string{"--delay DURATION"}},
-	{"quarantine", "quarantine list", "list the chunks verification moved aside", []string{"list"}, nil},
+	{"quarantine", "quarantine list|add", "the chunks moved aside: list them, or move one a host reported as undecryptable", []string{"list", "add"}, nil},
+	{"quarantine add", "quarantine add CHUNK", "move a chunk aside although it passes the keyless check (a host found it does not decrypt); the next backup holding it uploads it again", nil, nil},
+	{"escrow", "escrow list|delete", "the escrow blobs of the key domains", []string{"list", "delete"}, nil},
+	{"escrow delete", "escrow delete DOMAIN", "delete an escrow blob that does not open with the recovery identity; a host then stores a new one", nil, nil},
 	{"reconcile", "reconcile", "rebuild the snapshot index from the repository", nil, nil},
 	{"jobs", "jobs [ID]", "recent jobs, or one job with its result", nil, nil},
 	{"hosts", "hosts enroll|list|revoke", "the backup hosts enrolled in the database", []string{"enroll", "list", "revoke"}, nil},
@@ -186,7 +191,7 @@ func RunCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		err = c.hosts(ctx, rest)
 	case "users":
 		err = c.users(ctx, rest)
-	case "status", "gc", "verify", "retention", "maintenance", "protect", "unprotect", "delete", "quarantine", "reconcile", "jobs":
+	case "status", "gc", "verify", "retention", "maintenance", "protect", "unprotect", "delete", "quarantine", "escrow", "reconcile", "jobs":
 		err = c.admin(ctx, cmd, rest)
 	case "completion":
 		err = c.completion(rest)
@@ -715,9 +720,50 @@ func (c *cli) admin(ctx context.Context, cmd string, args []string) error {
 		fmt.Fprintf(c.out, "%sed %s/%s\n", cmd, args[0], args[1])
 	case "delete":
 		return c.deleteCmd(ctx, ac, base, args, delay)
+	case "escrow":
+		switch {
+		case len(args) == 1 && args[0] == "list":
+			var l struct {
+				Domains []string `json:"domains"`
+			}
+			if err := ac.Call(ctx, "GET", base+"/escrow", nil, &l); err != nil {
+				return err
+			}
+			if c.json {
+				c.print(l)
+				return nil
+			}
+			for _, d := range l.Domains {
+				fmt.Fprintln(c.out, d)
+			}
+			return nil
+		case len(args) == 2 && args[0] == "delete":
+			if err := ac.Call(ctx, "DELETE", base+"/escrow/"+url.PathEscape(args[1]), nil, nil); err != nil {
+				return err
+			}
+			fmt.Fprintf(c.out, "deleted the escrow blob of key domain %s; a host stores a new one with: jailops backup key escrow --recipient ...\n", args[1])
+			return nil
+		}
+		return errors.New("escrow list | escrow delete DOMAIN")
 	case "quarantine":
+		if len(args) == 2 && args[0] == "add" {
+			var res struct {
+				Moved bool `json:"moved"`
+			}
+			if err := ac.Call(ctx, "POST", base+"/quarantine/"+url.PathEscape(args[1]), nil, &res); err != nil {
+				return err
+			}
+			if c.json {
+				c.print(res)
+			} else if res.Moved {
+				fmt.Fprintf(c.out, "moved %s aside; the next backup that holds it uploads it again\n", args[1])
+			} else {
+				fmt.Fprintf(c.out, "%s is not in the repository\n", args[1])
+			}
+			return nil
+		}
 		if len(args) != 1 || args[0] != "list" {
-			return errors.New("quarantine list")
+			return errors.New("quarantine list | quarantine add CHUNK")
 		}
 		var q []node.QuarantinedChunk
 		if err := ac.Call(ctx, "GET", base+"/quarantine", nil, &q); err != nil {

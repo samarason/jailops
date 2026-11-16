@@ -12,7 +12,8 @@ type Project struct {
 
 // ProjectSpec is the desired state of a project.
 type ProjectSpec struct {
-	Description string `json:"description,omitempty"`
+	// Comment is what the project is for.
+	Comment string `json:"comment,omitempty"`
 	// Hosts lists the hosts a fleet project spans. Empty means this host
 	// only. The definition is fleet-level; each host implements the named
 	// networks and storage locally and enforces its own copy.
@@ -22,14 +23,32 @@ type ProjectSpec struct {
 	// Storage lists the storage the project may place jails and volumes on.
 	Storage []ProjectStorage `json:"storage,omitempty"`
 	Quotas  ProjectQuotas    `json:"quotas,omitempty"`
-	// Firewall names a mandatory policy rendered before a jail's own policy.
-	Firewall string `json:"firewall,omitempty"`
+	// FirewallPolicies are the project's mandatory policies, rendered in this order before a jail's own.
+	FirewallPolicies []string `json:"firewall_policies,omitempty"`
 	// Images is an allow-list of image names; empty allows every image.
 	Images []string `json:"images,omitempty"`
 	// NewNetwork is a create-time convenience: the server creates a dedicated
-	// bridge and subnet from its configured pool of subnets, grants it to the
+	// network with a subnet from its configured pool of subnets, grants it to the
 	// project and clears this flag. It is never stored as true.
 	NewNetwork bool `json:"new_network,omitempty"`
+}
+
+// SoleNetwork is the network a jail of the project is attached to when it names none: the project's only network
+// grant, or "" when the project has none or several.
+func (s ProjectSpec) SoleNetwork() string {
+	if len(s.Networks) == 1 {
+		return s.Networks[0].Network
+	}
+	return ""
+}
+
+// SoleStorage is the storage a jail of the project is placed on when it names none: the project's only storage
+// grant, or "" when the project has none, several, or the grant of every storage ("*").
+func (s ProjectSpec) SoleStorage() string {
+	if len(s.Storage) == 1 && s.Storage[0].Storage != "*" {
+		return s.Storage[0].Storage
+	}
+	return ""
 }
 
 // ProjectNetwork grants a network to a project. A network belongs to at most
@@ -82,8 +101,9 @@ type Storage struct {
 type StorageSpec struct {
 	// Dataset is the ZFS dataset that holds jailops data, for example
 	// "tank/jailops". It must exist and live on an imported pool.
-	Dataset     string `json:"dataset"`
-	Description string `json:"description,omitempty"`
+	Dataset string `json:"dataset"`
+	// Comment is what the storage is for.
+	Comment string `json:"comment,omitempty"`
 	// Compression, when set, is applied to new datasets ("zstd", "lz4").
 	Compression string `json:"compression,omitempty"`
 	// Encrypted is reserved: native ZFS encryption is not implemented and creating a storage with it set is refused.

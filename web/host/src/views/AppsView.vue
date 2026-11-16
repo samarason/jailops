@@ -14,6 +14,8 @@ import LoadState from '@jailops/shared/components/LoadState.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import AppsInstalled from '@/components/AppsInstalled.vue'
 import AppInstallDialog from '@/components/AppInstallDialog.vue'
+import TabBar from '@jailops/shared/components/TabBar.vue'
+import { useTabQuery } from '@jailops/shared/composables/tabs'
 import type { AppDetail, Jail } from '@jailops/shared/api/types'
 
 const route = useRoute()
@@ -31,10 +33,17 @@ const jl = useLoad(async () => (projectState.current || !can('projects') ? insta
 watch(() => projectState.current, () => void jl.reload())
 
 type Tab = 'catalog' | 'installed'
-const tab = ref<Tab>(route.query.tab === 'installed' ? 'installed' : 'catalog')
+const { tab } = useTabQuery<Tab>(() => ['catalog', 'installed'], 'catalog')
 const q = ref(typeof route.query.q === 'string' ? route.query.q : '')
 const cat = ref(typeof route.query.category === 'string' ? route.query.category : '')
-watch([tab, q, cat], () => void router.replace({ query: { ...(tab.value === 'installed' ? { tab: 'installed' } : {}), ...(q.value ? { q: q.value } : {}), ...(cat.value ? { category: cat.value } : {}) } }))
+watch([q, cat], () => {
+  const { q: _q, category: _c, ...rest } = route.query
+  void router.replace({ query: { ...rest, ...(q.value ? { q: q.value } : {}), ...(cat.value ? { category: cat.value } : {}) } })
+})
+const tabItems = computed(() => [
+  { key: 'catalog' as Tab, label: s.apps.catalogTab, count: all.value.length },
+  { key: 'installed' as Tab, label: s.apps.installedTab, count: jl.data.value?.length ?? 0 },
+])
 
 const all = computed(() => l.data.value?.list ?? [])
 const chips = computed(() => categoryCounts(all.value, q.value))
@@ -43,14 +52,6 @@ const shown = computed(() => searchApps(all.value, q.value, cat.value))
 const details = computed(() => l.data.value?.details ?? {})
 
 const installing = ref<AppDetail | null>(null)
-function selectTab(t: Tab): void {
-  tab.value = t
-}
-function onTabKey(e: KeyboardEvent): void {
-  if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return
-  tab.value = tab.value === 'catalog' ? 'installed' : 'catalog'
-  void Promise.resolve().then(() => (document.querySelector(`[data-tab="${tab.value}"]`) as HTMLElement | null)?.focus())
-}
 </script>
 
 <template>
@@ -61,17 +62,14 @@ function onTabKey(e: KeyboardEvent): void {
         <p class="muted apps-lead">{{ s.apps.lead }}</p>
       </div>
     </div>
-    <div class="tabs" role="tablist" :aria-label="s.apps.sections" @keydown="onTabKey">
-      <button type="button" role="tab" id="apps-tab-catalog" aria-controls="apps-panel" :aria-selected="tab === 'catalog'" :tabindex="tab === 'catalog' ? 0 : -1" data-tab="catalog" @click="selectTab('catalog')">{{ s.apps.catalogTab }}<span v-if="all.length" class="apps-tabn">{{ all.length }}</span></button>
-      <button type="button" role="tab" id="apps-tab-installed" aria-controls="apps-panel" :aria-selected="tab === 'installed'" :tabindex="tab === 'installed' ? 0 : -1" data-tab="installed" @click="selectTab('installed')">{{ s.apps.installedTab }}<span v-if="jl.data.value?.length" class="apps-tabn">{{ jl.data.value.length }}</span></button>
-    </div>
+    <TabBar v-model="tab" :tabs="tabItems" :label="s.apps.sections" id="apps" />
     <div id="apps-panel" role="tabpanel" :aria-labelledby="`apps-tab-${tab}`">
       <LoadState :loading="l.loading.value" :error="l.error.value" :has-data="!!l.data.value" @retry="l.reload">
         <template v-if="tab === 'catalog'">
           <div class="apps-tools">
             <div class="apps-search">
               <Icon name="search" />
-              <input v-model="q" type="search" :placeholder="s.apps.search" :aria-label="s.apps.search" data-test="apps-search" />
+              <input v-model="q" type="search" :placeholder="s.apps.search" :aria-label="s.apps.searchLabel" :title="s.apps.searchLabel" data-test="apps-search" />
             </div>
             <div class="row apps-chips" role="group" :aria-label="s.apps.categories">
               <button class="apps-chip" type="button" :aria-pressed="cat === ''" data-category="" @click="cat = ''">{{ s.apps.all }}<span class="apps-chipn">{{ total }}</span></button>
@@ -107,7 +105,7 @@ function onTabKey(e: KeyboardEvent): void {
             </li>
           </ul>
         </template>
-        <AppsInstalled v-else :jails="jl.data.value ?? []" :loading="jl.loading.value" :error="jl.error.value" :details="details" @retry="jl.reload" />
+        <AppsInstalled v-else :jails="jl.data.value ?? []" :loading="jl.loading.value" :error="jl.error.value" :details="details" @retry="jl.reload" @changed="jl.reload" />
       </LoadState>
     </div>
     <AppInstallDialog :open="!!installing" :detail="installing" @close="installing = null" @done="jl.reload" />
@@ -116,7 +114,6 @@ function onTabKey(e: KeyboardEvent): void {
 
 <style>
 .apps-lead { max-width: 72ch; margin: 4px 0 0; }
-.apps-tabn { margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--surface-3); color: var(--text-2); font-size: 12px; font-weight: 500; }
 .apps-tools { display: flex; gap: 10px 16px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
 .apps-search { position: relative; flex: 1 1 260px; max-width: 420px; }
 .apps-search .icon { position: absolute; left: 9px; top: 8px; color: var(--text-3); pointer-events: none; }

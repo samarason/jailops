@@ -21,11 +21,13 @@ const (
 	PropManifest  = "jailops:manifest"
 	PropPackages  = "jailops:packages"
 	PropOSRelease = "jailops:osrelease"
-	PropCreated   = "jailops:created"
-	PropSource    = "jailops:source"
-	PropOS        = "jailops:os"
-	PropDeleted   = "jailops:deleted"
-	PropAliases   = "jailops:aliases"
+	// PropFreeBSD is the FreeBSD version of the generation's base packages (FreeBSDVersion), set when it is built.
+	PropFreeBSD = "jailops:freebsd_version"
+	PropCreated = "jailops:created"
+	PropSource  = "jailops:source"
+	PropOS      = "jailops:os"
+	PropDeleted = "jailops:deleted"
+	PropAliases = "jailops:aliases"
 	// PropLastGen records the highest generation number ever built, so numbers
 	// are never reused after generations are deleted.
 	PropLastGen = "jailops:last_gen"
@@ -41,9 +43,7 @@ const (
 )
 
 var (
-	imageRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
-	aliasRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,31}$`)
-	genRe   = regexp.MustCompile(`^g([0-9]+)$`)
+	genRe = regexp.MustCompile(`^g([0-9]+)$`)
 )
 
 // GenerationName is "<image>#g<N>".
@@ -60,14 +60,14 @@ type Ref struct {
 // ParseRef parses an image reference.
 func ParseRef(s string) (Ref, error) {
 	if img, a, ok := strings.Cut(s, "@"); ok {
-		if !imageRe.MatchString(img) || !aliasRe.MatchString(a) {
+		if !validImage(img) || !validAlias(a) {
 			return Ref{}, api.Errorf(api.CodeInvalid, "bad image reference %q", s)
 		}
 		return Ref{Image: img, Alias: a}, nil
 	}
 	if img, g, ok := strings.Cut(s, "#"); ok {
 		m := genRe.FindStringSubmatch(g)
-		if !imageRe.MatchString(img) || m == nil {
+		if !validImage(img) || m == nil {
 			return Ref{}, api.Errorf(api.CodeInvalid, "bad image reference %q", s)
 		}
 		n, err := strconv.Atoi(m[1])
@@ -76,7 +76,7 @@ func ParseRef(s string) (Ref, error) {
 		}
 		return Ref{Image: img, Gen: n}, nil
 	}
-	if !imageRe.MatchString(s) {
+	if !validImage(s) {
 		return Ref{}, api.Errorf(api.CodeInvalid, "bad image reference %q", s)
 	}
 	return Ref{Image: s}, nil
@@ -85,7 +85,7 @@ func ParseRef(s string) (Ref, error) {
 // Layout holds the dataset and mount paths of the image tree.
 type Layout struct {
 	Root      string // "<pool>/jailops"
-	MountBase string // "/jailops" (directory under which images are mounted)
+	MountBase string // "/usr/local/jailops" (directory under which images are mounted)
 }
 
 func (l Layout) ImageDS(image string) string { return path.Join(l.Root, "images", image) }
@@ -95,6 +95,15 @@ func (l Layout) GenDS(image string, n int) string {
 func (l Layout) StagingDS(image string, n int) string {
 	return fmt.Sprintf("%s/staging-g%d", l.ImageDS(image), n)
 }
+
+// CacheDS is the dataset of the package cache every image build and upgrade shares: a package of the base is
+// downloaded once, not into every generation's /var/cache/pkg.
+func (l Layout) CacheDS() string { return path.Join(l.Root, "cache") }
+
+// CacheMount is where CacheDS is mounted; PkgCache is the directory pkg(8) keeps its downloads in.
+func (l Layout) CacheMount() string { return path.Join(l.MountBase, "cache") }
+func (l Layout) PkgCache() string   { return path.Join(l.CacheMount(), "pkg") }
+
 func (l Layout) DeletedParent() string { return path.Join(l.Root, "deleted") }
 func (l Layout) DeletedDS(image string, n int) string {
 	return fmt.Sprintf("%s/%s-g%d", l.DeletedParent(), image, n)
@@ -105,3 +114,7 @@ func (l Layout) GenMount(image string, n int) string {
 func (l Layout) StagingMount(image string, n int) string {
 	return fmt.Sprintf("%s/images/%s/staging-g%d", l.MountBase, image, n)
 }
+
+// validImage and validAlias follow api.NamePattern (an alias has at most 32 characters).
+func validImage(s string) bool { return api.IsName(s, api.MaxName) }
+func validAlias(s string) bool { return api.IsName(s, 32) }

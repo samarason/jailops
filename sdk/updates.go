@@ -68,3 +68,13 @@ func (j *JailClient) Provision(ctx context.Context, name string, again bool) (*O
 	op, _, err := sendOp[api.ProvisionResult](ctx, j.c, request{method: http.MethodPost, path: j.r.item(name) + "/provision", body: api.ProvisionRequest{Again: again}}, nil)
 	return op, err
 }
+
+// ShellSetup gives a FreeBSD jail the shell and prompt a new jail gets (docs/shell.md): bash installed when it is
+// the jail's shell and missing, and the prompt written. The jail must run.
+func (j *JailClient) ShellSetup(ctx context.Context, name string) (*Operation[api.ShellSetupResult], error) {
+	if err := j.c.need("jail_shell_setup"); err != nil {
+		return nil, err
+	}
+	op, _, err := sendOp[api.ShellSetupResult](ctx, j.c, request{method: http.MethodPost, path: j.r.item(name) + "/shell-setup", body: api.ShellSetupRequest{}}, nil)
+	return op, err
+}

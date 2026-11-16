@@ -119,7 +119,7 @@ func runExample(t *testing.T, args ...string) result {
 
 func TestExampleFleetValidatesAndRenders(t *testing.T) {
 	r := mustOK(t, runExample(t, "validate"))
-	contains(t, r.out, `fleet "minimal", 2 host(s), 13 object(s)`)
+	contains(t, r.out, `fleet "minimal", 2 host(s), 14 object(s)`)
 	contains(t, r.out, "1 rollout(s), 1 secret(s)")
 	contains(t, r.out, "sops: 1 secret value(s) in shared/secrets.sops.yaml, 1 remote file(s)")
 

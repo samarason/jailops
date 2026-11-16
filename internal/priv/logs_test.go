@@ -294,3 +294,34 @@ func TestLogsOverTheSocket(t *testing.T) {
 		t.Errorf("the missing marker did not travel: %v", err)
 	}
 }
+
+// A jail that swaps var/log for a symlink between the helper's check and its open cannot make the log
+// operations read the rest of its root.
+func TestLogDirSwappedAfterTheCheck(t *testing.T) {
+	e := newEnv(t)
+	logs := logTree(t, e)
+	swapped := false
+	openBelowHook = func(seg string) {
+		if seg != "log" || swapped {
+			return
+		}
+		swapped = true
+		if err := os.Rename(logs, logs+".real"); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink("../etc", logs); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { openBelowHook = nil })
+	files, _, err := e.local.ListLogs(context.Background(), logs)
+	if !swapped {
+		t.Fatal("the hook did not run")
+	}
+	if !api.IsCode(err, api.CodeForbidden) {
+		t.Fatalf("listed the swapped directory: %v %+v", err, files)
+	}
+	if _, _, _, err := e.local.TailFile(context.Background(), logs+"/master.passwd", 0, 0); err == nil {
+		t.Fatal("read /etc/master.passwd of the jail through var/log")
+	}
+}

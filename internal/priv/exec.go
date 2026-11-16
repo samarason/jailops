@@ -169,6 +169,7 @@ func (l *Local) Exec(ctx context.Context, jail string, argv []string, o ExecOpts
 }
 
 type localSession struct {
+	grace  time.Duration // sessionGrace when the session was made
 	tty    bool
 	cmd    *exec.Cmd
 	pgid   int
@@ -178,6 +179,12 @@ type localSession struct {
 	stdin          io.WriteCloser
 	stdout, stderr io.Reader
 	toClose        []*os.File
+
+	// a session with a terminal runs under a leader process of the helper (session_leader.go)
+	leaderRelease *os.File      // the helper's end of the pipe whose close releases the leader
+	cmdDone       chan struct{} // closed when the leader reported the end of the command
+	rmu           sync.Mutex
+	rep           leaderReport
 
 	done    chan struct{}
 	code    int
@@ -189,7 +196,7 @@ type localSession struct {
 }
 
 func startSession(ctx context.Context, bin string, args []string, o ExecOpts, release func()) (*localSession, error) {
-	s := &localSession{tty: o.TTY, done: make(chan struct{}), drained: make(chan struct{}), release: release}
+	s := &localSession{grace: sessionGrace, tty: o.TTY, done: make(chan struct{}), drained: make(chan struct{}), cmdDone: make(chan struct{}), release: release}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = "/"
 	cmd.Env = []string{"PATH=/sbin:/bin:/usr/sbin:/usr/bin"}
@@ -201,6 +208,9 @@ func startSession(ctx context.Context, bin string, args []string, o ExecOpts, re
 		}
 		if s.master != nil {
 			s.master.Close()
+		}
+		if s.leaderRelease != nil {
+			s.leaderRelease.Close()
 		}
 		return nil, api.Errorf(api.CodeInternal, "start session: %v", err)
 	}
@@ -219,9 +229,41 @@ func startSession(ctx context.Context, bin string, args []string, o ExecOpts, re
 		if err := unix.IoctlSetWinsize(s.mfd, unix.TIOCSWINSZ, &unix.Winsize{Row: rows, Col: cols}); err != nil {
 			return fail(err)
 		}
+		// The command runs under a leader of its own (session_leader.go): a new session whose controlling terminal is the
+		// slave (fd 0), which lives until the output of the command was read.
+		self, err := os.Executable()
+		if err != nil {
+			return fail(err)
+		}
+		relR, relW, err := os.Pipe()
+		if err != nil {
+			return fail(err)
+		}
+		repR, repW, err := os.Pipe()
+		if err != nil {
+			relR.Close()
+			relW.Close()
+			return fail(err)
+		}
+		childEnds = append(childEnds, relR, repW)
+		s.toClose = append(s.toClose, repR)
+		s.leaderRelease = relW
+		cmd = exec.Command(self, append([]string{sessionLeaderArg, bin}, args...)...)
+		cmd.Dir = "/"
+		cmd.Env = []string{"PATH=/sbin:/bin:/usr/sbin:/usr/bin"}
+		s.cmd = cmd
+		cmd.ExtraFiles = []*os.File{relR, repW}
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
-		// New session; the slave (child fd 0) becomes the controlling terminal.
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+		go readLeaderReport(repR, func(r leaderReport) {
+			s.rmu.Lock()
+			first := !s.rep.exited && r.exited
+			s.rep = r
+			s.rmu.Unlock()
+			if first {
+				close(s.cmdDone)
+			}
+		})
 		s.stdin = &ttyStdin{f: master}
 		s.stdout = ttyReader{f: master}
 		s.drains = 1
@@ -276,6 +318,13 @@ func startSession(ctx context.Context, bin string, args []string, o ExecOpts, re
 	return s, nil
 }
 
+// daemonSetsid is how long what a command left in its group has to leave it (setsid) before the group is killed.
+const daemonSetsid = 250 * time.Millisecond
+
+// sessionGrace is how long the leader of a terminal session has to end after it was released, and how long the output of
+// a finished session is waited for.
+var sessionGrace = 10 * time.Second
+
 // reap waits for the command, kills what it left behind, frees the slot and
 // closes the descriptors once the output was read (or after a grace period).
 func (s *localSession) reap(ctx context.Context) {
@@ -287,9 +336,41 @@ func (s *localSession) reap(ctx context.Context) {
 		case <-waited:
 		}
 	}()
-	err := s.cmd.Wait()
+	leaderDone := make(chan error, 1)
+	go func() { leaderDone <- s.cmd.Wait() }()
+	if s.leaderRelease != nil {
+		// A terminal session: the leader reports the end of the command and stays; the output is read, then the leader is
+		// released and the terminal ends with it.
+		select {
+		case <-s.cmdDone:
+			s.waitOutputRead(ctx)
+		case <-leaderDone:
+			leaderDone <- nil
+		case <-ctx.Done():
+		}
+		s.leaderRelease.Close()
+	}
+	var err error
+	if s.leaderRelease != nil {
+		// the leader of a terminal session was released: it ends within a grace period or is killed
+		select {
+		case err = <-leaderDone:
+		case <-time.After(s.grace):
+			s.killGroup()
+			err = <-leaderDone
+		}
+	} else {
+		// a command without a terminal runs as long as it runs; the end of the request (ctx) kills its group
+		err = <-leaderDone
+	}
 	close(waited)
-	s.killGroup() // no process of the session outlives it
+	// No process of the session outlives it. A daemon the command started is in the group of the command until it has
+	// made a session of its own, which takes it a moment after its parent exited: killing the group at once would take
+	// it too (one start in ten of `daemon -f`), so what is left is given that moment first.
+	if syscall.Kill(-s.pgid, 0) == nil {
+		time.Sleep(daemonSetsid)
+	}
+	s.killGroup()
 	s.code = 0
 	if ps := s.cmd.ProcessState; ps != nil {
 		s.code = ps.ExitCode()
@@ -297,18 +378,53 @@ func (s *localSession) reap(ctx context.Context) {
 			s.code = 128 + int(ws.Signal())
 		}
 	}
+	if s.leaderRelease != nil {
+		s.rmu.Lock()
+		if s.rep.exited {
+			s.code = s.rep.exitCode
+		}
+		s.rmu.Unlock()
+	}
 	_ = err
 	close(s.done)
 	s.release()
 	select {
 	case <-s.drained:
 	case <-ctx.Done():
-	case <-time.After(10 * time.Second):
+	case <-time.After(s.grace):
 	}
 	s.Close()
 }
 
-func (s *localSession) killGroup() { _ = syscall.Kill(-s.pgid, syscall.SIGKILL) }
+// waitOutputRead returns once the master of the terminal holds nothing that is not read (at most two seconds).
+func (s *localSession) waitOutputRead(ctx context.Context) {
+	deadline := time.Now().Add(2 * time.Second)
+	quiet := 0
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		if outputQueued(s.mfd) == 0 {
+			if quiet++; quiet >= 3 {
+				return
+			}
+		} else {
+			quiet = 0
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+}
+
+func (s *localSession) killGroup() {
+	_ = syscall.Kill(-s.pgid, syscall.SIGKILL)
+	if g := s.commandGroup(); g > 0 {
+		_ = syscall.Kill(-g, syscall.SIGKILL)
+	}
+}
+
+// commandGroup is the process group of the command of a terminal session (the leader reported it), or 0.
+func (s *localSession) commandGroup() int {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	return s.rep.pgid
+}
 
 func (s *localSession) isDone() bool {
 	select {
@@ -351,7 +467,11 @@ func (s *localSession) Signal(sig int) error {
 	if s.isDone() {
 		return api.Errorf(api.CodeNotFound, "the session has ended")
 	}
-	if err := syscall.Kill(-s.pgid, syscall.Signal(sig)); err != nil && !errors.Is(err, syscall.ESRCH) {
+	target := -s.pgid
+	if g := s.commandGroup(); g > 0 {
+		target = -g // the command runs in a process group of its own, below its leader
+	}
+	if err := syscall.Kill(target, syscall.Signal(sig)); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return api.Errorf(api.CodeInternal, "signal: %v", err)
 	}
 	return nil
@@ -376,6 +496,9 @@ func (s *localSession) Close() error {
 	}
 	if s.master != nil {
 		s.master.Close()
+	}
+	if s.leaderRelease != nil {
+		s.leaderRelease.Close()
 	}
 	for _, f := range s.toClose {
 		f.Close()

@@ -18,3 +18,25 @@ for (const scheme of ['light', 'dark'] as const) {
     }
   })
 }
+
+// Dialogs: the retention policy form (after a submit attempt, so its messages are on screen), host enrolment and a
+// typed confirmation.
+const dialogs: Array<[string, string, string[]]> = [
+  ['/retention', 'add policy', ['[data-test="add-policy"]', 'force:[data-test="policy-save"]']],
+  ['/hosts', 'enrol', ['[data-test="enrol"]']],
+  ['/maintenance', 'mode', ['[data-mode="offline"]']],
+  ['/access?tab=tokens', 'tokens tab', []],
+]
+for (const scheme of ['light', 'dark'] as const) {
+  for (const [r, name, clicks] of dialogs) {
+    test(`a11y ${scheme}: ${r} ${name}`, async ({ page }) => {
+      await page.emulateMedia({ colorScheme: scheme })
+      await page.goto('/?demo')
+      await page.waitForSelector('.shell')
+      await page.evaluate((p) => { history.pushState({}, '', p); dispatchEvent(new PopStateEvent('popstate')) }, r)
+      await page.waitForLoadState('networkidle')
+      for (const c of clicks) await page.locator(c.replace(/^force:/, '')).first().click({ force: c.startsWith('force:') })
+      expect(await audit(page)).toEqual([])
+    })
+  }
+}

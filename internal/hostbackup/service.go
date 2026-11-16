@@ -20,9 +20,14 @@ type Deps struct {
 	ZFS zfs.Client
 	// Mounter defaults to OSMounter over ZFS.
 	Mounter Mounter
+	// Datasets mounts the datasets a capture finds unmounted (a jail that is not running). Without it such a capture
+	// fails and says so.
+	Datasets DatasetMounter
 	// Agents, when set, reads snapshots and writes restored jails through file agents (see Agents).
 	Agents Agents
 	Jails  JailSource
+	// Volumes lists the volumes as records; optional (see VolumeSource).
+	Volumes VolumeSource
 	// Objects resolves networks, policies and address sets for the bundle.
 	Objects  backup.ObjectSource
 	Policies PolicySource
@@ -122,6 +127,10 @@ func (s *Service) isBusy(uuid string) bool {
 	defer s.mu.Unlock()
 	return s.busy[uuid]
 }
+
+// Busy says whether a backup of the jail or volume with this UUID is being taken or restored now (the delete of a
+// jail or volume asks before it starts).
+func (s *Service) Busy(uuid string) bool { return s.isBusy(uuid) }
 
 func randHex(n int) string {
 	b := make([]byte, n)

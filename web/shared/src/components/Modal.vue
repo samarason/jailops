@@ -65,9 +65,12 @@ onBeforeUnmount(() => opener?.focus?.())
 
 <style>
 .modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / 0.5); display: flex; align-items: flex-start; justify-content: center; padding: 6vh var(--gutter) var(--gutter); overflow-y: auto; z-index: 50; }
-.modal { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); box-shadow: var(--shadow); width: min(520px, 100%); }
+/* a long dialog scrolls its body: the header and the footer with the buttons stay in view */
+.modal { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); box-shadow: var(--shadow); width: min(520px, 100%); display: flex; flex-direction: column; max-height: calc(100dvh - 6vh - var(--gutter)); --tabbar-bg: var(--surface); }
+.modal > header, .modal > footer { flex: none; }
 .modal.wide { width: min(760px, 100%); }
 .modal > header { display: flex; justify-content: space-between; align-items: center; padding: 8px 8px 8px 16px; border-bottom: 1px solid var(--border); gap: 8px; }
-.modal-body { padding: 16px; }
-.modal > footer { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface-2); }
+.modal-body { padding: 16px; overflow-y: auto; min-height: 0; flex: 1 1 auto; }
+.modal > footer { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface-2); border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
+@media (max-width: 600px) { .modal-backdrop { padding-top: 12px; } .modal { max-height: calc(100dvh - 12px - var(--gutter)); } }
 </style>

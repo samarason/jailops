@@ -2,7 +2,7 @@ apiVersion: jailops/v1
 kind: App
 metadata:
   name: db
-# An app is installed once, as `jailops app install postgresql --name db` would; sync never
+# An app is installed once, as `jailops app install postgresql db` would; sync never
 # reinstalls, changes or deletes it afterwards.
 hosts: [db1]
 spec:

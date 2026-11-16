@@ -1,18 +1,24 @@
 $ jailops list
 ! invalid: a project is required
-! hint: name one with --project NAME, or choose one with 'jailops project switch NAME' (list them with 'jailops project list'; create one with 'jailops project create NAME --new-network')
+! hint: name one with --project NAME or JAILOPS_PROJECT=NAME, or choose one with 'jailops project switch NAME' (list them with 'jailops project list'; create one with 'jailops project create NAME --new-network')
 [exit 2]
 
 $ jailops create x --image freebsd-15@stable
 ! invalid: a project is required
-! hint: name one with --project NAME, or choose one with 'jailops project switch NAME' (list them with 'jailops project list'; create one with 'jailops project create NAME --new-network')
+! hint: name one with --project NAME or JAILOPS_PROJECT=NAME, or choose one with 'jailops project switch NAME' (list them with 'jailops project list'; create one with 'jailops project create NAME --new-network')
 [exit 2]
 
-$ jailops project create web --new-network --storage default
+$ jailops project create web --new-network
 project/web created
 
-$ jailops project create db --new-network --storage default
+$ jailops storage grant default --project web
+storage/default granted to project web
+
+$ jailops project create db --new-network
 project/db created
+
+$ jailops storage grant default --project db
+storage/default granted to project db
 
 $ jailops project switch
 ! no project chosen on remote a: choose one with 'jailops project switch NAME'
@@ -21,14 +27,14 @@ $ jailops project switch web
 remote a now uses project web
 
 $ jailops project list
-    NAME   HOSTS   NETWORKS   STORAGE   JAILS   DESCRIPTION
+    NAME   HOSTS   NETWORKS   STORAGE   JAILS   COMMENT
     db     -       db         default   0       -
     main   -       lan        default   0       -
 *   web    -       web        default   0       -
 
 $ jailops project switch nowhere
 ! not_found: project "nowhere" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops project list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops --remote b project switch db
@@ -77,7 +83,7 @@ dry-run: would switch remote a to project db
 
 $ jailops project switch default
 ! not_found: project "default" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops project list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops list -o name

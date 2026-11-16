@@ -47,7 +47,7 @@ on it; 'jailops app validate' reports each line that still holds a TODO
 marker, and a definition is ready for the packages repository when it reports
 nothing. NAME.svg, a neutral placeholder icon, is written next to it unless an
 icon of that name is there. An existing NAME.yaml is not overwritten without
---force.
+--overwrite.
 
 To try it on a FreeBSD host, copy both files into /usr/local/etc/jailops/apps
 (apps.local_dir) and run 'jailops app install NAME'. docs/apps.md, "Write your
@@ -73,7 +73,7 @@ jailops app new tool`,
 			}
 			file := filepath.Join(dir, name+".yaml")
 			if _, err := os.Lstat(file); err == nil && !force {
-				return api.Errorf(api.CodeAlreadyExists, "%s exists", file).WithHint("keep it, or write over it with --force")
+				return api.Errorf(api.CodeAlreadyExists, "%s exists", file).WithHint("keep it, or write over it with --overwrite")
 			}
 			data := d.YAML()
 			if err := os.WriteFile(file, data, 0o644); err != nil {
@@ -107,7 +107,7 @@ jailops app new tool`,
 	f.StringSliceVar(&ports, "port", nil, "port the app listens on: N, N/tcp or N/udp (repeat, or separate with commas)")
 	f.StringVar(&category, "category", "", "category: "+strings.Join(appCategoryNames(), ", "))
 	f.StringVar(&dir, "dir", ".", "directory to write NAME.yaml and NAME.svg into")
-	f.BoolVar(&force, "force", false, "write over an existing NAME.yaml")
+	f.BoolVar(&force, "overwrite", false, "write over an existing NAME.yaml")
 	enumFlag(cmd, "category", appCategoryNames()...)
 	_ = cmd.MarkFlagDirname("dir")
 	return cmd
@@ -121,7 +121,9 @@ func (a *app) appExport() *cobra.Command {
 		Short: "Draft an app definition from a running jail",
 		Long: `Ask the server to draft an app definition from a running FreeBSD jail of the
 project, one you set up by hand until the app worked, and write it as a
-commented definition to FILE (-o) or to the standard output.
+commented definition to FILE (--to) or to the standard output. -o json and
+-o yaml print the server's draft as data instead (the definition with its
+TODO list), for programs.
 
 The draft holds what the jail shows: the packages installed on purpose (their
 dependencies come with them), the services enabled in its rc.conf and their
@@ -141,16 +143,20 @@ read-only commands in it, which needs the operator role.
 
 The file is named after the jail: write it as JAIL.yaml, or change name: to
 match the file name.`,
-		Example: `jailops app export cache -o cache.yaml
+		Example: `jailops app export cache --file cache.yaml
 jailops app export web --project shop
-jailops app export cache -o ./apps/cache.yaml --force`,
+jailops app export cache --file ./apps/cache.yaml --overwrite
+jailops app export cache -o json`,
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completeKind(a, a.jailDesc()),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			if a.format != fmtTable && a.format != fmtJSON && a.format != fmtYAML {
+				return usagef("-o %s is not available here: the draft is YAML (the default), -o json or -o yaml", a.format)
+			}
 			if out != "" && out != "-" && !force {
 				if _, err := os.Lstat(out); err == nil {
-					return api.Errorf(api.CodeAlreadyExists, "%s exists", out).WithHint("keep it, or write over it with --force")
+					return api.Errorf(api.CodeAlreadyExists, "%s exists", out).WithHint("keep it, or write over it with --overwrite")
 				}
 			}
 			c, err := a.connect(ctx)
@@ -160,6 +166,9 @@ jailops app export cache -o ./apps/cache.yaml --force`,
 			d, err := c.Jails().AppDraft(ctx, args[0])
 			if err != nil {
 				return err
+			}
+			if a.format != fmtTable && out == "" {
+				return a.emit(d, nil, nil, nil)
 			}
 			data := apps.Draft{App: d.Definition, Todo: d.Todo, Header: apps.ExportHeader(d)}.YAML()
 			if out == "" || out == "-" {
@@ -177,9 +186,8 @@ jailops app export cache -o ./apps/cache.yaml --force`,
 			return nil
 		},
 	}
-	// -o names the file here, not an output format
-	cmd.Flags().StringVarP(&out, "output", "o", "", "file to write the definition to (default: the standard output)")
-	cmd.Flags().BoolVar(&force, "force", false, "write over an existing FILE")
-	_ = cmd.MarkFlagFilename("output", "yaml")
+	cmd.Flags().StringVarP(&out, "file", "f", "", "file to write the definition to (default: the standard output)")
+	cmd.Flags().BoolVar(&force, "overwrite", false, "write over an existing FILE")
+	_ = cmd.MarkFlagFilename("file", "yaml", "yml")
 	return cmd
 }

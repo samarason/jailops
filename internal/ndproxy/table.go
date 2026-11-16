@@ -49,7 +49,7 @@ const (
 	// ModeImmediate answers at once for every allocated address. JailOps
 	// allocates the addresses itself, so this is the default.
 	ModeImmediate Mode = iota
-	// ModeProbe sends a solicitation toward the bridge side first and
+	// ModeProbe sends a solicitation toward the jail first and
 	// answers only once the jail has replied.
 	ModeProbe
 )

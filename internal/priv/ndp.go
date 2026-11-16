@@ -2,11 +2,9 @@ package priv
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/netip"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,12 +23,12 @@ import (
 //   - ndp.answer makes the helper build and send one Neighbor Advertisement itself, after checking it against the
 //     operator's configuration. The daemon never sends a frame of its own.
 //
-// What may be answered is decided by the operator in the root-owned configuration (ndp-proxy = <uplink>=<prefix>,...),
-// not by anything the daemon says: a compromised daemon can at most make the helper answer for addresses inside a
-// prefix the operator approved, on an uplink the operator approved, at a bounded rate.
+// What may be answered is decided from the networks JailOps has stored: the helper answers only for addresses inside the
+// subnet of a network in IPv6 proxy mode on that uplink, and only when it checks out (ndpPrefixes). The daemon cannot
+// make it answer for anything else, at more than a bounded rate.
 
-// NDPUplink is an uplink the operator approved for the IPv6 proxy, with the prefixes it may answer for.
-type NDPUplink struct {
+// ndpUplink is an uplink the IPv6 proxy works on, with the prefixes it may answer for.
+type ndpUplink struct {
 	Uplink   string
 	Prefixes []netip.Prefix
 }
@@ -152,66 +150,101 @@ func (s *ndpState) allow(uplink string) bool {
 	return true
 }
 
-// ParseNDPProxy parses "<uplink>=<prefix>[,<prefix>...]".
-func ParseNDPProxy(s string) (NDPUplink, error) {
-	name, list, ok := strings.Cut(strings.TrimSpace(s), "=")
-	if !ok || name == "" || list == "" {
-		return NDPUplink{}, fmt.Errorf("ndp-proxy %q: want <uplink>=<prefix>[,<prefix>...]", s)
+// ndpPrefixes are the prefixes the proxy may answer for on an uplink: the subnets of the stored networks in proxy mode that
+// use it, each checked here, by the helper itself: between /48 and /120, global or unique-local, no address of the host
+// inside it on any interface, no overlap with another stored network, and the uplink a plain interface of the host (not a
+// loopback, a bridge, an interface of JailOps or a member of a bridge).
+func (l *Local) ndpPrefixes(ctx context.Context, uplink string) (ndpUplink, error) {
+	u := ndpUplink{Uplink: uplink}
+	nets, err := l.storedNetworks()
+	if err != nil {
+		return u, err
 	}
-	u := NDPUplink{Uplink: strings.TrimSpace(name)}
-	for _, p := range strings.Split(list, ",") {
-		pf, err := netip.ParsePrefix(strings.TrimSpace(p))
-		if err != nil {
-			return NDPUplink{}, fmt.Errorf("ndp-proxy %q: %v", s, err)
+	var mine []netip.Prefix
+	for _, n := range nets {
+		if v6 := n.Spec.IPv6; v6 != nil && v6.Mode == api.IPv6Proxy && n.Spec.Uplink == uplink {
+			p, err := netip.ParsePrefix(v6.Subnet)
+			if err != nil {
+				continue
+			}
+			mine = append(mine, p.Masked())
 		}
-		u.Prefixes = append(u.Prefixes, pf)
+	}
+	if len(mine) == 0 {
+		return u, forbidden("no network in IPv6 proxy mode uses %q: the proxy answers for the subnets of such networks only", uplink)
+	}
+	list, err := l.d.Net.List(ctx)
+	if err != nil {
+		return u, err
+	}
+	var up *ifconfig.Iface
+	for k := range list {
+		if list[k].Name == uplink {
+			up = &list[k]
+		}
+	}
+	if up == nil {
+		return u, forbidden("%q is not an interface of this host", uplink)
+	}
+	for _, g := range up.Groups {
+		if g == "lo" || g == "bridge" || g == "epair" || g == "wg" || g == "tun" {
+			return u, forbidden("%q is a %s interface: the IPv6 proxy needs a plain interface", uplink, g)
+		}
+	}
+	if ifconfig.HasMarker(up.Description) {
+		return u, forbidden("%q is an interface of JailOps", uplink)
+	}
+	for _, i := range list {
+		for _, m := range i.Members {
+			if m.Name == uplink {
+				return u, forbidden("%q is a member of bridge %s: the IPv6 proxy needs a plain interface", uplink, i.Name)
+			}
+		}
+	}
+	for _, p := range mine {
+		switch {
+		case !p.Addr().Is6() || p.Addr().Is4In6():
+			return u, forbidden("%s is not an IPv6 prefix", p)
+		case p.Bits() < ndpMinPrefixBits || p.Bits() > ndpMaxPrefixBits:
+			return u, forbidden("prefix %s must be between /%d and /%d", p, ndpMinPrefixBits, ndpMaxPrefixBits)
+		case !p.Addr().IsGlobalUnicast():
+			return u, forbidden("prefix %s is not a global or unique-local unicast prefix", p)
+		}
+		for _, i := range list {
+			for _, h := range i.Inet6 {
+				if p.Contains(h.Addr()) {
+					return u, forbidden("prefix %s holds the host's own address %s on %s", p, h.Addr(), i.Name)
+				}
+			}
+		}
+		for _, n := range nets {
+			for _, o := range networkPrefixes(n.Spec) {
+				if o != p && o.Overlaps(p) {
+					return u, forbidden("prefix %s overlaps %s of network %q", p, o, n.Metadata.Name)
+				}
+			}
+		}
+		u.Prefixes = append(u.Prefixes, p)
 	}
 	return u, nil
 }
 
-// normalizeNDP validates the approved uplinks.
-func normalizeNDP(in []NDPUplink) ([]NDPUplink, error) {
-	seen := map[string]bool{}
-	var out []NDPUplink
-	for _, u := range in {
-		if err := ifconfig.ValidateIfName(u.Uplink); err != nil {
-			return nil, fmt.Errorf("ndp-proxy: %v", err)
-		}
-		if seen[u.Uplink] {
-			return nil, fmt.Errorf("ndp-proxy: uplink %s is listed twice; give its prefixes in one line", u.Uplink)
-		}
-		seen[u.Uplink] = true
-		if len(u.Prefixes) == 0 {
-			return nil, fmt.Errorf("ndp-proxy: uplink %s has no prefix", u.Uplink)
-		}
-		n := NDPUplink{Uplink: u.Uplink}
-		for _, p := range u.Prefixes {
-			p = p.Masked()
-			switch {
-			case !p.Addr().Is6() || p.Addr().Is4In6():
-				return nil, fmt.Errorf("ndp-proxy: %s is not an IPv6 prefix", p)
-			case p.Bits() < ndpMinPrefixBits || p.Bits() > ndpMaxPrefixBits:
-				return nil, fmt.Errorf("ndp-proxy: prefix %s must be between /%d and /%d", p, ndpMinPrefixBits, ndpMaxPrefixBits)
-			case !p.Addr().IsGlobalUnicast():
-				return nil, fmt.Errorf("ndp-proxy: prefix %s is not a global or unique-local unicast prefix", p)
-			}
-			n.Prefixes = append(n.Prefixes, p)
-		}
-		out = append(out, n)
-	}
-	return out, nil
-}
-
-func (c Config) ndpUplink(uplink string) (NDPUplink, error) {
-	for _, u := range c.NDPProxy {
-		if u.Uplink == uplink {
-			return u, nil
+func networkPrefixes(s api.NetworkSpec) []netip.Prefix {
+	var out []netip.Prefix
+	if s.IPv4 != nil {
+		if p, err := netip.ParsePrefix(s.IPv4.Subnet); err == nil {
+			out = append(out, p.Masked())
 		}
 	}
-	return NDPUplink{}, forbidden("the IPv6 proxy is not approved for %q: add the line `ndp-proxy = %s=<prefix of the jails' addresses>` to priv.conf and restart jailops-priv", uplink, uplink)
+	if s.IPv6 != nil && s.IPv6.Mode != api.IPv6None {
+		if p, err := netip.ParsePrefix(s.IPv6.Subnet); err == nil {
+			out = append(out, p.Masked())
+		}
+	}
+	return out
 }
 
-func (u NDPUplink) contains(a netip.Addr) bool {
+func (u ndpUplink) contains(a netip.Addr) bool {
 	for _, p := range u.Prefixes {
 		if p.Contains(a) {
 			return true
@@ -225,21 +258,21 @@ func (l *Local) NDPOpen(ctx context.Context, uplink string, promisc bool) (*os.F
 	if err := ifconfig.ValidateIfName(uplink); err != nil {
 		return nil, err
 	}
-	if _, err := l.cfg.ndpUplink(uplink); err != nil {
-		return nil, err
-	}
 	if l.d.NDP == nil {
 		return nil, api.Errorf(api.CodeUnsupported, "packet capture is not available here")
+	}
+	if _, err := l.ndpPrefixes(ctx, uplink); err != nil {
+		return nil, err
 	}
 	return l.d.NDP.Capture(uplink, promisc)
 }
 
-// NDPAnswer implements Host: it validates the request against the operator's approval and sends one advertisement.
+// NDPAnswer implements Host: it validates the request against the stored networks and sends one advertisement.
 func (l *Local) NDPAnswer(ctx context.Context, q NDPAnswerReq) error {
 	if err := ifconfig.ValidateIfName(q.Uplink); err != nil {
 		return err
 	}
-	up, err := l.cfg.ndpUplink(q.Uplink)
+	up, err := l.ndpPrefixes(ctx, q.Uplink)
 	if err != nil {
 		return err
 	}
@@ -248,7 +281,7 @@ func (l *Local) NDPAnswer(ctx context.Context, q NDPAnswerReq) error {
 		return invalid("ndp.answer: target %q is not an IPv6 address", q.Target)
 	}
 	if !up.contains(target) {
-		return forbidden("ndp.answer: %s is outside the prefixes approved for %s", target, q.Uplink)
+		return forbidden("ndp.answer: %s is outside the subnets of the networks in proxy mode on %s", target, q.Uplink)
 	}
 	if q.Announce {
 		return l.ndpAnnounce(q.Uplink, target)
@@ -344,7 +377,7 @@ func (l *Local) requireJailRoute(target netip.Addr) error {
 	if !ok {
 		return forbidden("ndp.answer: %s has no host route of a jail on this host", target)
 	}
-	if err := l.cfg.ifOwned(iface); err != nil {
+	if err := l.ifOwned(context.Background(), iface); err != nil {
 		return forbidden("ndp.answer: the route of %s leaves through %s, which is not an interface of JailOps", target, iface)
 	}
 	return nil

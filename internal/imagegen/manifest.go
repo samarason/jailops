@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -32,6 +33,30 @@ func ManifestHash(pkgs []Package) string {
 		h.Write([]byte{'\n'})
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+var reReleaseVersion = regexp.MustCompile(`^([0-9]+\.[0-9]+)(?:p([0-9]+))?$`)
+
+// FreeBSDVersion is the FreeBSD version a pkgbase package set was built from, read from the version of its
+// FreeBSD-runtime package: "15.1" is 15.1-RELEASE, "15.1p6" 15.1-RELEASE-p6. Any other form (a snapshot of a branch,
+// "15.snap20261031190411") is returned as it is, because it says nothing more than that. "" when the set has no
+// FreeBSD-runtime (a Linux image).
+func FreeBSDVersion(pkgs []Package) string {
+	for _, p := range pkgs {
+		if p.Name != "FreeBSD-runtime" {
+			continue
+		}
+		m := reReleaseVersion.FindStringSubmatch(p.Version)
+		switch {
+		case m == nil:
+			return p.Version
+		case m[2] == "":
+			return m[1] + "-RELEASE"
+		default:
+			return m[1] + "-RELEASE-p" + m[2]
+		}
+	}
+	return ""
 }
 
 // ParsePkgQuery parses "name version" lines from pkg query '%n %v'.

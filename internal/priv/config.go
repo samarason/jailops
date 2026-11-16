@@ -1,17 +1,21 @@
 package priv
 
 import (
+	"net/netip"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
-	"jailops.net/jailops/internal/sys/ifconfig"
+	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/sdk/api"
 )
 
 // Default locations on a FreeBSD host.
 const (
-	DefaultSocket     = "/var/run/jailops/priv.sock"
+	// DefaultSocket is the helper's socket. Its directory belongs to root (mode 0710, group jailops): the daemon may
+	// reach the socket but cannot put anything in its place.
+	DefaultSocket     = "/var/run/jailops-priv/priv.sock"
 	DefaultConfDir    = "/usr/local/etc/jailops/jails"
 	DefaultHelperPath = "/usr/local/libexec/jailops-priv"
 	// DefaultStorageFile persists the storage roots registered at run time.
@@ -30,7 +34,7 @@ type Limits struct {
 	MaxVolumeBytes   uint64        // volsize, quota, reservation
 	MaxExecPerJail   int           // exec sessions per jail
 	MaxExecTotal     int           // exec sessions in total
-	MaxInflight      int           // concurrent requests per connection
+	MaxInflight      int           // concurrent requests per connection (an exec session is one for as long as it runs: room for MaxExecTotal sessions and the calls beside them)
 	MaxConns         int           // concurrent connections
 	DefaultTimeout   time.Duration // applied when the request has no deadline
 	MaxTimeout       time.Duration // cap for ordinary requests
@@ -42,7 +46,7 @@ func DefaultLimits() Limits {
 	return Limits{
 		MaxFileBytes: 4 << 20, MaxArgv: 256, MaxArgvBytes: 128 << 10,
 		MaxNames: 256, MaxProps: 64, MaxVolumeBytes: 16 << 40,
-		MaxInflight: 8, MaxConns: 32, MaxExecPerJail: 8, MaxExecTotal: 64,
+		MaxInflight: 96, MaxConns: 32, MaxExecPerJail: 8, MaxExecTotal: 64,
 		DefaultTimeout: 5 * time.Minute, MaxTimeout: time.Hour, MaxStreamTimeout: 24 * time.Hour,
 	}
 }
@@ -114,6 +118,10 @@ type AdminPolicy struct {
 	RawPF bool
 	// ResumeSend lets an admin resume a send from an opaque token.
 	ResumeSend bool
+	// ZFSDelegation lets an admin hand a jail one dataset of its own, `<container>/delegated`: the jailed property
+	// of that dataset, `zfs.dataset` with that name, allow.mount, allow.mount.zfs and enforce_statfs=1 in the jail's
+	// jail.conf. The jail's root can then create datasets, snapshots and mounts below it.
+	ZFSDelegation bool
 }
 
 // Config configures validation and the Local implementation.
@@ -133,14 +141,14 @@ type Config struct {
 	StorageFile string
 	// AllowPoolRoot lets a pool's top dataset be registered as a root.
 	AllowPoolRoot bool
+	// AllowStartWithoutPF lets a jail with a network link start while pf is disabled; by default the start is refused.
+	AllowStartWithoutPF bool
 	// FetchHosts are the hosts fetch may download from (default
 	// DefaultFetchHosts).
 	FetchHosts []string
 	// ImageMirrors are directories fs.read_file may read besides the storage
 	// roots (a local mirror of image archives). Reading is all that is allowed.
 	ImageMirrors []string
-	// IfPrefixes are the interface name prefixes JailOps owns (default "jo").
-	IfPrefixes []string
 	// MountBase is optional. It only supplies the default StateDir
 	// (<MountBase>/state); file and mount paths are checked against the
 	// mountpoints of the registered roots, not against it.
@@ -151,17 +159,32 @@ type Config struct {
 	StateDir string
 	// WorkDir is the daemon's scratch directory (image builds). Empty: none.
 	WorkDir string
+	// PkgKeysDir holds the key directories (fingerprints) that a pkg repository configuration written by the daemon
+	// may name besides the base system's /usr/share/keys (default DefaultPkgKeysDir). KeyringDir holds the keyrings
+	// that debootstrap may check a release with (default DefaultKeyringDir). Both belong to root, are not
+	// writable by others and lie outside every directory the daemon writes: the daemon never chooses what the
+	// helper trusts. Their contents are checked every time they are used.
+	PkgKeysDir, KeyringDir string
+	// UnboundConf is the one file the helper writes the names of the running jails into for the host's resolver
+	// (dns.unbound, docs/dns.md). The helper binary's default is DefaultUnboundConf, the conf.d of the base system's
+	// local-unbound, which counts only when that directory exists; empty (also the zero Config): off. Its directory
+	// belongs to root and is closed to others, and lies outside every directory the daemon writes.
+	UnboundConf string
+	// DNSSuffix is the zone under which the names of the jails live: NAME.PROJECT.<suffix> (dns-suffix; default
+	// DefaultDNSSuffix). One or more DNS labels; `local` (multicast DNS) is refused. A suffix of the administrator's own
+	// (corp.example) is the clean choice.
+	DNSSuffix string
 	// WireGuardDir holds the keys of WireGuard interfaces, one directory per object (default
 	// DefaultWireGuardDir). It belongs to root with mode 0700 and lies outside every directory the daemon writes.
 	WireGuardDir string
+	// WireGuardRoutes are networks a WireGuard tunnel may route into itself although they are wider than a /8 or /16,
+	// or cover an address of the host, its gateway, a resolver, loopback, link-local or multicast (wireguard-routes).
+	WireGuardRoutes []netip.Prefix
 	// noOwnerCheck skips the check that the helper's own directories belong to root (tests).
 	noOwnerCheck bool
 	// HelperPath is the path jail.conf hooks call; only the exact hook
 	// command lines are accepted in a jail.conf.
 	HelperPath string
-	// NDPProxy lists the uplinks the IPv6 proxy may use and the prefixes it may answer for. Empty denies every
-	// request: the daemon cannot make the helper answer for anything the operator did not approve here.
-	NDPProxy []NDPUplink
 	// Sysctls extends the read allow-list.
 	Sysctls []string
 	// HostManage lists the host management modules the helper changes (host-manage; docs/appliance.md). Empty:
@@ -178,29 +201,21 @@ type Config struct {
 
 // DefaultSysctls is the sysctl read allow-list.
 var DefaultSysctls = []string{
-	"kern.osrelease", "kern.osreldate", "kern.ostype", "kern.version",
-	"kern.features.vimage", "net.link.bridge.pfil_member", "net.link.bridge.pfil_bridge", "net.link.bridge.pfil_onlyip",
-	"net.inet.ip.forwarding", "net.inet6.ip6.forwarding", "net.inet6.icmp6.nd6_onlink_ns_rfc4861", "security.jail.jailed",
+	"kern.osrelease", "kern.osreldate", "kern.ostype", "kern.version", "kern.boottime",
+	"kern.features.vimage",
+	"net.inet.ip.forwarding", "net.inet6.ip6.forwarding", "net.inet6.icmp6.nd6_onlink_ns_rfc4861", "net.inet6.ip6.use_stableaddr", "security.jail.jailed",
 	"security.jail.vnet", "kern.racct.enable", "hw.ncpu", "hw.physmem",
 }
 
 // Normalize fills defaults and cleans paths. It returns an error when the
 // configuration cannot enforce its own rules.
 func (c Config) Normalize() (Config, error) {
-	if len(c.IfPrefixes) == 0 {
-		c.IfPrefixes = ifconfig.DefaultPrefixes
-	}
 	if c.ConfDir == "" {
 		c.ConfDir = DefaultConfDir
 	}
 	if c.HelperPath == "" {
 		c.HelperPath = DefaultHelperPath
 	}
-	ndp, err := normalizeNDP(c.NDPProxy)
-	if err != nil {
-		return c, api.Errorf(api.CodeInvalid, "%v", err)
-	}
-	c.NDPProxy = ndp
 	c.StorageRoots = append([]string(nil), c.StorageRoots...)
 	if c.RootDataset != "" && !slices.Contains(c.StorageRoots, c.RootDataset) {
 		c.StorageRoots = append(c.StorageRoots, c.RootDataset)
@@ -222,11 +237,6 @@ func (c Config) Normalize() (Config, error) {
 	}
 	if c.reg == nil {
 		c.reg = newRootSet()
-	}
-	for _, p := range c.IfPrefixes {
-		if err := ifconfig.ValidateIfName(p + "0"); err != nil {
-			return c, api.Errorf(api.CodeInvalid, "interface prefix %q is invalid", p)
-		}
 	}
 	if c.MountBase != "" {
 		if !filepath.IsAbs(c.MountBase) {
@@ -256,8 +266,40 @@ func (c Config) Normalize() (Config, error) {
 		*p = filepath.Clean(*p)
 	}
 	for _, h := range c.FetchHosts {
-		if !reHostName.MatchString(h) {
-			return c, api.Errorf(api.CodeInvalid, "fetch host %q is not a lower case host name", h)
+		if !reHostName.MatchString(strings.TrimPrefix(h, "http://")) {
+			return c, api.Errorf(api.CodeInvalid, "fetch host %q is not a lower case host name (http://<host> allows plain http for that host)", h)
+		}
+	}
+	if c.PkgKeysDir == "" {
+		c.PkgKeysDir = DefaultPkgKeysDir
+	}
+	if c.KeyringDir == "" {
+		c.KeyringDir = DefaultKeyringDir
+	}
+	for _, p := range []struct{ key, dir string }{{"pkg-keys-dir", c.PkgKeysDir}, {"keyring-dir", c.KeyringDir}} {
+		if !filepath.IsAbs(p.dir) || filepath.Clean(p.dir) != p.dir || filepath.Dir(p.dir) == "/" {
+			return c, api.Errorf(api.CodeInvalid, "%s %q must be a clean absolute path at least two levels deep", p.key, p.dir)
+		}
+		for _, d := range []string{c.StateDir, c.ConfDir, c.WorkDir, c.MountBase, c.WireGuardDir} {
+			if d != "" && (within(d, p.dir) || within(p.dir, d)) {
+				return c, api.Errorf(api.CodeInvalid, "%s %q must not overlap %s: the daemon writes there, and the helper trusts what is in this directory", p.key, p.dir, d)
+			}
+		}
+	}
+	if c.DNSSuffix == "" {
+		c.DNSSuffix = DefaultDNSSuffix
+	}
+	if err := validate.Hostname("dns-suffix", c.DNSSuffix); err != nil || c.DNSSuffix == "local" || strings.HasSuffix(c.DNSSuffix, ".local") || len(c.DNSSuffix) > 100 {
+		return c, api.Errorf(api.CodeInvalid, "dns-suffix %q must be DNS labels and not `local` (multicast DNS)", c.DNSSuffix)
+	}
+	if c.UnboundConf != "" {
+		if !filepath.IsAbs(c.UnboundConf) || filepath.Clean(c.UnboundConf) != c.UnboundConf || filepath.Dir(c.UnboundConf) == "/" || !strings.HasSuffix(c.UnboundConf, ".conf") {
+			return c, api.Errorf(api.CodeInvalid, "unbound-conf %q must be a clean absolute path of a .conf file at least two levels deep", c.UnboundConf)
+		}
+		for _, d := range []string{c.StateDir, c.ConfDir, c.WorkDir, c.MountBase} {
+			if d != "" && within(d, c.UnboundConf) {
+				return c, api.Errorf(api.CodeInvalid, "unbound-conf %q must not lie in %s: the daemon writes there", c.UnboundConf, d)
+			}
 		}
 	}
 	if c.WireGuardDir == "" {

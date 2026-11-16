@@ -36,7 +36,7 @@ func TestAcceptanceDesign46(t *testing.T) {
 	}
 	// new data written on the upgraded jail, after the pre-upgrade snapshot
 	w.Z.WriteFile(jc+"/home", "/home/user/after-upgrade", "new data")
-	w.Z.WriteFile(jc+"/data/db", "/db/rows", "rows written on g2")
+	w.Z.WriteFile(dbVol, "/db/rows", "rows written on g2")
 
 	// root rollback is the default scope and never touches data
 	homeBefore := w.Z.Dump()
@@ -62,7 +62,7 @@ func TestAcceptanceDesign46(t *testing.T) {
 			t.Fatalf("root rollback lost data: %s = %q", path, got)
 		}
 	}
-	if got, _ := w.Z.ReadFile(jc+"/data/db", "/db/rows"); got != "rows written on g2" {
+	if got, _ := w.Z.ReadFile(dbVol, "/db/rows"); got != "rows written on g2" {
 		t.Fatal("volume data lost")
 	}
 
@@ -156,14 +156,14 @@ func TestRollbackRootKeepsDataAndEtcMergesBack(t *testing.T) {
 func dataWorld(t *testing.T) *world {
 	w := runningSetup(t)
 	w.Z.WriteFile(jc+"/home", "/home/a", "v1")
-	w.Z.WriteFile(jc+"/data/db", "/db/x", "v1")
+	w.Z.WriteFile(dbVol, "/db/x", "v1")
 	w.Z.WriteFile(jc+"/etc", "/etc/conf", "v1")
 	if _, err := w.S.SnapshotJail(bg, "alpha_web", "s1", ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Z.WriteFile(jc+"/home", "/home/a", "version-two")
 	w.Z.WriteFile(jc+"/home", "/home/new", "n")
-	w.Z.WriteFile(jc+"/data/db", "/db/x", "v2")
+	w.Z.WriteFile(dbVol, "/db/x", "v2")
 	w.Z.WriteFile(jc+"/etc", "/etc/conf", "v2")
 	return w
 }
@@ -174,7 +174,7 @@ func TestRollbackDataScope(t *testing.T) {
 	before := w.state()
 	res, err := rollback(w, opts)
 	wantCode(t, err, api.CodeDataLoss)
-	wantW := int64(len("version-two") + len("n") + len("v2"))
+	wantW := int64(len("version-two") + len("n")) // a volume is not part of a jail
 	if res.TotalWritten != wantW || w.state() != before {
 		t.Fatalf("written %d want %d", res.TotalWritten, wantW)
 	}
@@ -189,8 +189,8 @@ func TestRollbackDataScope(t *testing.T) {
 	if _, ok := w.Z.ReadFile(jc+"/home", "/home/new"); ok {
 		t.Fatal("new file survived")
 	}
-	if v, _ := w.Z.ReadFile(jc+"/data/db", "/db/x"); v != "v1" {
-		t.Fatal(v)
+	if v, _ := w.Z.ReadFile(dbVol, "/db/x"); v != "v2" {
+		t.Fatalf("a data rollback of the jail must not touch its volume, got %q", v)
 	}
 	if v, _ := w.Z.ReadFile(jc+"/etc", "/etc/conf"); v != "v2" {
 		t.Fatalf("data scope must not touch /etc, got %q", v)
@@ -227,13 +227,13 @@ func TestRollbackRefusesWhenLaterSnapshotsExist(t *testing.T) {
 
 func TestRollbackSkipsDatasetsWithoutSnapshotOnlyWithForce(t *testing.T) {
 	w := dataWorld(t)
-	w.Z.Create(bg, jc+"/data/cache", map[string]string{PropManaged: "on", PropKind: KindVolume, PropClass: "data", PropPath: "/srv/cache"})
+	w.Z.Create(bg, jc+"/cache", map[string]string{PropManaged: "on", PropKind: KindPersistent, PropClass: "data", PropPath: "/srv/cache"})
 	opts := RollbackOptions{JailRollback: api.JailRollback{Scope: api.RollbackData, Snapshot: "s1", ConfirmDataLoss: true}}
 	_, err := rollback(w, opts)
 	wantCode(t, err, api.CodeConflict)
 	opts.Force = true
 	res, err := rollback(w, opts)
-	if err != nil || len(res.Skipped) != 1 || res.Skipped[0] != jc+"/data/cache" {
+	if err != nil || len(res.Skipped) != 1 || res.Skipped[0] != jc+"/cache" {
 		t.Fatal(res.Skipped, err)
 	}
 }

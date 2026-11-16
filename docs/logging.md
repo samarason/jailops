@@ -73,32 +73,44 @@ In `jailopsd.yaml` (restart `jailopsd` after a change):
         - name: alerts
           type: webhook
           to: https://hooks.example.com/jailops
-          token_file: /usr/local/etc/jailops/hook.token
+          token_file: /usr/local/etc/jailops/sinks/hook.token
           sources: {no_jails: true, audit: true}
 
 Or from the command line or the console, which store the list in the daemon's state (the state kind `LogForward`). **A
 stored list replaces the file's** until `jailops logs forward reset` (or *Reset to the file* in the console) deletes it.
 `jailops logs forward list` says which one is in force.
 
-    jailops logs forward add syslog --to tls://logs.example.com:6514 --facility local3 [--ca FILE] [--jail NAME]... [-l K=V]...
-    jailops logs forward add webhook --to https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit
-    jailops logs forward edit central --facility local5
+    jailops logs forward add central --url tls://logs.example.com:6514 --facility local3 [--ca FILE] [--jail NAME]... [-l K=V]...
+    jailops logs forward add hooks --url https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/sinks/hook.token --audit
+    jailops logs forward set central --facility local5
     jailops logs forward test central            one tagged line, and whether it was delivered
     jailops logs forward status                  sent, queued, dropped, last delivery, failing since, last error
-    jailops logs forward remove alerts
-    jailops logs forward reset                   back to logging.forward of jailopsd.yaml
+    jailops logs forward remove alerts           asks first; -y in a script
+    jailops logs forward reset                   back to logging.forward of jailopsd.yaml; asks first, -y in a script
+
+**A list set from the command line or the console is restricted**, because an administrator's token, not root, sets
+it: its `ca_file` and `token_file` must be files directly in `logging.secrets_dir` (default
+`/usr/local/etc/jailops/sinks`, a directory owned by root, mode 0750, group `jailops`, which the setup makes),
+and its receivers may not be on this host's loopback addresses, link-local addresses (`169.254.0.0/16`, `fe80::/10`,
+cloud metadata services among them), the unspecified, multicast or broadcast addresses, or the daemon's own ports
+(the console's listener and the ACME challenge listener) on an address of the host. A host name is checked on the
+address it resolves to, when the connection is made, so a name that later resolves elsewhere changes nothing; an
+address or `localhost` is refused when the list is stored. A receiver on this host, and files anywhere else, go into
+`logging.forward` of `jailopsd.yaml`, which only root writes. A list stored through the API replaces the file's whole list, so it cannot
+carry such a sink along either: `jailops logs forward add` on top of a file list that has one is refused until that
+sink is removed from the stored list (or `jailops logs forward reset` goes back to the file).
 
 `--dry-run` shows what add, edit, remove and reset would send. A sink without a name is named after the receiver's
 host (`logs` for `logs.example.com`).
 
 | Key | Meaning |
 |---|---|
-| `name` | `^[a-z][a-z0-9-]{0,31}$`, unique; at most 16 sinks |
+| `name` | the name rule (hyphens only, at most 32 characters), unique; at most 16 sinks |
 | `type` | `syslog` or `webhook` |
 | `to` | `udp://HOST[:514]`, `tcp://HOST[:514]`, `tls://HOST[:6514]` for syslog; an `https://` URL for a webhook |
 | `facility` | `local0` (default) to `local7`; syslog only |
-| `ca_file` | PEM certificates to verify the receiver with (tls, webhook); default the host's roots |
-| `token_file` | webhook: a file whose first line is the bearer token |
+| `ca_file` | PEM certificates to verify the receiver with (tls, webhook); default the host's roots. Set through the API: a file directly in `logging.secrets_dir` |
+| `token_file` | webhook: a file whose first line is the bearer token. Set through the API: a file directly in `logging.secrets_dir` |
 | `queue` | lines held while the receiver is away, 100 to 1,000,000 (default 10,000) |
 | `sources.projects`, `jails`, `labels` | only these jails (all must match when several are given); all jails when none |
 | `sources.exclude_jails`, `exclude_labels` | leave these out (a jail with any one of the labels) |
@@ -108,7 +120,10 @@ host (`logs` for `logs.example.com`).
 
 The CLI flags are the same: `--from-project`, `--jail`, `-l/--label`, `--exclude-jail`, `--exclude-label`, `--file`,
 `--no-app-logs`, `--audit`, `--audit-only`, `--queue`, `--ca`, `--token-file`. Reading and changing the list, its
-status and the test need a **global administrator**; every change and test is in the audit log.
+status and the test need a **global administrator**; every change and test is in the audit log. The test answers whether
+the line was delivered and, when it was not, a short class of the failure (`connection refused`, `timeout`,
+`dns lookup failed`, `tls handshake failed`, `certificate not trusted`, `HTTP 503`, `target refused: loopback`, ...),
+never what the receiver answered; a webhook's answer body is not kept anywhere.
 
 ### What is sent
 
@@ -150,7 +165,8 @@ failure.
   there.
 - **Anything with an HTTPS endpoint**: a webhook. Check the bearer token on the receiver.
 - To see what arrives during a test, a plain listener is enough: `nc -lk 127.0.0.1 1514` and a sink
-  `tcp://127.0.0.1:1514` show the frames as they come (that is what `scripts/ci-freebsd-e2e.sh` does).
+  `tcp://127.0.0.1:1514` in `logging.forward` of `jailopsd.yaml` show the frames as they come (that is what
+  `scripts/ci-freebsd-e2e.sh` does; the API refuses a loopback receiver).
 
 ### Delivery, honestly
 
@@ -187,10 +203,16 @@ file and round, files read every two seconds and the jail list every 30 seconds,
 - **Plain udp and tcp** send logs, which may hold secrets, in the clear. A plain sink to an address that is not a
   loopback one carries a warning in its status; the daemon logs it when the sink starts and doctor reports it.
 - **The token is never in the configuration, the API or the audit log**: `token_file` names a file the daemon reads at
-  each delivery. It must be a regular file (no symbolic link), owned by root, not writable by anyone else and not
-  readable by others: `install -m 0640 -o root -g jailops token /usr/local/etc/jailops/hook.token`. `ca_file` must be
-  owned by root and not writable by group or others. Both are checked when the list is stored and again when the sink
-  reads them (the token at each delivery, the CA file when a connection is set up).
+  each delivery. It must be a regular file, owned by root, not writable by anyone else and not readable by others:
+  `install -m 0640 -o root -g jailops token /usr/local/etc/jailops/sinks/hook.token`. `ca_file` must be owned by root
+  and not writable by group or others. Both are opened from `/` one directory at a time without following a symbolic
+  link anywhere in the path, and owner and mode are checked on the open file, so what is read is what was checked.
+  Both are checked when the list is stored and again when the sink reads them (the token at each delivery, the CA file
+  when a connection is set up).
+- **What an administrator's token can point a sink at**: through the API, only files directly in
+  `logging.secrets_dir` (so a token cannot make the daemon send the first line of another root-owned file the daemon
+  may read to a receiver of its choosing), and only receivers off this host and off the link-local network (see
+  Configure). `jailopsd.yaml` is root's and has neither limit.
 - **Who may**: the sink list names receivers and files of the host, so reading it, changing it and testing it need a
   global administrator. Reading many jails' logs needs the operator role in each project read, as one jail's does.
 - **Log lines are data**: escaped as described above, never interpreted, never run.

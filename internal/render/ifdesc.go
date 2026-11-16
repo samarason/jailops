@@ -1,6 +1,10 @@
 package render
 
-import "strings"
+import (
+	"strings"
+
+	"jailops.net/jailops/internal/sys/ifconfig"
+)
 
 // Interface descriptions. Every interface JailOps creates carries a short, fixed, one-line text that says what it is,
 // shown by ifconfig(8) as "description: TEXT". The text is built from names only (never from free text or secrets),
@@ -13,23 +17,15 @@ const IfaceDescMax = 64
 // IfaceDescCharset lists the characters a description may hold besides letters and digits.
 const IfaceDescCharset = " ._:/=()-"
 
-// LegacyIfaceDesc is the ownership marker of releases before 0.4.0 ("jailops:<id>"). It is still recognised, and the
-// reconcile loop replaces it with the readable text.
-func LegacyIfaceDesc(id string) string { return "jailops:" + id }
+// IsJailOpsDesc reports whether a description is one JailOps writes. It is the helper's ownership
+// marker (ifconfig.HasMarker): the helper changes only interfaces that carry it.
+func IsJailOpsDesc(d string) bool { return ifconfig.HasMarker(d) }
 
-// BridgeDescription is LegacyIfaceDesc, the name earlier code used.
-func BridgeDescription(id string) string { return LegacyIfaceDesc(id) }
-
-// IsJailOpsDesc reports whether a description is one JailOps writes, in either format.
-func IsJailOpsDesc(d string) bool {
-	return strings.HasPrefix(d, "jailops:") || strings.HasPrefix(d, "jailops ")
-}
-
-// OwnsIface reports whether an interface whose name JailOps derives from one of its objects (id) is that object's:
-// it carries the wanted text or the marker of earlier releases for the same object. An interface without a
-// description, or with another one, may be someone else's and is left alone.
-func OwnsIface(desc, id, want string) bool {
-	return desc != "" && (desc == want || id != "" && desc == LegacyIfaceDesc(id))
+// OwnsIface reports whether an interface whose name JailOps derives from one of its objects is that object's: it carries
+// the wanted text, or the bare marker the helper writes when it creates an interface (ifconfig.Marker: made, not
+// described yet). An interface without a description, or with another one, may be someone else's and is left alone.
+func OwnsIface(desc, want string) bool {
+	return desc != "" && (desc == want || desc == ifconfig.Marker)
 }
 
 // ValidIfaceDesc reports whether d is a description JailOps may write: at most IfaceDescMax bytes of letters,
@@ -47,22 +43,8 @@ func ValidIfaceDesc(d string) bool {
 	return true
 }
 
-// NetBridgeDesc is the description of a network's bridge.
-func NetBridgeDesc(network string) string {
-	return buildDesc([]descField{{"net", network}}, " bridge")
-}
-
-// NetGatewayDesc is the description of one end of a network's gateway pair: the member end is a port of the bridge
-// (bridge side), the other end holds the host's gateway addresses (host side).
-func NetGatewayDesc(network string, hostSide bool) string {
-	if hostSide {
-		return buildDesc([]descField{{"net", network}}, " gateway (host side)")
-	}
-	return buildDesc([]descField{{"net", network}}, " gateway (bridge side)")
-}
-
-// JailIfaceDesc is the description of one end of a jail's epair: the host side is a port of the bridge, the jail
-// side lives in the jail's vnet.
+// JailIfaceDesc is the description of one end of a jail's epair: the host side is the routed link of the jail on the
+// host, the jail side lives in the jail's vnet.
 func JailIfaceDesc(project, jail, network string, hostSide bool) string {
 	side := " (jail side)"
 	if hostSide {

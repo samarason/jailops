@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log/syslog"
+	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"jailops.net/jailops/sdk"
 	"jailops.net/jailops/sdk/api"
@@ -121,13 +124,16 @@ func rootPool(run func(string, ...string) (string, error)) (string, error) {
 	}
 	ds := strings.TrimSpace(out)
 	pool, _, _ := strings.Cut(ds, "/")
-	if pool == "" || strings.ContainsAny(pool, " \t\n@#") {
+	if pool == "" || strings.ContainsAny(pool, " \t\n@#") || strings.HasPrefix(pool, "-") {
 		return "", fmt.Errorf("cannot read the pool of the root file system from %q: set jailops_pool in /etc/rc.conf", ds)
 	}
 	return pool, nil
 }
 
 func (a applianceInit) do(stdout io.Writer) error {
+	if strings.HasPrefix(a.pool, "-") {
+		return fmt.Errorf("-pool %q is not a pool name", a.pool)
+	}
 	if _, err := a.stat(a.config); err == nil {
 		fmt.Fprintf(stdout, "jailops-priv: %s exists: the helper is set up, appliance-init does nothing\n", a.config)
 		return nil
@@ -146,7 +152,7 @@ func (a applianceInit) do(stdout io.Writer) error {
 		}
 		pool = p
 	}
-	o := &initOptions{pool: pool, mount: "/jailops", user: "jailops", group: "jailops", etc: "/usr/local/etc/jailops",
+	o := &initOptions{pool: pool, mount: "/usr/local/jailops", user: "jailops", group: "jailops", etc: "/usr/local/etc/jailops",
 		dbDir: "/var/db/jailops", dryRun: a.dryRun, run: logged, chown: os.Chown, appliance: true}
 	if a.prepare != nil {
 		a.prepare(o)
@@ -246,6 +252,11 @@ func setupToken(ctx context.Context, e setupTokenEnv, stdout, stderr io.Writer) 
 		// the daemon is still starting: its socket is not there yet
 		e.sleep(250 * time.Millisecond)
 	}
+	if !setupTokenRE.MatchString(tok.Token) {
+		// the daemon's answer reaches root's terminal and the system console: only a token of the expected shape does
+		fmt.Fprintln(stderr, "jailops-priv setup-token: the daemon answered a malformed setup token")
+		return 1
+	}
 	text := setupTokenText(tok)
 	fmt.Fprint(stdout, text)
 	if e.log != nil {
@@ -265,19 +276,64 @@ func askSetupToken(ctx context.Context, socket string) (api.SetupToken, error) {
 	return c.SetupToken(cctx)
 }
 
-// setupTokenText is what the console shows.
+// setupTokenRE is the shape of a setup token: 32 bytes in base32 without padding.
+var setupTokenRE = regexp.MustCompile(`^[A-Z2-7]{52}$`)
+
+// consoleURL reports an address of the console as the daemon makes them: https://HOST:PORT/, printable ASCII only.
+func consoleURL(s string) bool {
+	if len(s) > 300 || strings.ContainsFunc(s, func(r rune) bool { return r <= 0x20 || r >= 0x7f }) {
+		return false
+	}
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil
+}
+
+// bannerText cleans a text of the daemon for the terminal and the system console: control characters (escape
+// sequences included), bidirectional and zero-width characters become U+FFFD, and it is cut at 200 characters.
+func bannerText(s string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range strings.ToValidUTF8(s, "\uFFFD") {
+		if n == 200 {
+			b.WriteString("...")
+			break
+		}
+		if api.UnsafeRune(r) {
+			r = utf8.RuneError
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
+}
+
+// setupTokenText is what the console shows. Everything in it came from the daemon, which the helper does not trust:
+// a token of another shape is never printed (setupToken), an address that is not https://HOST:PORT/ in printable
+// ASCII is left out, and the hint is cleaned.
 func setupTokenText(t api.SetupToken) string {
 	var b strings.Builder
 	b.WriteString("JailOps first-run setup\n")
-	if len(t.URLs) == 0 {
-		fmt.Fprintf(&b, "  The web console is off: %s\n", t.Hint)
+	var urls []string
+	for _, u := range t.URLs {
+		if consoleURL(u) {
+			urls = append(urls, u)
+		}
 	}
-	for i, u := range t.URLs {
+	if len(urls) == 0 {
+		fmt.Fprintf(&b, "  The web console is off: %s\n", bannerText(t.Hint))
+	}
+	for i, u := range urls {
 		label := "  Open the console:  "
 		if i > 0 {
 			label = "                     "
 		}
 		b.WriteString(label + u + "\n")
+	}
+	if len(urls) < len(t.URLs) {
+		fmt.Fprintf(&b, "  (%d address(es) of the daemon were not shown: not https://HOST:PORT/)\n", len(t.URLs)-len(urls))
+	}
+	if !setupTokenRE.MatchString(t.Token) {
+		t.Token = "(malformed, not shown)"
 	}
 	fmt.Fprintf(&b, "  Setup token:       %s\n", t.Token)
 	fmt.Fprintf(&b, "  Valid until %s, for one administrator. A new token: jailops-priv setup-token (as root)\n", t.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC"))

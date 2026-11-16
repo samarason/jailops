@@ -15,8 +15,10 @@ import (
 	"filippo.io/age"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -35,6 +37,7 @@ import (
 	"jailops.net/jailops/internal/sys/pfctl"
 	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/internal/sys/zfs"
+	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/internal/wireguard"
 	"jailops.net/jailops/sdk"
 	"jailops.net/jailops/sdk/api"
@@ -60,7 +63,7 @@ type Deps struct {
 	Env      api.Environment
 
 	// Pool is the ZFS pool name; Root the JailOps dataset ("tank/jailops") and
-	// MountBase the directory its datasets are mounted under ("/jailops").
+	// MountBase the directory its datasets are mounted under ("/usr/local/jailops").
 	Pool      string
 	Root      string
 	MountBase string
@@ -147,8 +150,21 @@ type Deps struct {
 	// ProjectFilesDir holds the provisioning files of each project, one
 	// directory per project (default <StateDir>/project-files).
 	ProjectFilesDir string
+	// JailShell (bash or sh), JailPrompt (default, short, none or a PS1 text) and JailPromptColor are the jails section of
+	// jailopsd.yaml: what a new FreeBSD jail gets when its keys leave shell and prompt empty. An empty JailShell
+	// means sh and an empty JailPrompt none (a Service built without a configuration changes nothing in jails);
+	// JailPromptColor 0 means api.DefaultPromptColor.
+	JailShell       string
+	JailPrompt      string
+	JailPromptColor int
+	// JailMaxStates is jails.max_states: the pf state limit of a jail whose limits.states is 0 (0 sets no limit).
+	JailMaxStates int
 	// UpdateTick is how often the update schedules are evaluated (default 1m).
 	UpdateTick time.Duration
+	// VolumeWatchTick is how often the mounts of watched volumes of host directories are looked at (default 15s).
+	VolumeWatchTick time.Duration
+	// AutoUpgradeZone is the time zone of the time of day of an image's automatic upgrade (default: the host's).
+	AutoUpgradeZone *time.Location
 	// AppsDir is the application catalog directory (default apps.DefaultDir);
 	// a missing directory is an empty catalog.
 	AppsDir string
@@ -156,11 +172,12 @@ type Deps struct {
 	// catalog (default apps.DefaultLocalDir); a local definition wins over a
 	// packaged one of the same name.
 	AppsLocalDir string
+	// HostFile reads a world-readable file of the host (/etc/resolv.conf, /etc/rc.conf, /etc/pf.conf) as the
+	// daemon's own user; nil reads the file system.
+	HostFile func(path string) ([]byte, error)
 	// DialJail opens a connection from the host to a jail (the tcp and http
 	// health checks of an app installation); nil uses the network.
 	DialJail func(ctx context.Context, network, address string) (net.Conn, error)
-	// NetSysctl overrides NetSysctlDefaults (network.sysctl of jailopsd.yaml).
-	NetSysctl map[string]string
 	// Persistent replaces lifecycle.DefaultPersistent (nil keeps it).
 	Persistent []lifecycle.PersistentPath
 	// ServerFingerprint is the pin of the server certificate; trust tokens
@@ -174,8 +191,16 @@ type Deps struct {
 	LogForward []api.LogSink
 	// LogForwardTune adjusts the forwarder's environment (tests: dialer, file check, clock).
 	LogForwardTune func(*logfwd.Env)
+	// LogSecretsDir is logging.secrets_dir: the only directory a sink set through the API may name files in.
+	LogSecretsDir string
+	// LogOwnPorts are the ports this daemon listens on: a sink set through the API may not send to them on an
+	// address of this host.
+	LogOwnPorts func() []int
 	// ConsolePort is the port of the TLS listener (listen.https.address), 0 without one; the host firewall opens it.
 	ConsolePort int
+	// HostAddrs are the addresses of this host's interfaces: a port forward may be published on one of them only. Nil
+	// reads the interfaces of the machine.
+	HostAddrs func() ([]netip.Addr, error)
 	// ConsoleURLs are the addresses of the console (https://HOST:PORT/) a setup token is printed with; nil without a
 	// TLS listener.
 	ConsoleURLs func() []string
@@ -188,9 +213,16 @@ type Deps struct {
 
 // Service implements the business logic.
 type Service struct {
-	d   Deps
-	log *slog.Logger
-	now func() time.Time
+	// racctAt and racctVal keep the last answer of the kern.racct.enable sysctl (see racctOn); guarded by mu.
+	racctAt   time.Time
+	racctVal  bool
+	unbound   unboundState  // the names of the jails through the host's unbound (dns_unbound.go)
+	devdState devdHolder    // the reader of devd's notifications (devd.go)
+	pipes     pipeTable     // the dummynet pipe number of every limited direction (shaping.go)
+	hostAddr  hostAddrCache // the host's own addresses (hostaddrs.go)
+	d         Deps
+	log       *slog.Logger
+	now       func() time.Time
 
 	locks   *lockSet
 	events  *eventBus
@@ -199,6 +231,11 @@ type Service struct {
 	journal *fileJournal
 	nx      *reconcile.NetExec
 	login   *auth.Lockout
+	// loginIP limits the logins of one source address over all users, ten times looser than login.
+	loginIP *auth.Lockout
+	acct    *auth.AccountDelay
+	// credGen counts changes of credentials (tokens, users, certificates, sessions) so long streams check theirs again.
+	credGen atomic.Int64
 	// totpMu makes "read the last accepted step, validate, record the new one" one step: two logins presenting
 	// the same code at once must not both succeed.
 	totpMu sync.Mutex
@@ -212,19 +249,28 @@ type Service struct {
 	lcfg     lifecycle.Config
 	localReg *LocalRegistrar
 
-	imgKind  kindStore[api.ImageSpec]
-	netKind  kindStore[api.NetworkSpec]
-	polKind  kindStore[api.FirewallPolicySpec]
-	setKind  kindStore[api.AddressSetSpec]
-	tgtKind  kindStore[api.BackupTargetSpec]
-	bpolKind kindStore[api.BackupPolicySpec]
-	remKind  kindStore[api.RemoteSpec]
-	certKind kindStore[api.CertificateSpec]
-	projKind kindStore[api.ProjectSpec]
-	stoKind  kindStore[api.StorageSpec]
-	profKind kindStore[api.ProfileSpec]
-	wgKind   kindStore[api.WireGuardSpec]
-	fwdKind  kindStore[api.LogForwardSpec]
+	// rel caches the host's kern.osrelease (hostrelease.go).
+	rel hostReleaseCache
+	// genVer caches the FreeBSD version of generations by name ("freebsd-15-1#g1"): a generation never changes.
+	genVerMu sync.Mutex
+	genVer   map[string]string
+
+	imgKind       kindStore[api.ImageSpec]
+	netKind       kindStore[api.NetworkSpec]
+	polKind       kindStore[api.FirewallPolicySpec]
+	setKind       kindStore[api.AddressSetSpec]
+	tgtKind       kindStore[api.BackupTargetSpec]
+	bpolKind      kindStore[api.BackupPolicySpec]
+	remKind       kindStore[api.RemoteSpec]
+	certKind      kindStore[api.CertificateSpec]
+	projKind      kindStore[api.ProjectSpec]
+	stoKind       kindStore[api.StorageSpec]
+	profKind      kindStore[api.ProfileSpec]
+	wgKind        kindStore[api.WireGuardSpec]
+	fwdKind       kindStore[api.LogForwardSpec]
+	volKind       kindStore[api.VolumeSpec]
+	hostDirs      hostDirWatch
+	hostDirProbes hostDirProbes
 
 	// fwd forwards logs; fwdMu serialises changes of its sink list.
 	fwd      *logfwd.Forwarder
@@ -256,11 +302,15 @@ type Service struct {
 	logAud     logAudit
 
 	upd     updateState
+	imgAuto imageAutoState
 	prov    provMarks
+	shellM  shellMarks
 	histMem histMemory
 	// keys holds the failed unlocks of each jail and the jails a boot wanted to start while they were locked
 	// (volkeys.go). Memory only: a restart forgets both.
 	keys keyState
+	// ready is what GET /readyz answers (ready.go).
+	ready readyState
 
 	mu sync.RWMutex
 	// linuxBuilds counts Linux image builds in progress; the host keeps the Linux kernel state while one runs.
@@ -276,6 +326,9 @@ type Service struct {
 	certMu    sync.Mutex
 	certCache map[string]certInfo
 	certGen   uint64
+
+	// renameCrashAt makes a rename stop at that step as if the daemon died (tests; 0 never).
+	renameCrashAt int
 
 	closeOnce sync.Once
 	baseCtx   context.Context
@@ -326,7 +379,7 @@ func New(d Deps) (*Service, error) {
 	}
 	s := &Service{d: d, log: d.Log, now: d.Now,
 		jails: map[string]*jailEntry{}, status: map[string]jailRuntime{}, netStat: map[string]api.NetworkStatus{},
-		login: auth.NewLockout(withClock(d.Lockout, d.Now)), trustLim: auth.NewLockout(withClock(d.Lockout, d.Now)), setupLim: auth.NewLockout(withClock(d.Lockout, d.Now)), storages: map[string]*storageInfo{}, placed: map[string]string{},
+		login: auth.NewLockout(withClock(d.Lockout, d.Now)), loginIP: auth.NewLockout(looser(withClock(d.Lockout, d.Now), 10)), acct: auth.NewAccountDelay(auth.AccountDelayConfig{Now: d.Now}), trustLim: auth.NewLockout(withClock(d.Lockout, d.Now)), setupLim: auth.NewLockout(withClock(d.Lockout, d.Now)), storages: map[string]*storageInfo{}, placed: map[string]string{},
 		pending: map[string]pendingJail{}, execN: map[string]int{}, installing: map[string]bool{}, localReg: NewLocalRegistrar()}
 	s.baseCtx, s.cancel = context.WithCancel(context.Background())
 	s.imgKind = newKindStore[api.ImageSpec](s, api.KindImage, api.ScopeFleet, "image", "/api/v1/images")
@@ -342,6 +395,7 @@ func New(d Deps) (*Service, error) {
 	s.profKind = newProjectKindStore[api.ProfileSpec](s, api.KindProfile, api.ScopeFleet, "profile", "/api/v1/profiles")
 	s.wgKind = newKindStore[api.WireGuardSpec](s, api.KindWireGuard, api.ScopeFleet, "wireguard", "/api/v1/wireguard")
 	s.fwdKind = newKindStore[api.LogForwardSpec](s, api.KindLogForward, api.ScopeHost, "log-forward", "/api/v1/logs/forward")
+	s.volKind = newProjectKindStore[api.VolumeSpec](s, api.KindVolume, api.ScopeHost, "volume", "/api/v1/volumes")
 	s.fwd = s.newForwarder()
 	s.locks = newLockSet()
 	s.events = newEventBus(d.DB, d.HostUUID)
@@ -356,22 +410,36 @@ func New(d Deps) (*Service, error) {
 		s.nx = &reconcile.NetExec{Net: d.Net, PF: d.PF, Run: d.Run, Sysctl: d.Sysctl}
 	}
 	s.planExec = &plan.Executor{Journal: s.journal, OnEvent: s.ops.planEvent}
-	s.lcfg = lifecycle.Config{Root: d.Root, MountBase: d.MountBase, Locate: s.locate, Storages: s.lifecycleStorages, Persistent: d.Persistent}
+	s.lcfg = lifecycle.Config{Root: d.Root, MountBase: d.MountBase, Locate: s.locate, Storages: s.lifecycleStorages, Persistent: d.Persistent, Attached: s.attachedVolumes}
 	if d.ZFS != nil {
 		lc := d.Lifecycle
 		lc.Root, lc.MountBase = d.Root, d.MountBase
-		lc.Locate, lc.Storages = s.locate, s.lifecycleStorages
+		lc.Locate, lc.Storages, lc.Attached = s.locate, s.lifecycleStorages, s.attachedVolumes
 		if lc.Now == nil {
 			lc.Now = d.Now
 		}
 		s.lcfg = lc
 		s.life = &lifecycle.Service{Cfg: lc, ZFS: d.ZFS, Exec: d.Exec, Jails: &jailRuntimeAdapter{s: s}, Files: d.Files,
-			Hooks: &hooks{s: s}, Images: &imageAdapter{s: s}, Executor: s.planExec, Keys: d.Keys}
+			Hooks: &hooks{s: s}, Images: &imageAdapter{s: s}, Executor: s.planExec, Keys: d.Keys,
+			Warn: func(ctx context.Context, key, action, what string) {
+				project, name := validate.SplitQualified(key)
+				s.log.Warn(what, "jail", key, "event", action)
+				s.emitIn(ctx, project, action, "/api/v1/jails/"+name)
+			}}
 	}
 	if d.Root != "" {
 		s.addStorage(DefaultStorage, api.StorageSpec{Dataset: d.Root}, d.Root, d.MountBase)
 	}
 	return s, nil
+}
+
+// looser raises the threshold of a lockout configuration by factor (the default threshold is 5).
+func looser(c auth.LockoutConfig, factor int) auth.LockoutConfig {
+	if c.Threshold <= 0 {
+		c.Threshold = 5
+	}
+	c.Threshold *= factor
+	return c
 }
 
 func withClock(c auth.LockoutConfig, now func() time.Time) auth.LockoutConfig {
@@ -398,11 +466,23 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.warmCerts()
 	s.startLogForward()
+	if s.d.Files != nil {
+		s.unboundOn(ctx) // is it on: the resolv.conf of the jails that start now depends on it
+	}
 	if s.life != nil {
-		s.wg.Add(1)
-		go func() { defer s.wg.Done(); s.updateLoop(s.baseCtx) }()
+		s.loop("updates", s.updateLoop)
+		s.loop("image-auto-upgrade", s.imageAutoLoop)
+		s.loop("host-directories", s.hostDirLoop)
+		s.loop("heal", s.healLoop)
 	}
 	return nil
+}
+
+// loop runs a background loop of the service under the supervisor: a panic in it is logged and counted and the loop
+// starts again after a delay.
+func (s *Service) loop(name string, f func(context.Context)) {
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); supervise.Run(s.baseCtx, s.log, name, f) }()
 }
 
 // Close stops background work and cancels running operations.
@@ -506,7 +586,7 @@ func (s *Service) Info(auth string) api.ServerInfo {
 	return api.ServerInfo{
 		APIVersion: api.Version, APIExtensions: s.Extensions(), Version: s.d.Version,
 		HostUUID: s.d.HostUUID, Hostname: s.d.Hostname, Role: s.d.Role, Hub: s.d.Hub,
-		Auth: auth, Environment: s.d.Env, SecretsRecipient: s.d.SecretsRecipient,
+		Auth: auth, Environment: s.environment(), SecretsRecipient: s.d.SecretsRecipient,
 	}
 }
 

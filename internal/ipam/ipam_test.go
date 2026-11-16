@@ -143,12 +143,12 @@ func TestCounts(t *testing.T) {
 }
 
 func TestIPv6Huge(t *testing.T) {
-	a, err := NewV6(&api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8::/32", Gateway: "2001:db8::1", Range: "2001:db8::1-2001:db8:ffff::"}, nil)
+	a, err := NewV6(&api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8::/32", Range: "2001:db8::1-2001:db8:ffff::"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	x, err := a.Allocate(netip.Addr{}, "")
-	if err != nil || x != ap("2001:db8::2") {
+	if err != nil || x != ap("2001:db8::1") {
 		t.Fatalf("%v %v", x, err)
 	}
 	_, fr := a.Counts()
@@ -163,7 +163,7 @@ func TestIPv6Huge(t *testing.T) {
 }
 
 func TestIPv6LinkLocalGatewayAndNetworkAddr(t *testing.T) {
-	a, err := NewV6(&api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2::/64", Gateway: "fe80::1", Range: "2001:db8:1:2::-2001:db8:1:2::10"}, nil)
+	a, err := NewV6(&api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2::/64", Range: "2001:db8:1:2::-2001:db8:1:2::10"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,9 +268,6 @@ func TestEpair(t *testing.T) {
 	if IsEpairName("epair0a") || IsEpairName("jo0") {
 		t.Fatal("false positive")
 	}
-	if BridgeName(3) != "jo3" {
-		t.Fatal()
-	}
 }
 
 func netHW(s string) ([]byte, error) {
@@ -296,119 +293,16 @@ func v4net() *api.IPv4Net {
 	return &api.IPv4Net{Subnet: "10.0.0.0/24", Gateway: "10.0.0.1", Range: "10.0.0.10-10.0.0.60"}
 }
 
-func TestProjectsShareABridgeWithDisjointAddresses(t *testing.T) {
-	var inUse []netip.Addr // the in-use set spans all projects
-	subA, subB := "10.0.0.10-10.0.0.19", "10.0.0.20-10.0.0.29"
-	got := map[netip.Addr]string{}
-	for i := 0; i < 10; i++ {
-		for _, p := range []struct{ name, sub, other string }{{"a", subA, subB}, {"b", subB, subA}} {
-			al, err := NewV4In(v4net(), Scope{Sub: p.sub}, inUse)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ad, err := al.Allocate(netip.Addr{}, p.name)
-			if err != nil {
-				t.Fatalf("%s %d: %v", p.name, i, err)
-			}
-			if o, dup := got[ad]; dup {
-				t.Fatalf("%s got %s already given to %s", p.name, ad, o)
-			}
-			r, _ := ParseRange(p.sub)
-			if !r.Contains(ad) {
-				t.Fatalf("%s: %s outside %s", p.name, ad, p.sub)
-			}
-			got[ad] = p.name
-			inUse = append(inUse, ad)
-		}
-	}
-	al, _ := NewV4In(v4net(), Scope{Sub: subA}, inUse)
-	if _, err := al.Allocate(netip.Addr{}, "a"); !api.IsCode(err, api.CodePoolExhausted) {
-		t.Fatalf("a should be exhausted: %v", err)
-	}
-	if a, f := al.Stats(); a != 10 || f != 0 {
-		t.Fatalf("stats %d %d", a, f)
-	}
-}
-
-func TestScopeWithoutSubExcludesOthers(t *testing.T) {
-	al, err := NewV4In(v4net(), Scope{Exclude: []string{"10.0.0.10-10.0.0.19", "10.0.0.20-10.0.0.29"}}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ad, err := al.Allocate(netip.Addr{}, "c")
-	if err != nil || ad.String() != "10.0.0.30" {
-		t.Fatalf("%v %v", ad, err)
-	}
-	_, err = al.Allocate(netip.MustParseAddr("10.0.0.15"), "c")
-	if !api.IsCode(err, api.CodeForbidden) || err.(*api.Error).Detail["address"] != "10.0.0.15" {
-		t.Fatalf("%v", err)
-	}
-	if _, err := al.Allocate(netip.MustParseAddr("10.0.0.40"), "c"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestFixedAddressMustBeInSub(t *testing.T) {
-	al, _ := NewV4In(v4net(), Scope{Sub: "10.0.0.20-10.0.0.29"}, nil)
-	for _, a := range []string{"10.0.0.19", "10.0.0.30", "10.0.0.200"} {
-		if _, err := al.Allocate(netip.MustParseAddr(a), "x"); !api.IsCode(err, api.CodeForbidden) {
-			t.Errorf("%s: %v", a, err)
-		}
-	}
-	if _, err := al.Allocate(netip.MustParseAddr("10.0.0.25"), "x"); err != nil {
-		t.Fatal(err)
-	}
-	// Sub is clipped to the network range.
-	al, err := NewV4In(v4net(), Scope{Sub: "10.0.0.5-10.0.0.12"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ad, _ := al.Allocate(netip.Addr{}, "x"); ad.String() != "10.0.0.10" {
-		t.Fatalf("%v", ad)
-	}
-	for _, sub := range []string{"10.0.0.70-10.0.0.80", "10.0.0.1", "fd00::1"} {
-		if _, err := NewV4In(v4net(), Scope{Sub: sub}, nil); !api.IsCode(err, api.CodeInvalid) {
-			t.Errorf("%s: %v", sub, err)
-		}
-	}
-}
-
-func TestScopedIPv6(t *testing.T) {
-	n := &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "fd50::/64", Gateway: "fd50::1", Range: "fd50::10-fd50::ff"}
-	a, _ := NewV6In(n, Scope{Sub: "fd50::20-fd50::2f"}, nil)
-	b, _ := NewV6In(n, Scope{Sub: "fd50::30-fd50::3f"}, []netip.Addr{netip.MustParseAddr("fd50::20")})
-	x, err1 := a.Allocate(netip.Addr{}, "a")
-	y, err2 := b.Allocate(netip.Addr{}, "b")
-	if err1 != nil || err2 != nil || x.String() != "fd50::20" || y.String() != "fd50::30" {
-		t.Fatalf("%v %v %v %v", x, y, err1, err2)
-	}
-	if _, err := a.Allocate(netip.MustParseAddr("fd50::30"), "a"); !api.IsCode(err, api.CodeForbidden) {
-		t.Fatalf("%v", err)
-	}
-	c, _ := NewV6In(n, Scope{Exclude: []string{"fd50::20-fd50::3f"}}, nil)
-	if z, _ := c.Allocate(netip.Addr{}, "c"); z.String() != "fd50::10" {
-		t.Fatalf("%v", z)
-	}
-}
-
-func TestParseSubAndOverlap(t *testing.T) {
-	if _, err := ParseSub("10.0.0.20-10.0.0.30", "10.0.0.10-10.0.0.60"); err != nil {
-		t.Fatal(err)
-	}
-	for _, s := range []string{"10.0.0.5-10.0.0.30", "10.0.0.50-10.0.0.61", "fd00::1", "x"} {
-		if _, err := ParseSub(s, "10.0.0.10-10.0.0.60"); err == nil {
-			t.Errorf("accepted %s", s)
-		}
-	}
+func TestOverlap(t *testing.T) {
 	r := func(s string) Range { x, _ := ParseRange(s); return x }
 	if !Overlap(r("10.0.0.1-10.0.0.5"), r("10.0.0.5-10.0.0.9")) || Overlap(r("10.0.0.1-10.0.0.4"), r("10.0.0.5-10.0.0.9")) || Overlap(r("10.0.0.1"), r("fd00::1")) {
 		t.Fatal("overlap")
 	}
 }
 
-func v6alloc(t *testing.T, subnet, gw, rng string) *Allocator {
+func v6alloc(t *testing.T, subnet, rng string) *Allocator {
 	t.Helper()
-	a, err := NewV6(&api.IPv6Net{Mode: api.IPv6Routed, Subnet: subnet, Gateway: gw, Range: rng}, nil)
+	a, err := NewV6(&api.IPv6Net{Mode: api.IPv6Routed, Subnet: subnet, Range: rng}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +312,7 @@ func v6alloc(t *testing.T, subnet, gw, rng string) *Allocator {
 // The subnet-router anycast address, the all-ones end and (in a /64) the RFC 2526 anycast identifiers are never handed
 // out, even when the range reaches the end of the subnet; the addresses below them are, and a released one is reused.
 func TestIPv64ReservesAnycastAndTheAllOnesEnd(t *testing.T) {
-	a := v6alloc(t, "2001:db8:1:2::/64", "2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ff00-2001:db8:1:2:ffff:ffff:ffff:ffff")
+	a := v6alloc(t, "2001:db8:1:2::/64", "2001:db8:1:2:ffff:ffff:ffff:ff00-2001:db8:1:2:ffff:ffff:ffff:ffff")
 	got, err := a.Allocate(netip.Addr{}, "x")
 	if err != nil || got != ap("2001:db8:1:2:ffff:ffff:ffff:ff00") {
 		t.Fatalf("%v %v", got, err)
@@ -452,7 +346,7 @@ func TestIPv64ReservesAnycastAndTheAllOnesEnd(t *testing.T) {
 
 // Prefixes other than /64 have no RFC 2526 range: only the all-ones end is kept back.
 func TestIPv6OtherPrefixesReserveOnlyTheAllOnesEnd(t *testing.T) {
-	a := v6alloc(t, "2001:db8:1:2:100::/80", "2001:db8:1:2:100::1", "2001:db8:1:2:100:ffff:ffff:fff0-2001:db8:1:2:100:ffff:ffff:ffff")
+	a := v6alloc(t, "2001:db8:1:2:100::/80", "2001:db8:1:2:100:ffff:ffff:fff0-2001:db8:1:2:100:ffff:ffff:ffff")
 	n := 0
 	for {
 		got, err := a.Allocate(netip.Addr{}, "x")
@@ -468,7 +362,7 @@ func TestIPv6OtherPrefixesReserveOnlyTheAllOnesEnd(t *testing.T) {
 		t.Fatalf("%d addresses, want 15 (the last of 16 is reserved)", n)
 	}
 	// a small subnet: the range may not end at its all-ones address
-	b := v6alloc(t, "2001:db8::/126", "2001:db8::1", "2001:db8::2-2001:db8::3")
+	b := v6alloc(t, "2001:db8::/126", "2001:db8::2-2001:db8::3")
 	if got, err := b.Allocate(netip.Addr{}, "x"); err != nil || got != ap("2001:db8::2") {
 		t.Fatal(got, err)
 	}
@@ -476,8 +370,34 @@ func TestIPv6OtherPrefixesReserveOnlyTheAllOnesEnd(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 	// the range's own last address at the very end of the address space is not an infinite loop
-	c := v6alloc(t, "ffff::/16", "ffff::1", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+	c := v6alloc(t, "ffff::/16", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
 	if _, err := c.Allocate(netip.Addr{}, "x"); err != nil {
 		t.Logf("%v", err)
+	}
+}
+
+// A /80 at the end of its /64 (the proxy mode hands out /80s) holds the reserved subnet anycast identifiers of RFC 2526, and
+// none of its addresses is given out; a /80 elsewhere in the /64 holds none, and its own last address is the only one kept back.
+func TestReservedAnycastIdentifiersInsideALongerPrefix(t *testing.T) {
+	top := &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:ffff::/80", Range: "2001:db8:1:2:ffff:ffff:ffff:ff00-2001:db8:1:2:ffff:ffff:ffff:ffff"}
+	al, err := NewV6(top, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []string{"2001:db8:1:2:ffff:ffff:ffff:ff80", "2001:db8:1:2:ffff:ffff:ffff:ffff"} {
+		if _, err := al.Allocate(netip.MustParseAddr(a), "x"); err == nil {
+			t.Errorf("the reserved anycast identifier %s was given out", a)
+		}
+	}
+	got, err := al.Allocate(netip.Addr{}, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := got.As16(); g[15] >= 0x80 {
+		t.Errorf("a reserved identifier was allocated: %s", got)
+	}
+	mid := &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80", Range: "2001:db8:1:2:100::10-2001:db8:1:2:100::20"}
+	if _, err := NewV6(mid, nil); err != nil {
+		t.Fatal(err)
 	}
 }

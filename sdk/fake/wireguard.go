@@ -38,7 +38,7 @@ func (s *Server) setupWireGuard() {
 			}
 		}
 		if w.Spec.Mode == api.WireGuardClient && old == nil && w.Spec.PeerPublicKey == "" {
-			return api.Errorf(api.CodeInvalid, "a client is made from a join token").WithHint("jailops wireguard join TOKEN")
+			return api.Errorf(api.CodeInvalid, "a client is made from a join token").WithHint("jailops wireguard join NAME --token-file TOKEN-FILE")
 		}
 		for _, n := range w.Spec.Networks {
 			if s.networks.items[n] == nil {

@@ -326,7 +326,7 @@ func TestRestoreFailureAtEveryStepLeavesNothing(t *testing.T) {
 		})
 	}
 	t.Run("mount fails for every dataset", func(t *testing.T) {
-		for _, name := range []string{container, container + "/etc", container + "/local", container + "/data/db"} {
+		for _, name := range []string{container, container + "/etc", container + "/local", container + "/db"} {
 			r, b, _ := mk()
 			r.w.m.failMount = func(ds string) error {
 				if ds == name {

@@ -3,7 +3,14 @@ kind: FirewallPolicy
 metadata:
   name: app
 spec:
+  comment: "The application jail: only nginx may reach it."
   default_in: deny
   default_out: allow
   rules:
-    - {name: from-nginx, action: allow, direction: in, proto: tcp, ports: ["8080"], from: ["10.60.0.10"]}
+    - name: from-nginx
+      comment: "nginx forwards the shop's requests to the application on 8080"
+      action: allow
+      direction: in
+      proto: tcp
+      ports: ["8080"]
+      from: ["10.60.0.10"]

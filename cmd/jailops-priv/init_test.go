@@ -16,6 +16,7 @@ type recorder struct {
 	cmds  []string
 	exist map[string]bool // datasets that exist
 	flag  map[string]string
+	mp    map[string]string // the mountpoint property of a dataset (zfs get mountpoint); unset prints the mount the options ask for
 	// root is the dataset mounted at / (rootErr: none); managed is what a recursive zfs get of jailops:managed prints
 	root    string
 	rootErr bool
@@ -41,6 +42,8 @@ func (r *recorder) run(name string, args ...string) (string, error) {
 			return ds, nil
 		}
 		return "", fmt.Errorf("dataset does not exist")
+	case name == "zfs" && args[0] == "get" && slices.Contains(args, "mountpoint"):
+		return r.mp[args[len(args)-1]], nil
 	case name == "zfs" && args[0] == "get":
 		return r.flag[args[len(args)-1]], nil
 	case name == "zfs" && args[0] == "create":
@@ -51,7 +54,7 @@ func (r *recorder) run(name string, args ...string) (string, error) {
 
 func newInit(t *testing.T, r *recorder) (*initOptions, string) {
 	root := t.TempDir()
-	return &initOptions{pool: "tank", mount: "/jailops", user: "jailops", group: "jailops",
+	return &initOptions{pool: "tank", mount: "/usr/local/jailops", user: "jailops", group: "jailops",
 		etc: "/usr/local/etc/jailops", dbDir: "/var/db/jailops", root: root, run: r.run,
 		lookupUser: func(string) (int, int, error) { return 1001, 1001, nil },
 		lookupGrp:  func(string) (int, int, error) { return 0, 1001, nil },
@@ -66,7 +69,7 @@ func TestInitCreatesWhatTheDaemonCannot(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := strings.Join(r.cmds, "\n")
-	for _, want := range []string{"zfs create -o mountpoint=/jailops -o jailops:managed=on tank/jailops", "zfs create -o mountpoint=/var/db/jailops/state -o jailops:managed=on tank/jailops/state"} {
+	for _, want := range []string{"zfs create -o mountpoint=/usr/local/jailops -o jailops:managed=on tank/jailops", "zfs create -o mountpoint=/var/db/jailops/state -o jailops:managed=on tank/jailops/state"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("missing %q in\n%s", want, all)
 		}
@@ -80,11 +83,15 @@ func TestInitCreatesWhatTheDaemonCannot(t *testing.T) {
 	if err := loadConfigFile(fs, filepath.Join(root, "usr/local/etc/jailops/priv.conf"), true); err != nil {
 		t.Fatalf("priv.conf: %v", err)
 	}
-	if po.mountBase != "/jailops" || len(po.storage) != 1 || po.storage[0] != "tank/jailops" || po.workDir != "/var/tmp/jailops" {
+	if po.mountBase != "/usr/local/jailops" || len(po.storage) != 1 || po.storage[0] != "tank/jailops" || po.workDir != "/var/tmp/jailops" {
 		t.Fatalf("priv.conf = %+v", po)
 	}
 	if fi, err := os.Stat(filepath.Join(root, "usr/local/etc/jailops/priv.conf")); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("priv.conf mode: %v %v", fi, err)
+	}
+	// the directory of the files of API log sinks (logging.secrets_dir): root's, the group reads
+	if fi, err := os.Stat(filepath.Join(root, "usr/local/etc/jailops/sinks")); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o750 {
+		t.Fatalf("sinks directory: %v %v", fi, err)
 	}
 }
 
@@ -126,7 +133,7 @@ func TestInitRefusesWhatItDoesNotOwn(t *testing.T) {
 	for _, bad := range []*initOptions{{pool: ""}, {pool: "tank/x"}, {pool: "tank", dataset: "other/jailops"}, {pool: "tank", mount: "relative"}, {pool: "tank", mount: "/"}} {
 		bad.run = r.run
 		if bad.mount == "" {
-			bad.mount = "/jailops"
+			bad.mount = "/usr/local/jailops"
 		}
 		if err := bad.do(&bytes.Buffer{}); err == nil {
 			t.Errorf("accepted %+v", bad)
@@ -176,5 +183,31 @@ func TestInitWebTurnsTheConsoleOn(t *testing.T) {
 		if got := cfg.Listen.HTTPS.Address; (got == ":39110") != web {
 			t.Errorf("web=%v: https address %q", web, got)
 		}
+	}
+}
+
+// An installed host keeps the mount point of its storage root: init again on a release with another default must not
+// point mount-base elsewhere (the helper would then refuse every path of the images and jails there).
+func TestInitKeepsTheMountPointOfAnExistingStorageRoot(t *testing.T) {
+	r := &recorder{exist: map[string]bool{"tank/jailops": true, "tank/jailops/state": true},
+		flag: map[string]string{"tank/jailops": "on\tlocal"}, mp: map[string]string{"tank/jailops": "/jailops"}}
+	o, _ := newInit(t, r)
+	var out bytes.Buffer
+	if err := o.do(&out); err != nil {
+		t.Fatal(err)
+	}
+	if o.mount != "/jailops" || !strings.Contains(out.String(), "already mounted at /jailops: keeping it") {
+		t.Fatalf("mount %q\n%s", o.mount, out.String())
+	}
+}
+
+func TestInitRefusesAMountThatContradictsTheExistingStorageRoot(t *testing.T) {
+	r := &recorder{exist: map[string]bool{"tank/jailops": true, "tank/jailops/state": true},
+		flag: map[string]string{"tank/jailops": "on\tlocal"}, mp: map[string]string{"tank/jailops": "/jailops"}}
+	o, _ := newInit(t, r)
+	o.mountSet = true
+	err := o.do(&bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "is mounted at /jailops, not at /usr/local/jailops") {
+		t.Fatalf("%v", err)
 	}
 }

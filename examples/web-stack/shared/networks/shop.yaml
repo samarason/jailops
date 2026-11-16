@@ -3,7 +3,6 @@ kind: Network
 metadata:
   name: shop
 spec:
-  bridge: jo20
   uplink: em0
   ipv4: {subnet: 10.60.0.0/24, gateway: 10.60.0.1, range: 10.60.0.10-10.60.0.250, nat: true}
   dns: [9.9.9.9, 1.1.1.1]

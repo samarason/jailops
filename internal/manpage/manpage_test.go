@@ -13,8 +13,9 @@ import (
 
 func tree() *cobra.Command {
 	root := &cobra.Command{Use: "tool", Short: "A tool", Long: "The tool does things.\n\n  indented example\n\n.A line that starts with a dot and holds a back\\slash. It is long.",
-		Example: "tool jail list -o json\ntool jail create web --project web --image freebsd-15@stable --network lan --storage default --start --memory 4G",
-		Run:     func(*cobra.Command, []string) {}}
+		Example:     "tool jail list -o json\ntool jail create web --project web --image freebsd-15@stable --network lan --storage default --start --memory 4G",
+		Run:         func(*cobra.Command, []string) {},
+		Annotations: map[string]string{Environment: "TOOL_HOME\twhere the tool keeps its files", ExitStatus: "0\tsuccess\n2\ta usage error"}}
 	root.PersistentFlags().StringP("output", "o", "table", "output `format`")
 	jail := &cobra.Command{Use: "jail", Short: "Manage jails", Aliases: []string{"j"}}
 	list := &cobra.Command{Use: "list [flags]", Short: "List jails", Run: func(*cobra.Command, []string) {}}
@@ -63,7 +64,7 @@ func TestPagesAreCompleteAndDeterministic(t *testing.T) {
 		}
 	}
 	list, _ := os.ReadFile(filepath.Join(dir, "tool-jail-list.1"))
-	for _, want := range []string{".Nm tool jail list\n.Ar [flags]", ".Sh OPTIONS\n.Bl -tag -width Ds\n.It Fl -all\nevery jail.\nEven the stopped ones!\nReally?\nYes.\n.El", ".Sh GLOBAL OPTIONS", ".Xr tool-jail 1\n"} {
+	for _, want := range []string{".Sh ENVIRONMENT\n.Bl -tag -width Ds\n.It Ev TOOL_HOME\nwhere the tool keeps its files\n.El\n.Sh EXIT STATUS\n.Bl -tag -width Ds\n.It 0\nsuccess\n.It 2\na usage error\n.El\n", ".Nm tool jail list\n.Ar [flags]", ".Sh OPTIONS\n.Bl -tag -width Ds\n.It Fl -all\nevery jail.\nEven the stopped ones!\nReally?\nYes.\n.El", ".Sh GLOBAL OPTIONS", ".Xr tool-jail 1\n"} {
 		if !strings.Contains(string(list), want) {
 			t.Errorf("tool-jail-list.1 lacks %q:\n%s", want, list)
 		}
@@ -166,7 +167,7 @@ func TestLint(t *testing.T) {
 // The hand-written pages of the daemons follow the same conventions.
 func TestHandWrittenPages(t *testing.T) {
 	pages, _ := filepath.Glob(filepath.Join("..", "..", "packaging", "man", "*.8"))
-	if len(pages) != 3 {
+	if len(pages) != 4 {
 		t.Fatalf("pages: %v", pages)
 	}
 	for _, p := range pages {

@@ -49,12 +49,7 @@ func TestLinuxJailManagesTheFallbackBrandAndModules(t *testing.T) {
 			t.Fatalf("%+v", c)
 		}
 	}
-	// The bridge sysctls are the configured defaults and the helper never touched /etc/sysctl.conf.
-	for k, want := range map[string]string{"net.link.bridge.pfil_bridge": "0", "net.link.bridge.pfil_member": "1", "net.link.bridge.pfil_onlyip": "1"} {
-		if v := e.SysctlValue(k); v != want {
-			t.Errorf("%s=%s", k, v)
-		}
-	}
+	// the helper never touched /etc/sysctl.conf
 	if _, ok := e.Files.Data["/etc/sysctl.conf"]; ok {
 		t.Error("the daemon wrote /etc/sysctl.conf")
 	}
@@ -76,20 +71,10 @@ func TestLinuxJailManagesTheFallbackBrandAndModules(t *testing.T) {
 	}
 }
 
-func TestNetworkSysctlConfigIsExactAndOverridesDefaults(t *testing.T) {
-	for _, bad := range []string{"network:\n  sysctl:\n    net.inet.ip.forwarding: 1\n", "network:\n  sysctl:\n    net.link.bridge.pfil_member: 2\n", "network:\n  sysctl:\n    net.link.bridge.pfil_member: 0\n", "network:\n  pf_placement: bridge\n"} {
+func TestTheNetworkSectionIsNotAKey(t *testing.T) {
+	for _, bad := range []string{"network:\n  sysctl:\n    net.inet.ip.forwarding: 1\n", "network:\n  pf_placement: host\n"} {
 		if _, err := daemon.Decode(strings.NewReader("pool: tank\n" + bad)); err == nil {
 			t.Errorf("accepted %q", bad)
-		}
-	}
-	e := dtest.New(t, dtest.Options{Mutate: func(c *daemon.Config) {
-		c.Network.Sysctl = map[string]string{"net.link.bridge.pfil_bridge": "1", "net.link.bridge.pfil_onlyip": "0"}
-	}})
-	e.Seed()
-	e.D.Reconciler().Pass(context.Background())
-	for k, want := range map[string]string{"net.link.bridge.pfil_bridge": "1", "net.link.bridge.pfil_member": "1", "net.link.bridge.pfil_onlyip": "0"} {
-		if v := e.SysctlValue(k); v != want {
-			t.Errorf("%s=%s want %s", k, v, want)
 		}
 	}
 }
@@ -133,7 +118,7 @@ func TestDoctorWarnsWhenForwardingIsNotPersistent(t *testing.T) {
 // proxyNet is a network in IPv6 proxy mode (a shared switched segment behind em0).
 func proxyNet() api.Network {
 	return api.Network{Metadata: api.ObjectMeta{Name: "sw"}, Spec: api.NetworkSpec{Uplink: "em0",
-		IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80", Gateway: "fe80::1", Range: "2001:db8:1:2:100::10-2001:db8:1:2:100::ff"}}}
+		IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80", Range: "2001:db8:1:2:100::10-2001:db8:1:2:100::ff"}}}
 }
 
 func doctorCheck(t *testing.T, e *dtest.Env, name string) api.DoctorCheck {
@@ -209,7 +194,7 @@ func TestCreatingAProxyNetworkWarnsAboutOnlinkNS(t *testing.T) {
 		t.Fatalf("%v %+v", err, got.Status.Warnings)
 	}
 	routed := api.Network{Metadata: api.ObjectMeta{Name: "rt"}, Spec: api.NetworkSpec{
-		IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:1:2:1::/80", Gateway: "2001:db8:1:2:1::1", Range: "2001:db8:1:2:1::10-2001:db8:1:2:1::ff"}}}
+		IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:9:1::/80", Range: "2001:db8:9:1::10-2001:db8:9:1::ff"}}}
 	if n, err := e.Admin.Networks().Create(ctx, routed); err != nil || len(n.Status.Warnings) != 0 {
 		t.Fatalf("%v %+v", err, n.Status.Warnings)
 	}

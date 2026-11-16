@@ -1,5 +1,5 @@
 .\" jailopsd.8, installed as /usr/local/share/man/man8/jailopsd.8
-.Dd November 2, 2026
+.Dd November 5, 2026
 .Dt JAILOPSD 8
 .Os
 .Sh NAME
@@ -45,6 +45,21 @@ is true.
 Only root (uid 0) is recognised on the unix socket, as the host's recovery
 access; every other client signs in with a JailOps user, an API token or a
 client certificate.
+.Pp
+Two routes answer without credentials, for monitors and load balancers:
+.Pa /healthz
+is liveness (the process answers HTTP) and always says
+.Dq ok ;
+.Pa /readyz
+answers 200
+.Dq ok
+only when start-up has finished, the helper answers a read-only call and the
+database answers a query, and 503
+.Dq not ready: Ar class
+otherwise, where
+.Ar class
+is starting, stopping, helper, storage or store.
+The answer is cached for two seconds.
 .Pp
 The options are:
 .Bl -tag -width Ds
@@ -134,12 +149,37 @@ with
 prints a new setup token and the console's addresses on
 .Pa /dev/console
 and to syslog
-.Pq Cm jailops-priv setup-token .
+.Pq Dq service jailopsd setuptoken .
 .El
+.Pp
+At boot
+.Sy jailops_priv
+starts first and at shutdown it stops last.
+The two are one service, the helper being the part that runs as root.
+A start of
+.Nm
+by hand while the helper is not running starts the helper first, as
+.Xr rc.subr 8
+does for a dependency (it prints that the helper will be forced to start),
+and a stop of
+.Nm
+stops the helper after it, so
+.Cm restart
+replaces both.
+A start while the helper still runs a binary that has been replaced since
+it started (a package upgrade) warns that the helper needs a restart too.
+.Cm status
+also says whether the helper runs: without it the daemon serves, but changes
+nothing on the host, and it reconnects once the helper is back.
+After an upgrade of the package, restart the pair:
+.Dl service jailopsd restart
 .Pp
 The configuration is validated as the daemon's user with
 .Dl service jailopsd checkconfig
 and a start refuses a configuration that does not validate.
+The one-time token of the first-run setup (appliance mode), a new one on every
+call, is printed as root by
+.Dl service jailopsd setuptoken
 There is no
 .Cm reload :
 the configuration is read at start.
@@ -159,8 +199,12 @@ The configuration; the installed sample is
 .Pa jailopsd.yaml.sample .
 .It Pa /var/run/jailops/jailops.sock
 The API socket.
-.It Pa /var/run/jailops/jailopsd.pid
+.It Pa /var/run/jailopsd.pid
 The pid of the daemon under rc.d.
+.It Pa /var/run/jailopsd-daemon.pid
+The pid of its
+.Xr daemon 8
+supervisor.
 .It Pa /var/db/jailops
 The data directory: database, seal key, TLS material, operation journal
 .Pq Sy data_dir .
@@ -171,9 +215,13 @@ The state dataset, mounted outside the storage root
 The rendered jail.conf files
 .Pq Sy conf_dir ,
 shared with the helper.
-.It Pa /var/run/jailops/priv.sock
+.It Pa /var/run/jailops-priv/priv.sock
 The socket of
-.Xr jailops-priv 8 .
+.Xr jailops-priv 8
+.Pq Sy priv.socket ;
+the former
+.Pa /var/run/jailops/priv.sock
+means this path.
 .El
 .Sh EXIT STATUS
 .Bl -tag -width Ds -compact

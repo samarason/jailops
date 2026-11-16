@@ -12,10 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"jailops.net/jailops/sdk/api"
@@ -33,19 +31,20 @@ type sender interface {
 }
 
 // CheckFile is the default check of a CA or token file: a regular file
-// reached without a symlink, owned by root and writable by nobody else; a
-// secret (the token) must not be readable by others either (0600, or 0640
-// with the daemon's group).
+// reached without a symlink at any component, owned by root and writable by
+// nobody else; a secret (the token) must not be readable by others either
+// (0600, or 0640 with the daemon's group). The open descriptor is checked.
 func CheckFile(path string, secret bool) error {
-	st, err := os.Lstat(path)
+	f, err := openNoFollow(path, false)
 	if err != nil {
 		return err
 	}
-	uid := uint32(1<<32 - 1)
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		uid = sys.Uid
+	defer f.Close()
+	mode, uid, err := statOf(f)
+	if err != nil {
+		return err
 	}
-	return checkMode(path, st.Mode(), uid, secret)
+	return checkMode(path, mode, uid, secret)
 }
 
 func checkMode(path string, mode fs.FileMode, uid uint32, secret bool) error {
@@ -64,24 +63,47 @@ func checkMode(path string, mode fs.FileMode, uid uint32, secret bool) error {
 	return nil
 }
 
-// readChecked reads a file after the check, at most 1 MiB.
-func (e *Env) readChecked(path string, secret bool) ([]byte, error) {
-	if err := e.CheckFile(path, secret); err != nil {
-		return nil, err
+// readChecked reads a file, at most 1 MiB: opened without following a
+// symlink, then checked on the open descriptor, so what is read is what was
+// checked. The file of an API sink must lie directly in the secrets directory.
+func (e *Env) readChecked(path string, secret, fromAPI bool) ([]byte, error) {
+	if fromAPI {
+		if !inSecretsDir(e.SecretsDir, path) {
+			return nil, fmt.Errorf("%s is not a file directly in %s (a sink set through the API reads only there)", path, e.secretsDirName())
+		}
+		if err := e.CheckDir(e.SecretsDir); err != nil {
+			return nil, err
+		}
 	}
-	f, err := os.Open(path)
+	f, err := openNoFollow(path, false)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	if e.CheckFile != nil {
+		if err := e.CheckFile(path, secret); err != nil {
+			return nil, err
+		}
+		if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular file", path)
+		}
+	} else {
+		mode, uid, err := statOf(f)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkMode(path, mode, uid, secret); err != nil {
+			return nil, err
+		}
+	}
 	return io.ReadAll(io.LimitReader(f, 1<<20))
 }
 
 // tlsConfig verifies the receiver against the CA file, or the host's roots.
-func (e *Env) tlsConfig(k api.LogSink, host string) (*tls.Config, error) {
+func (e *Env) tlsConfig(k api.LogSink, host string, fromAPI bool) (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
 	if k.CAFile != "" {
-		pem, err := e.readChecked(k.CAFile, false)
+		pem, err := e.readChecked(k.CAFile, false, fromAPI)
 		if err != nil {
 			return nil, fmt.Errorf("ca_file: %w", err)
 		}
@@ -95,7 +117,8 @@ func (e *Env) tlsConfig(k api.LogSink, host string) (*tls.Config, error) {
 }
 
 // newSender builds the sender of a sink; the files it names are checked here.
-func newSender(k api.LogSink, env *Env) (sender, error) {
+// fromAPI restricts what the sink may read and where it may connect.
+func newSender(k api.LogSink, env *Env, fromAPI bool) (sender, error) {
 	tr, addr, err := k.SinkTarget()
 	if err != nil {
 		return nil, err
@@ -104,34 +127,34 @@ func newSender(k api.LogSink, env *Env) (sender, error) {
 	switch k.Type {
 	case api.LogSinkSyslog:
 		fac, _ := api.SyslogFacility(k.Facility)
-		s := &syslogSender{tr: tr, addr: addr, facility: fac, env: env}
+		s := &syslogSender{tr: tr, addr: addr, facility: fac, env: env, api: fromAPI}
 		if tr == "tls" {
-			if s.tlsConf, err = env.tlsConfig(k, host); err != nil {
+			if s.tlsConf, err = env.tlsConfig(k, host, fromAPI); err != nil {
 				return nil, err
 			}
 		}
 		return s, nil
 	case api.LogSinkWebhook:
-		cfg, err := env.tlsConfig(k, host)
+		cfg, err := env.tlsConfig(k, host, fromAPI)
 		if err != nil {
 			return nil, err
 		}
 		if k.TokenFile != "" {
-			if _, err := env.token(k.TokenFile); err != nil {
+			if _, err := env.token(k.TokenFile, fromAPI); err != nil {
 				return nil, err
 			}
 		}
 		t := &http.Transport{TLSClientConfig: cfg, DialContext: env.Dial, TLSHandshakeTimeout: sendTimeout, MaxIdleConns: 2, IdleConnTimeout: time.Minute}
 		hc := &http.Client{Transport: t, Timeout: sendTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		return &webhookSender{url: k.To, tokenFile: k.TokenFile, hc: hc, t: t, env: env}, nil
+		return &webhookSender{url: k.To, tokenFile: k.TokenFile, hc: hc, t: t, env: env, api: fromAPI}, nil
 	}
 	return nil, fmt.Errorf("unknown sink type %q", k.Type)
 }
 
 // token reads the first line of a token file.
-func (e *Env) token(path string) (string, error) {
-	b, err := e.readChecked(path, true)
+func (e *Env) token(path string, fromAPI bool) (string, error) {
+	b, err := e.readChecked(path, true, fromAPI)
 	if err != nil {
 		return "", fmt.Errorf("token_file: %w", err)
 	}
@@ -150,6 +173,7 @@ type syslogSender struct {
 	tr, addr string
 	facility int
 	env      *Env
+	api      bool // set through the API: the dial is checked
 	tlsConf  *tls.Config
 	conn     net.Conn
 	raw      net.Conn // the tcp connection below conn
@@ -166,6 +190,9 @@ func (s *syslogSender) dial(ctx context.Context) error {
 	network := "tcp"
 	if s.tr == "udp" {
 		network = "udp"
+	}
+	if s.api {
+		ctx = restricted(ctx)
 	}
 	c, err := s.env.Dial(ctx, network, s.addr)
 	if err != nil {
@@ -249,6 +276,7 @@ type webhookSender struct {
 	hc             *http.Client
 	t              *http.Transport
 	env            *Env
+	api            bool // set through the API: the dial is checked (the request's context reaches it)
 }
 
 func (w *webhookSender) close() { w.t.CloseIdleConnections() }
@@ -258,6 +286,9 @@ func (w *webhookSender) send(ctx context.Context, batch []Entry) error {
 	for _, e := range batch {
 		b.Write(FormatJSON(e, w.env.Hostname))
 	}
+	if w.api {
+		ctx = restricted(ctx)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, &b)
 	if err != nil {
 		return err
@@ -265,7 +296,7 @@ func (w *webhookSender) send(ctx context.Context, batch []Entry) error {
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("User-Agent", "jailopsd")
 	if w.tokenFile != "" {
-		tok, err := w.env.token(w.tokenFile) // read at each send: a replaced token is used at once
+		tok, err := w.env.token(w.tokenFile, w.api) // read at each send: a replaced token is used at once
 		if err != nil {
 			return err
 		}
@@ -281,9 +312,9 @@ func (w *webhookSender) send(ctx context.Context, batch []Entry) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) // read a little so the connection can be reused
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, Escape(strings.TrimSpace(string(body))))
+		return &HTTPStatusError{Code: resp.StatusCode}
 	}
 	return nil
 }

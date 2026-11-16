@@ -1,49 +1,51 @@
 $ jailops app installed
 ! No resources found.
 
-$ jailops app install nginx --image freebsd-151@stable --dry-run
+$ jailops app install nginx --image freebsd-151 --dry-run
 Dry run: nothing was created. Installing app nginx as jail nginx would do:
-  01 create-jail: create thin jail nginx from freebsd-151@stable
-  02 start-jail: start nginx
-  03 install-packages-ports: pkg -r <root> install -y nginx
-  04 record-version: pkg -r <root> query %v nginx, then label jailops.app.version
-  05 write-rc-conf: set the services' rc.conf variables in <root>/etc/rc.conf
-  06 start-service-nginx: in the jail: /usr/sbin/service nginx start
-  07 health-check: the health check of the definition
-  08 close-firewall: firewall policy app-nginx (managed by app access): deny every inbound connection until jailops app allow nginx from SOURCE
-  09 snapshot: snapshot every dataset of nginx as app-installed
+  01 create-volume-nginx-usr-local-www: create volume nginx-usr-local-www for /usr/local/www
+  02 create-jail: create thin jail nginx from freebsd-151
+  03 start-jail: start nginx
+  04 install-packages-ports: pkg -r <root> install -y nginx
+  05 record-version: pkg -r <root> query %v nginx, then label jailops.app.version
+  06 write-rc-conf: set the services' rc.conf variables in <root>/etc/rc.conf
+  07 start-service-nginx: in the jail: /usr/sbin/service nginx start
+  08 health-check: the health check of the definition
+  09 close-firewall: firewall policy app-nginx (managed by app access): deny every inbound connection until jailops app allow nginx --from SOURCE
+  10 snapshot: snapshot every dataset of nginx as app-installed
+  11 enable-autostart: boot.autostart of nginx: start with the host
 
-$ jailops app install nginx --image freebsd-151@stable
+$ jailops app install nginx --image freebsd-151
 App nginx installed as jail nginx (running)
   Version:   1.30.6,3
   Addresses: 10.20.0.10
   Ports:     http 80/tcp at 10.20.0.10:80 (expose: forwarding is not set up yet) HTTP, the default site.
-  Access:    closed: nothing reaches it until jailops app allow nginx from SOURCE
+  Access:    closed: nothing reaches it until jailops app allow nginx --from SOURCE
   Data:      /usr/local/www The sites.
   Config:    /usr/local/etc/nginx/nginx.conf (restart nginx) The server configuration.
   Logs:      access /var/log/nginx/access.log One line per request.
              error /var/log/nginx/error.log
   Snapshot:  app-installed (jailops jail rollback nginx --all --snapshot app-installed goes back to it)
-  Steps:     9 done
+  Steps:     11 done
 Notes:
   Put the site under /usr/local/www.
 
-$ jailops app install postgresql --name db --image freebsd-151@stable --network lan --storage default --memory 2G --disk 20G --cpu 2
+$ jailops app install postgresql db --image freebsd-151 --network lan --storage default --memory 2G --disk 20G --cpu 2
 App postgresql installed as jail db (running)
   Version:   18.6
   Addresses: 10.20.0.11
   Ports:     postgres 5432/tcp at 10.20.0.11:5432 The SQL port.
-  Access:    closed: nothing reaches it until jailops app allow db from SOURCE
+  Access:    closed: nothing reaches it until jailops app allow db --from SOURCE
   Data:      /var/db/postgres The cluster (data18).
   Config:    /var/db/postgres/data18/postgresql.conf (restart postgresql) Server settings.
              /var/db/postgres/data18/pg_hba.conf (restart postgresql) Who may connect.
   Logs:      server /var/log/messages The port logs to syslog.
   Snapshot:  app-installed (jailops jail rollback db --all --snapshot app-installed goes back to it)
-  Steps:     11 done
+  Steps:     13 done
 Notes:
   Connect from inside the jail with: jailops exec NAME -- su -l postgres -c psql
 
-$ jailops app install valkey --image freebsd-151@stable --no-wait
+$ jailops app install valkey --image freebsd-151 --no-wait
 OPERATION                              STATUS    DESCRIPTION
 <uuid>   pending   Install app valkey as jail valkey
 
@@ -63,22 +65,31 @@ nginx
 valkey
 
 $ jailops list
-NAME     STATE     IMAGE                GEN   ADDRESSES    AGE
-db       running   freebsd-151@stable   g1    10.20.0.11   3h
-nginx    running   freebsd-151@stable   g1    10.20.0.10   3h
-valkey   running   freebsd-151@stable   g1    10.20.0.12   3h
+NAME     STATE     IMAGE         GEN   ADDRESSES    AUTOSTART   AGE
+db       running   freebsd-151   g1    10.20.0.11   -           3h
+nginx    running   freebsd-151   g1    10.20.0.10   -           3h
+valkey   running   freebsd-151   g1    10.20.0.12   -           3h
 
-$ jailops app install nginx --image freebsd-151@stable
+$ jailops app install nginx --image freebsd-151
 ! already_exists: jail "nginx" already exists
 ! hint: name the jail with --name, or delete the jail first
 [exit 5]
 
-$ jailops app install nginx --name web2
-! invalid: no image named, and 2 FreeBSD images have the alias stable (freebsd-15, freebsd-151), so there is no default
-! hint: name an image with --image, for example freebsd-15@stable; your images: freebsd-15, freebsd-151
-[exit 2]
+$ jailops app install nginx web2 --dry-run
+Dry run: nothing was created. Installing app nginx as jail web2 would do:
+  01 create-volume-web2-usr-local-www: create volume web2-usr-local-www for /usr/local/www
+  02 create-jail: create thin jail web2 from freebsd-151
+  03 start-jail: start web2
+  04 install-packages-ports: pkg -r <root> install -y nginx
+  05 record-version: pkg -r <root> query %v nginx, then label jailops.app.version
+  06 write-rc-conf: set the services' rc.conf variables in <root>/etc/rc.conf
+  07 start-service-nginx: in the jail: /usr/sbin/service nginx start
+  08 health-check: the health check of the definition
+  09 close-firewall: firewall policy app-web2 (managed by app access): deny every inbound connection until jailops app allow web2 --from SOURCE
+  10 snapshot: snapshot every dataset of web2 as app-installed
+  11 enable-autostart: boot.autostart of web2: start with the host
 
-$ jailops app install nginx --name web2 --image freebsd-15@stable
+$ jailops app install nginx web2 --image freebsd-15
 ! invalid: image "freebsd-15" is release 15.0-RELEASE; app nginx needs 15.1 or later
 ! hint: create an image of a newer release and name it with --image
 [exit 2]
@@ -93,13 +104,13 @@ $ jailops app install broken
 ! hint: fix the file in the catalog directory, or reinstall the jailops-apps package
 [exit 2]
 
-$ jailops app install nginx --name web2 --image freebsd-151@stable --network other
+$ jailops app install nginx web2 --image freebsd-151 --network other
 ! forbidden: network "other" is not granted to project "main"
 ! hint: an administrator grants networks with `jailops project set`
 [exit 3]
 
 $ jailops app install
-! usage: accepts 1 arg(s), received 0
+! usage: accepts between 1 and 2 arg(s), received 0
 ! hint: run 'jailops app install --help' for usage
 [exit 2]
 

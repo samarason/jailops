@@ -38,13 +38,21 @@ func (l *Local) SeedKeys(ctx context.Context, root string) (CopyResult, error) {
 		return res, api.Errorf(api.CodeNotFound, "image root %s is not a directory", root)
 	}
 	dst := filepath.Join(root, "usr", "share", "keys")
-	if _, err := os.Lstat(dst); err == nil {
+	// the destination is opened inside the image tree: a symlinked usr or share cannot lead out of it
+	rk, err := l.cfg.resolveMount(dst)
+	if err != nil {
+		return res, err
+	}
+	top, err := rk.openRoot()
+	if err != nil {
+		return res, mapFSErr(err)
+	}
+	defer top.Close()
+	if _, err := top.Lstat(rk.rel); err == nil {
 		return res, nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return res, mapFSErr(err)
 	}
-	// MkdirAll below the root goes through os.Root: a symlinked usr or share
-	// in the image cannot lead out of it.
 	if err := l.MkdirAll(ctx, MkdirReq{Path: dst, Mode: 0o755}); err != nil {
 		return res, err
 	}
@@ -57,20 +65,14 @@ func (l *Local) SeedKeys(ctx context.Context, root string) (CopyResult, error) {
 		return res, api.Errorf(api.CodeNotFound, "host keys directory %s: %v", src, err)
 	}
 	defer sr.Close()
-	top, err := os.OpenRoot(rd.root)
-	if err != nil {
-		return res, mapFSErr(err)
-	}
-	defer top.Close()
-	rel, _ := filepath.Rel(rd.root, dst)
-	dr, err := top.OpenRoot(rel)
+	dr, err := top.OpenRoot(rk.rel)
 	if err != nil {
 		return res, mapFSErr(err)
 	}
 	defer dr.Close()
 	res, err = l.runCopy(ctx, sr, dr, CopyOpts{}.filled())
 	if err != nil {
-		_ = top.RemoveAll(rel)
+		_ = top.RemoveAll(rk.rel)
 	}
 	return res, err
 }

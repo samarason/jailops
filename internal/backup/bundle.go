@@ -47,8 +47,8 @@ func setRefs(p api.FirewallPolicySpec) []string {
 	for _, r := range p.Rules {
 		for _, l := range [][]string{r.From, r.To} {
 			for _, a := range l {
-				if strings.HasPrefix(a, "@") {
-					refs = append(refs, a[1:])
+				if n, ok := strings.CutPrefix(a, "set:"); ok {
+					refs = append(refs, n)
 				}
 			}
 		}
@@ -76,14 +76,14 @@ func BuildBundle(spec api.JailSpec, gen api.ImageGeneration, src ObjectSource, s
 		b.Networks = append(b.Networks, deepCopy(ns))
 	}
 	var pending []string
-	if pn := spec.Firewall.Policy; pn != "" {
+	for _, pn := range spec.Firewall.Policies {
 		p, ok := src.Policy(pn)
 		if !ok {
 			return b, api.Errorf(api.CodeNotFound, "firewall policy %q referenced by the jail does not exist", pn)
 		}
 		b.PolicyNames = append(b.PolicyNames, pn)
 		b.Policies = append(b.Policies, deepCopy(p))
-		pending = setRefs(p)
+		pending = append(pending, setRefs(p)...)
 	}
 	seen := map[string]api.AddressSetSpec{}
 	for len(pending) > 0 {
@@ -97,7 +97,11 @@ func BuildBundle(spec api.JailSpec, gen api.ImageGeneration, src ObjectSource, s
 			return b, api.Errorf(api.CodeNotFound, "address set %q referenced by the policy does not exist", n)
 		}
 		seen[n] = deepCopy(as)
-		pending = append(pending, as.Includes...)
+		for _, m := range as.Members() { // a member set:NAME is another set; jail:NAME is a jail, not part of the closure
+			if n, ok := strings.CutPrefix(m, "set:"); ok {
+				pending = append(pending, n)
+			}
+		}
 	}
 	for n := range seen {
 		b.AddressSetNames = append(b.AddressSetNames, n)

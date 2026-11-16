@@ -238,6 +238,9 @@ func eventLine(a *app, ev api.Event) string {
 		var l api.LifecycleEvent
 		if json.Unmarshal(ev.Metadata, &l) == nil && l.Action != "" {
 			detail = l.Action + " " + l.Source
+			if l.Detail != "" {
+				detail += ": " + l.Detail
+			}
 			if l.Requestor != "" {
 				detail += " by " + l.Requestor
 			}

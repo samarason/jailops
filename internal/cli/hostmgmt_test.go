@@ -13,7 +13,7 @@ func TestHostIdentityCommands(t *testing.T) {
 	h.seed()
 	tr := h.transcript()
 	tr.ok("host", "show")
-	if _, errs, code := tr.do("", "host", "identity", "set", "--hostname", "web1.example.org"); code != 3 || !strings.Contains(errs, "not_managed") {
+	if _, errs, code := tr.do("", "host", "identity", "set", "--hostname", "web1.example.org"); code != 6 || !strings.Contains(errs, "not_managed") {
 		t.Fatalf("not managed: %d %s", code, errs)
 	}
 	tr.golden("host_not_managed")

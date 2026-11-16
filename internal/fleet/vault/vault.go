@@ -26,10 +26,12 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Environment variables SOPS reads.
@@ -110,7 +112,10 @@ func EnsureUnlocked(getenv func(string) string) error {
 			return fmt.Errorf("%s=%s: %w", EnvKeyFile, b.Detail, err)
 		}
 	case EnvKeyCmd:
-		c := exec.Command("sh", "-c", b.Detail)
+		ctx, cancel := context.WithTimeout(context.Background(), keyCmdTimeout)
+		defer cancel()
+		c := exec.CommandContext(ctx, "sh", "-c", b.Detail)
+		c.WaitDelay = time.Second
 		c.Env = append(os.Environ(), "SOPS_AGE_KEY_RECIPIENT=")
 		out, err := c.Output()
 		if err != nil {
@@ -122,3 +127,6 @@ func EnsureUnlocked(getenv func(string) string) error {
 	}
 	return nil
 }
+
+// keyCmdTimeout bounds the command that prints the key (SOPS_AGE_KEY_CMD).
+const keyCmdTimeout = 30 * time.Second

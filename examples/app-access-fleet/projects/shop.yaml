@@ -7,4 +7,4 @@ spec:
   networks: [{network: shop}]
   storage: [{storage: default, quota: 100G}]
   images: [freebsd-15]
-  firewall: floor
+  firewall_policies: [floor]

@@ -185,7 +185,7 @@ onBeforeUnmount(() => {
             <li v-for="(f, i) in sorted" :key="f.name">
               <button class="log-file" type="button" :disabled="f.compressed" :aria-current="f.name === selected ? 'true' : undefined" :aria-describedby="f.compressed ? `log-why-${i}` : undefined" :data-file="f.name" @click="selected = f.name">
                 <span class="row log-file-top"><span class="mono log-file-name">{{ f.name }}</span><span class="badge" :class="f.kind === 'active' ? 'info' : ''">{{ f.kind === 'active' ? s.logs.active : s.logs.rotated }}</span><span v-if="f.compressed" class="badge warn">{{ s.logs.compressed }}</span></span>
-                <span class="faint log-file-meta"><span class="mono">{{ bytes(f.size) }}</span> · <span :title="stamp(f.modified_at)">{{ s.logs.modified(ago(f.modified_at)) }}</span></span>
+                <span class="faint log-file-meta"><span class="mono">{{ bytes(f.size) }}</span> · <span :title="ago(f.modified_at)">{{ s.logs.modified(stamp(f.modified_at)) }}</span></span>
               </button>
               <p v-if="f.compressed" :id="`log-why-${i}`" class="log-why">{{ s.logs.compressedWhy }}</p>
             </li>

@@ -12,9 +12,6 @@ import (
 
 // Sysctl names JailOps manages itself.
 const (
-	sysctlPfilBridge = "net.link.bridge.pfil_bridge"
-	sysctlPfilMember = "net.link.bridge.pfil_member"
-	sysctlPfilOnlyIP = "net.link.bridge.pfil_onlyip"
 	// SysctlFallbackBrand makes ELF binaries without a brand run as Linux.
 	// Alpine's musl binaries carry no Linux note and apk installs new ones at
 	// any time, so branding files once is not enough (verified on FreeBSD 15.1).
@@ -22,10 +19,6 @@ const (
 	fallbackBrandLinux  = "3"
 	fallbackBrandOff    = "-1"
 )
-
-// SysctlPfilMemberKey is the sysctl that makes pf see the traffic that is forwarded between the ports of a bridge. JailOps
-// needs it on: the per-jail rules stand on the jail's port.
-const SysctlPfilMemberKey = sysctlPfilMember
 
 // SysctlOnlinkNS makes the kernel answer a unicast neighbor solicitation whose sender is not an on-link neighbour. On
 // a shared IPv6 segment (proxy mode) the provider's routers probe the host's own address from their global addresses;
@@ -58,27 +51,6 @@ func (s *Service) onlinkNSWarning(ctx context.Context) string {
 	return ""
 }
 
-// NetSysctlKeys are the only keys of the network.sysctl configuration.
-var NetSysctlKeys = []string{sysctlPfilBridge, sysctlPfilMember, sysctlPfilOnlyIP}
-
-// NetSysctlDefaults are applied when the configuration does not say otherwise
-// (verified on FreeBSD 15.1 for the default epair placement): PF filters on
-// the bridge members, not on the bridge itself, and only IP.
-var NetSysctlDefaults = map[string]string{sysctlPfilMember: "1", sysctlPfilBridge: "0", sysctlPfilOnlyIP: "1"}
-
-// NetSysctl returns the bridge sysctls JailOps asserts: the defaults, then the
-// configured values over them.
-func (s *Service) NetSysctl() map[string]string {
-	out := map[string]string{}
-	for k, v := range NetSysctlDefaults {
-		out[k] = v
-	}
-	for k, v := range s.d.NetSysctl {
-		out[k] = v
-	}
-	return out
-}
-
 func (s *Service) hasLinuxJail() bool {
 	s.mu.RLock()
 	for _, e := range s.jails {
@@ -97,7 +69,7 @@ func (s *Service) hasLinuxJail() bool {
 // hostModules lists the kernel modules JailOps needs, in load order. The
 // Linux ones only matter while a Linux jail exists.
 func hostModules(linux bool) []string {
-	m := []string{"if_bridge", "if_epair", "pf"}
+	m := []string{"if_epair", "pf"}
 	if linux {
 		m = append(m, "linux64", "linprocfs", "linsysfs", "fdescfs")
 	}
@@ -112,9 +84,12 @@ func (s *Service) hostDesired() reconcile.HostDesired {
 	if s.hasWireGuard() {
 		mods = append(mods, wireguard.Module)
 	}
+	if s.hasShaping() {
+		mods = append(mods, DummynetModule)
+	}
 	h := reconcile.HostDesired{
 		Modules: mods,
-		Sysctls: s.NetSysctl(),
+		Sysctls: map[string]string{},
 		Release: map[string]string{SysctlFallbackBrand: fallbackBrandOff},
 	}
 	if linux {

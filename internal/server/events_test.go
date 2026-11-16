@@ -164,16 +164,11 @@ func TestEventsBadRequests(t *testing.T) {
 	if code, _ := e.RawHdr("GET", "/api/v1/events", tok, "", map[string]string{"Last-Event-ID": "abc"}); code != 400 {
 		t.Fatalf("%d", code)
 	}
-	// The UI passes the token in the query: accepted on this route only.
-	req, _ := http.NewRequest("GET", e.HTTP.URL+"/api/v1/events?access_token="+tok, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-	if err != nil || resp.StatusCode != 200 {
-		t.Fatalf("%v %v", err, resp)
-	}
-	resp.Body.Close()
-	if code, _ := e.Raw("GET", "/api/v1/operations?access_token="+tok, "", ""); code != 401 {
-		t.Fatalf("a token in the query authenticated another route: %d", code)
+	// A token in the query string authenticates nothing, the event stream included: it would end up in logs and
+	// browser histories.
+	for _, p := range []string{"/api/v1/events", "/api/v1/operations"} {
+		if code, _ := e.Raw("GET", p+"?access_token="+tok, "", ""); code != 401 {
+			t.Fatalf("a token in the query authenticated %s: %d", p, code)
+		}
 	}
 }

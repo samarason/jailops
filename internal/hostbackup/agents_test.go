@@ -49,7 +49,7 @@ func TestCaptureAndRestoreThroughFileAgents(t *testing.T) {
 	if ag.writes.Load() == 0 {
 		t.Fatal("the restore did not go through a write agent")
 	}
-	for _, rel := range []string{"", "/etc", "/local", "/data/db"} {
+	for _, rel := range []string{"", "/etc", "/local", "/db"} {
 		want := readTree(t, r.w.m.liveDir(j.Container+rel))
 		got := readTree(t, r.w.m.liveDir(res.Placement.Container+rel))
 		if len(want) == 0 || len(want) != len(got) {

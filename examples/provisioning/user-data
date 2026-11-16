@@ -9,7 +9,6 @@ export JAILOPS_FLEET_REPO=https://git.example.org/ops/fleet.git
 # Private repository: use an https URL with a read-only deploy token, or an ssh URL and a deploy key in /root/.ssh.
 # The JailOps administrator to create (a password is generated into /root/jailops-admin-password, or give JAILOPS_ADMIN_PASSWORD_FILE).
 export JAILOPS_ADMIN_USER=admin
-# export JAILOPS_NDP_PROXY="vtnet0=2001:db8:1:2:100::/79"     # IPv6 proxy mode (a switched /64), see networking-ipv6.md
 # export JAILOPS_AGE_KEY_FILE=/root/fleet-age.key              # opens the fleet's SOPS secrets; deliver it out of band
 
 fetch -o /tmp/bootstrap.sh https://git.example.org/ops/fleet/raw/branch/master/bootstrap.sh

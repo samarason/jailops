@@ -7,7 +7,7 @@ hub: false            # true: keep a registry of remotes and forward ?host= requ
 
 pool: tank
 # dataset: tank/jailops          # default <pool>/jailops
-# mount_base: /jailops
+# mount_base: /usr/local/jailops
 # state_dir: /var/db/jailops/state   # default <data_dir>/state; outside the storage root, where "jailops-priv init" mounts it
 # data_dir: /var/db/jailops      # SQLite database, seal key, TLS material, operation journal
 # conf_dir: /usr/local/etc/jailops/jails   # must equal conf_dir of jailops-priv
@@ -41,7 +41,7 @@ web:
   enabled: false                # true: serve the embedded web console on the listeners (it is always in the binary); the API is the same either way
 
 priv:
-  socket: /var/run/jailops/priv.sock
+  socket: /var/run/jailops-priv/priv.sock   # the helper's socket; the former /var/run/jailops/priv.sock means this path
 
 log:
   level: info                   # debug, info, warn, error
@@ -63,14 +63,6 @@ limits:
   # exec_max: 12h
   # auth_failure_threshold: 5     # failed authentications from one source before it is locked out
 
-network:
-  # Set at runtime through the helper and re-asserted by the reconcile loop;
-  # never written to /etc/sysctl.conf. Only these three keys, 0 or 1.
-  sysctl:
-    net.link.bridge.pfil_member: 1
-    net.link.bridge.pfil_bridge: 0
-    net.link.bridge.pfil_onlyip: 1
-
 # Dedicated networks for `jailops project create NAME --new-network`: each project gets a subnet carved from this pool.
 # Without a pool that option answers "unsupported".
 projects:
@@ -83,6 +75,15 @@ projects:
 updates:
   # tick: 1m
   # project_files_dir: /var/db/jailops/state/project-files   # provisioning files, one directory per project
+
+# What a new FreeBSD jail gets when its request and its profiles do not say (docs/shell.md): bash, installed into the
+# jail at its first start and started by `jailops shell` and the console, and a coloured bash prompt for every user of the
+# jail. An existing jail gets them only through `jailops jail shell-setup NAME`. Linux jails are left alone.
+jails:
+  # shell: bash          # bash, or sh (FreeBSD's own shell; nothing is installed)
+  # prompt: default      # default (user@jail [project/host]:dir), short (without the tag), none, or a bash PS1 text
+  # prompt_color: 39     # 256-colour number of user@jail (39 light blue, 40 green, 196 red: one colour per kind of host)
+  # max_states: 10000    # pf states each pass rule of a jail may create when its limits.states is 0 (0: no limit)
 
 # The application catalog (docs/apps.md): one YAML definition per file, installed by the jailops-apps package. The daemon
 # reads these local files only and never fetches anything; a missing directory is an empty catalog. local_dir holds the
@@ -101,12 +102,20 @@ host:
   manage:
     modules: []
 
+# The audit log (docs/security-model.md): once a day the daemon deletes the entries older than the retention and the
+# oldest beyond max_entries. The newest 1000 entries are never deleted.
+audit:
+  retention: 90d        # at least 1d; whole days as "90d", or hours as "2160h"
+  max_entries: 1000000  # at least 1000
+
 # Log forwarding (docs/logging.md): send the jails' logs, and the audit log when asked, to syslog servers (RFC 5424
 # over udp, tcp or tls) or https webhooks. This list is in force until an administrator stores one with
 # 'jailops logs forward' or the console, which then replaces it (delete that with 'jailops logs forward reset').
 # A sink starts at the end of the files: it sends what is written from now on. Files the daemon reads (ca_file,
-# token_file) must be owned by root and not writable by others; the token file 0640 root:jailops.
+# token_file) must be owned by root and not writable by others; the token file 0640 root:jailops. A list stored
+# through the API may name files only directly in secrets_dir, and no receiver on this host or the link-local network.
 logging:
+  secrets_dir: /usr/local/etc/jailops/sinks   # root:jailops 0750
   forward: []
   # - name: central
   #   type: syslog
@@ -127,7 +136,14 @@ logging:
   # - name: alerts
   #   type: webhook
   #   to: https://hooks.example.com/jailops
-  #   token_file: /usr/local/etc/jailops/hook.token   # the bearer token, first line; never the token itself here
+  #   token_file: /usr/local/etc/jailops/sinks/hook.token   # the bearer token, first line; never the token itself here
+
+# The kernel's notifications through devd(8): a ZFS error or a pool changing state, the link of the uplink, a resource
+# limit a jail hit. They show as events (`jailops events`, the console's Events page) and
+# `jailops doctor` says whether the daemon can read devd's socket (docs/operations.md).
+devd:
+  enable: true                      # the default is on for FreeBSD; false switches it off
+  pipe: /var/run/devd.seqpacket.pipe
 
 # The paths of a thin jail that survive a switch to a newer image generation, each in its own dataset. Empty keeps the
 # built-in list (/etc, /usr/local, /var/db, /var/log, /var/mail, /var/spool, /home, /root). Setting it replaces the list.

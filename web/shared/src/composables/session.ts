@@ -11,6 +11,8 @@ export const session = reactive({
   info: null as ServerInfo | null,
   authed: false,
   demo: false,
+  /** This build carries the demo (a demo build only: the console a daemon embeds never switches to canned data). */
+  demoAvailable: false,
   error: null as ApiError | null,
   /** Set by the login form when the server asked for a TOTP code. */
   needTotp: false,
@@ -34,6 +36,9 @@ export function hasExt(name: string): boolean {
   return !!session.info?.api_extensions.includes(name)
 }
 
+/** True in a demo build (JAILOPS_DEMO_BUILD=1 at build time, web/shared/vite.app.ts); the embedded console is not one. */
+export const demoBuild: boolean = import.meta.env.VITE_JAILOPS_DEMO === '1'
+
 export function wantsDemo(search = location.search): boolean {
   if (new URLSearchParams(search).has('demo')) return true
   try {
@@ -46,7 +51,7 @@ export function wantsDemo(search = location.search): boolean {
 export interface BootOptions {
   /** The role this console serves ("host" or "backup"). */
   role: 'host' | 'backup'
-  /** Loads the demo transport; called only when `?demo` is present. */
+  /** Loads the demo transport; called only when `?demo` is present. Only a demo build passes it (demoBuild). */
   loadDemo?: (o: { signedOut: boolean }) => Promise<Transport>
 }
 
@@ -55,6 +60,7 @@ let expectedRole: BootOptions['role'] = 'host'
 /** Decide on the transport, then ask the server who we are. */
 export async function boot(o: BootOptions): Promise<void> {
   expectedRole = o.role
+  session.demoAvailable = !!o.loadDemo
   session.demo = !!o.loadDemo && wantsDemo()
   if (session.demo) {
     try {

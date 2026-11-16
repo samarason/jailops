@@ -3,6 +3,5 @@ kind: Network
 metadata:
   name: media
 spec:
-  bridge: jo50
   uplink: em0
   ipv4: {subnet: 10.50.0.0/24, gateway: 10.50.0.1, range: 10.50.0.2-10.50.0.254, nat: true}

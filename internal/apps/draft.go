@@ -27,10 +27,10 @@ const PkgLeavesFormat = "%n %v %R %w"
 // PkgLeavesQuery selects the packages installed on purpose, not as dependencies.
 const PkgLeavesQuery = "%a = 0"
 
-// PkgLeavesArgv is the host command that lists the packages of a jail root
+// PkgLeavesArgv is the host command that lists the packages of a running jail
 // that were installed on purpose: name, version, repository, homepage.
-func PkgLeavesArgv(root string) []string {
-	return []string{"pkg", "-r", root, "query", "-e", PkgLeavesQuery, PkgLeavesFormat}
+func PkgLeavesArgv(jail string) []string {
+	return PkgJailArgv(jail, "query", "-e", PkgLeavesQuery, PkgLeavesFormat)
 }
 
 // SockstatArgv is the in-jail command that lists the listening IPv4 and IPv6 sockets, without a header.

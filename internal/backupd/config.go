@@ -163,13 +163,6 @@ func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(),
 
 // ParseConfig decodes a configuration strictly and applies defaults.
 func ParseConfig(data []byte) (*Config, error) {
-	var probe map[string]any
-	if yaml.Unmarshal(data, &probe) == nil {
-		if _, ok := probe["admin_group"]; ok {
-			return nil, errors.New("backupd: configuration: admin_group is no longer supported: only root (uid 0) may use the admin socket, " +
-				"which is now mode 0600 and owned by root. Remove the key")
-		}
-	}
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)

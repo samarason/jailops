@@ -153,7 +153,8 @@ func init() {
 		if err != nil {
 			os.Exit(2)
 		}
-		err = fsagent.Serve(conn, fsagent.Config{Mode: fsagent.Mode(os.Args[3]), Root: os.Args[5]})
+		special := len(os.Args) > 6 && os.Args[6] == AgentSpecialFlag
+		err = fsagent.Serve(conn, fsagent.Config{Mode: fsagent.Mode(os.Args[3]), Root: os.Args[5], Special: special})
 		if err != nil {
 			os.Exit(1)
 		}
@@ -390,7 +391,7 @@ func TestDebootstrapAlwaysChecksTheSignature(t *testing.T) {
 	r := newRuleEnv(t)
 	root := r.cfg.reg.mounts()[0] + "/images/deb/staging-g1"
 	admin := WithAdmin(context.Background(), "jailopsd")
-	good := []string{"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=/usr/local/share/keyrings/debian-archive-keyring.gpg", "trixie", root, "https://deb.debian.org/debian"}
+	good := []string{"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=" + r.cfg.KeyringDir + "/debian-archive-keyring.gpg", "trixie", root, "https://deb.debian.org/debian"}
 	if err := r.check(admin, good...); err != nil {
 		t.Fatal(err)
 	}
@@ -400,10 +401,10 @@ func TestDebootstrapAlwaysChecksTheSignature(t *testing.T) {
 	for name, args := range map[string][]string{
 		"no keyring":   {"debootstrap", "--arch=arm64", "--variant=minbase", "trixie", root},
 		"no gpg check": {"debootstrap", "--arch=arm64", "--variant=minbase", "--no-check-gpg", "trixie", root},
-		"http mirror":  {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=/usr/local/share/keyrings/k.gpg", "trixie", root, "http://deb.debian.org/debian"},
+		"http mirror":  {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=" + r.cfg.KeyringDir + "/k.gpg", "trixie", root, "http://deb.debian.org/debian"},
 		"bad keyring":  {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=/etc/shadow", "trixie", root},
-		"bad target":   {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=/usr/local/share/keyrings/k.gpg", "trixie", "/etc"},
-		"extra flag":   {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=/usr/local/share/keyrings/k.gpg", "--include=evil", "trixie", root},
+		"bad target":   {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=" + r.cfg.KeyringDir + "/k.gpg", "trixie", "/etc"},
+		"extra flag":   {"debootstrap", "--arch=arm64", "--variant=minbase", "--keyring=" + r.cfg.KeyringDir + "/k.gpg", "--include=evil", "trixie", root},
 	} {
 		if err := r.check(admin, args...); err == nil {
 			t.Errorf("%s accepted", name)
@@ -411,21 +412,38 @@ func TestDebootstrapAlwaysChecksTheSignature(t *testing.T) {
 	}
 }
 
-func TestDevfsRulesFileIsChecked(t *testing.T) {
-	n, text, err := render.LinuxDevfsRuleset([]string{"tun", "dri"})
+// Every rule JailOps renders for a jail's devfs ruleset is inside the helper's devfs grammar, and a rule outside it
+// is refused: the hook validates what it runs.
+func TestRenderedDevfsRulesAreInTheHelpersGrammar(t *testing.T) {
+	c := Config{}
+	check := func(rules [][]string) {
+		t.Helper()
+		for _, r := range rules {
+			if err := customDevfs(c, true, r[1:]); err != nil {
+				t.Errorf("%v refused: %v", r, err)
+			}
+		}
+	}
+	_, lin, err := render.LinuxDevfsRuleset([]string{"tun", "dri"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkDevfsRulesFile(text); err != nil {
-		t.Fatalf("rendered ruleset %d refused: %v\n%s", n, err, text)
+	check(lin)
+	_, fb, err := render.DevfsRuleset([]string{"tun", "bpf", "pf"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, ftext, _ := render.DevfsRuleset([]string{"tun"})
-	if err := checkDevfsRulesFile(ftext); err != nil {
-		t.Fatalf("freebsd ruleset refused: %v\n%s", err, ftext)
-	}
-	for _, bad := range []string{text + "add path 'mem' unhide\n", text + "add path '*' unhide\n", text + "add unhide\n", text + "add path 'tun*' mode 666\n", "[evil=3]\nadd hide\n"} {
-		if err := checkDevfsRulesFile(bad); err == nil {
-			t.Errorf("accepted:\n%s", bad)
+	check(fb)
+	for _, bad := range [][]string{
+		{"rule", "-s", "5001", "add", "path", "mem", "unhide"},
+		{"rule", "-s", "5001", "add", "path", "*", "unhide"},
+		{"rule", "-s", "5001", "add", "unhide"},
+		{"rule", "-s", "4", "add", "hide"},
+		{"rule", "-s", "5001", "delset", "x"},
+		{"rule", "-s", "5001", "add", "path", "../mem", "unhide"},
+	} {
+		if err := customDevfs(c, true, bad); err == nil {
+			t.Errorf("%v accepted", bad)
 		}
 	}
 }

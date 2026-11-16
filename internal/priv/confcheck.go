@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"jailops.net/jailops/internal/render"
+	"jailops.net/jailops/sdk/api"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -17,6 +18,7 @@ var (
 	quotedRE    = regexp.MustCompile(`^"([^"\\;$\x00-\x1f]*)"$`)
 	intRE       = regexp.MustCompile(`^-?[0-9]{1,9}$`)
 	hostnameRE  = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,253})$`)
+	whereNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	osreleaseRE = regexp.MustCompile(`^[0-9]+\.[0-9]+-[A-Za-z0-9_]+$`)
 	fsOptsRE    = regexp.MustCompile(`^[a-z0-9_]+(=[A-Za-z0-9_]+)?(,[a-z0-9_]+(=[A-Za-z0-9_]+)?)*$`)
 )
@@ -29,6 +31,11 @@ func (l *Local) checkConfContent(ctx context.Context, r resolved, path string, d
 	inConf := within(l.cfg.ConfDir, filepath.Clean(path))
 	switch {
 	case strings.HasSuffix(base, ".conf") && inConf:
+		// Every start of a jail rewrites its jail.conf. The delegation lines an administrator admitted stay admitted
+		// while they are unchanged; a new or changed one needs the administrator again.
+		if b, err := l.ReadFile(ctx, path); err == nil && delegationLines(string(data)) == delegationLines(string(b)) {
+			ctx = context.WithValue(ctx, delegationKept{}, true)
+		}
 		return l.cfg.checkJailConf(ctx, jailNameOfConf(l.cfg.ConfDir, path), string(data))
 	case base == "fstab" || strings.HasSuffix(base, ".fstab"):
 		// A file that is rewritten unchanged, as every start of a jail does, keeps the host mounts an administrator
@@ -41,10 +48,8 @@ func (l *Local) checkConfContent(ctx context.Context, r resolved, path string, d
 			return err
 		}
 		return l.cfg.checkFstabPaths(string(data), "")
-	case base == "devfs.rules" && inConf:
-		return checkDevfsRulesFile(string(data))
 	case inConf:
-		return forbidden("only .conf, .fstab and devfs.rules files may be written to %s", l.cfg.ConfDir)
+		return forbidden("only .conf and .fstab files may be written to %s", l.cfg.ConfDir)
 	}
 	return nil
 }
@@ -176,9 +181,9 @@ func (c Config) checkJailParam(ctx context.Context, name, key, val string, hasVa
 			return err
 		}
 		if !filepath.IsAbs(s) || filepath.Clean(s) != s || c.isMountRoot(s) || !c.inMounts(s) {
-			return forbidden("path %q is not below %s", s, c.mountBaseDesc())
+			return c.notBelowMount(s)
 		}
-		return nil
+		return c.checkJailRoot(name, s)
 	case "host.hostname":
 		s, err := str()
 		if err != nil {
@@ -186,6 +191,16 @@ func (c Config) checkJailParam(ctx context.Context, name, key, val string, hasVa
 		}
 		if !hostnameRE.MatchString(s) {
 			return invalid("invalid hostname %q", s)
+		}
+		return nil
+	case "env.jailops_jail", "env.jailops_project", "env.jailops_host":
+		// where the jail is: names only, read by the jail as lines of the sysctl security.jail.env
+		s, err := str()
+		if err != nil {
+			return err
+		}
+		if !whereNameRE.MatchString(s) {
+			return invalid("%s: %q is not a name", key, s)
 		}
 		return nil
 	case "vnet", "mount.devfs", "persist", "exec.clean":
@@ -199,7 +214,7 @@ func (c Config) checkJailParam(ctx context.Context, name, key, val string, hasVa
 			if !ok {
 				return invalid("vnet.interface: bad value")
 			}
-			if err := c.ifOwned(s); err != nil {
+			if err := c.epairEndName(s); err != nil {
 				return err
 			}
 		}
@@ -228,8 +243,20 @@ func (c Config) checkJailParam(ctx context.Context, name, key, val string, hasVa
 		if err != nil {
 			return err
 		}
+		if n == 1 && c.delegationAllowed(ctx, admin) {
+			return nil // a jail that may mount its delegated dataset
+		}
 		if n != 2 {
 			return c.rawParam(admin, key)
+		}
+		return nil
+	case "zfs.dataset":
+		s, err := str()
+		if err != nil {
+			return err
+		}
+		if !c.delegationAllowed(ctx, admin) || !slices.Contains(c.delegatedDatasetNames(name), s) {
+			return forbidden("zfs.dataset must be the delegated dataset of this jail, and needs the admin assertion and admin-zfs-delegation in priv.conf")
 		}
 		return nil
 	case "securelevel":
@@ -262,6 +289,15 @@ func (c Config) checkJailParam(ctx context.Context, name, key, val string, hasVa
 			return c.rawParam(admin, key)
 		}
 		return nil
+	case "stop.timeout":
+		n, err := num()
+		if err != nil {
+			return err
+		}
+		if n < 1 || n > api.MaxStopTimeout {
+			return invalid("stop.timeout must be between 1 and %d seconds", api.MaxStopTimeout)
+		}
+		return nil
 	case "exec.consolelog":
 		// the output of the exec.* commands goes to this host file, not to the pipes of jail(8)'s caller
 		if val != `"`+render.ConsoleLog+`"` {
@@ -278,6 +314,9 @@ func (c Config) checkJailParam(ctx context.Context, name, key, val string, hasVa
 	if flag, ok := strings.CutPrefix(key, "allow."); ok {
 		if err := bare(); err != nil {
 			return err
+		}
+		if c.delegationAllowed(ctx, admin) && (flag == "mount" || flag == "mount.zfs") {
+			return nil
 		}
 		if !admin || !slices.Contains(c.Admin.AllowFlags, flag) {
 			return forbidden("allow.%s needs the admin assertion and an allow-list entry", flag)
@@ -305,11 +344,14 @@ func (c Config) rawParam(admin bool, key string) error {
 var fstabTypes = map[string]bool{"devfs": true, "tmpfs": true, "fdescfs": true, "linprocfs": true, "linsysfs": true, "procfs": true, "nullfs": true}
 
 // checkFstab validates a jail fstab. Mount points must be below a storage
-// root's mountpoint. A nullfs source must be below one too, or, with the admin assertion,
-// below an AdminPolicy host mount root.
+// root's mountpoint. A nullfs source must be the root of a volume of a storage (or, for a Linux jail, the jail's own
+// root at compat/linux), or, with the admin assertion, below an AdminPolicy host mount root.
 func (c Config) checkFstab(ctx context.Context, text, existing string) error {
 	if len(text) > 64<<10 {
 		return invalid("fstab too large")
+	}
+	if err := c.checkFstabNesting(text); err != nil {
+		return err
 	}
 	for i, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
@@ -344,8 +386,11 @@ func (c Config) checkFstab(ctx context.Context, text, existing string) error {
 		if !cleanAbs(dev) {
 			return invalid("fstab line %d: invalid source %q", i+1, dev)
 		}
-		if c.inMounts(dev) {
+		if c.volumeRoot(dev) || c.linuxMirror(dev, mp) {
 			continue
+		}
+		if c.inMounts(dev) {
+			return forbidden("fstab line %d: %q is not the root of a volume: only volumes are mounted into a jail from a storage", i+1, dev)
 		}
 		listed := false
 		for _, r := range c.Admin.HostMountRoots {
@@ -364,41 +409,93 @@ func (c Config) checkFstab(ctx context.Context, text, existing string) error {
 	return nil
 }
 
+// volumeRoot reports whether p is exactly the mountpoint of a volume: <storage mount>/projects/<project>/volumes/<name>.
+func (c Config) volumeRoot(p string) bool {
+	for _, m := range c.reg.mounts() {
+		if !within(m, p) {
+			continue
+		}
+		rel, err := filepath.Rel(m, p)
+		if err != nil {
+			return false
+		}
+		s := strings.Split(rel, "/")
+		if len(s) == 4 && jailTreeDepth(rel) == 4 {
+			return true
+		}
+	}
+	return false
+}
+
+// linuxMirror reports whether a nullfs line mirrors a jail's root at its own compat/linux, the mount of a Linux jail.
+func (c Config) linuxMirror(dev, mp string) bool {
+	if mp != dev+"/compat/linux" {
+		return false
+	}
+	for _, m := range c.reg.mounts() {
+		if !within(m, dev) {
+			continue
+		}
+		rel, err := filepath.Rel(m, dev)
+		if err == nil && len(strings.Split(rel, "/")) == 5 && jailTreeDepth(rel) == 5 && filepath.Base(rel) == "root" {
+			return true
+		}
+	}
+	return false
+}
+
 func cleanAbs(p string) bool {
 	// no path the helper is asked about holds two dots in a row, even inside a name (a clean path has no ".." element, and
 	// this keeps the rule simple to audit)
 	return filepath.IsAbs(p) && filepath.Clean(p) == p && !strings.ContainsAny(p, "\x00\n\t ") && !strings.Contains(p, "..")
 }
 
-var (
-	reDevfsSection = regexp.MustCompile(`^\[jailops_devfs_([0-9]{1,6})=([0-9]{1,6})\]$`)
-	reDevfsAddPath = regexp.MustCompile(`^add path '([a-z0-9*?_./-]{1,64})' (hide|unhide)$`)
-	reDevfsInclude = regexp.MustCompile(`^add include \$devfsrules_(hide_all|unhide_basic|unhide_login)$`)
-)
+var reJailRoot = regexp.MustCompile(`^(/.+)/projects/([^/]+)/jails/([^/]+)/root$`)
 
-// checkDevfsRulesFile validates the devfs ruleset the daemon leaves beside a jail's configuration: the rules JailOps
-// renders and nothing else (hide everything, include the stock sets, unhide known device paths).
-func checkDevfsRulesFile(text string) error {
-	if len(text) > 16<<10 {
-		return invalid("devfs.rules is too large")
+// checkJailRoot says that the path of a jail is the root of that jail and no other place: <storage mount>/projects/
+// <project>/jails/<name>/root, where the jail is called <project>_<name>, and that it reaches that place without a
+// symbolic link. jail(8) follows a link in path (the jail's root would be whatever it points at, the host's / for
+// one), so the lexical form is not enough: the check resolves the path as it is now, and runs again when the jail is
+// started.
+func (c Config) checkJailRoot(name, p string) error {
+	m := reJailRoot.FindStringSubmatch(p)
+	if m == nil || !c.isMountRoot(m[1]) || name != m[2]+"_"+m[3] {
+		return forbidden("the path of jail %s is %s/projects/<project>/jails/<name>/root of a storage root, not %q", name, c.mountBaseDesc(), p)
 	}
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case line == "", strings.HasPrefix(line, "#"), line == "add hide", reDevfsInclude.MatchString(line):
-		case reDevfsSection.MatchString(line):
-			m := reDevfsSection.FindStringSubmatch(line)
-			n, _ := strconv.Atoi(m[1])
-			if m[1] != m[2] || n < DevfsRulesetMin || n > DevfsRulesetMax {
-				return forbidden("devfs.rules: ruleset %q is not in the private range", line)
+	if err := plainBelow(m[1], p); err != nil {
+		return forbidden("the path of jail %s: %v", name, err)
+	}
+	return nil
+}
+
+// checkFstabNesting refuses a mount point below the mount point of a volume or a host directory (and two mounts on one
+// mount point). Until jail(8) has mounted the first, the second path is a path of the jail's own tree; afterwards it
+// is a path inside the volume, which another jail (or this one) can write to: a symbolic link there would carry the
+// second mount to wherever it points, over a directory of the host. Only what the helper itself lays out is nested: a
+// Linux jail's compat/linux mirror of its own root with the file systems below it, and devfs with fdescfs.
+func (c Config) checkFstabNesting(text string) error {
+	type mnt struct {
+		dev, mp, typ string
+		line         int
+	}
+	var all []mnt
+	for i, line := range strings.Split(text, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) == 6 && !strings.HasPrefix(f[0], "#") {
+			all = append(all, mnt{f[0], f[1], f[2], i + 1})
+		}
+	}
+	for _, in := range all {
+		for _, out := range all {
+			if in.line == out.line || out.typ != "nullfs" || c.linuxMirror(out.dev, out.mp) {
+				continue
 			}
-		case reDevfsAddPath.MatchString(line):
-			m := reDevfsAddPath.FindStringSubmatch(line)
-			if m[2] == "unhide" && !render.DevfsUnhidable(m[1]) {
-				return forbidden("devfs.rules: %q is not a device JailOps may unhide", m[1])
+			if in.mp == out.mp {
+				return forbidden("fstab line %d: mount point %q is mounted twice (line %d)", in.line, in.mp, out.line)
 			}
-		default:
-			return forbidden("devfs.rules: line %q is not one JailOps writes", line)
+			if within(out.mp, in.mp) {
+				return forbidden("fstab line %d: mount point %q is inside the mount point %q of line %d: nothing is mounted below a volume", in.line, in.mp, out.mp, out.line)
+			}
 		}
 	}
 	return nil

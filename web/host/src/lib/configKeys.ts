@@ -2,6 +2,7 @@
 // api.ConfigKeys), so a key exists in one place. Each key's `path` locates it in the typed spec:
 // `resources.cpu`, `network[<device>].mtu`, `env.<var>`. This module reads, writes and validates by path.
 import { clone } from './clone'
+import { validSize } from '@jailops/shared/lib/names'
 import { configKeys, type ConfigKey, type JailSpec, type Profile } from '@jailops/shared/api/types'
 
 export type Spec = Record<string, unknown>
@@ -29,18 +30,22 @@ function steps(path: string): Step[] {
   })
 }
 
+/** The field a device of a list is named by: the volumes of a jail are named by the volume they attach. */
+const idField = (root: string) => (root === 'volumes' ? 'volume' : 'name')
+
 /** Names of the devices of a kind in a spec. Unnamed NICs are eth0, eth1, ... as the server names them. */
 export function deviceNames(spec: JailSpec, kind: DeviceKind): string[] {
-  const list = ((spec as unknown as Spec)[PATH_ROOT[kind]] as Array<{ name?: string }> | undefined) ?? []
-  return list.map((d, i) => d.name || (kind === 'nic' ? `eth${i}` : `${kind}${i}`))
+  const root = PATH_ROOT[kind]
+  const list = ((spec as unknown as Spec)[root] as Array<Record<string, string | undefined>> | undefined) ?? []
+  return list.map((d, i) => d[idField(root)] || (kind === 'nic' ? `eth${i}` : `${kind}${i}`))
 }
 
 function findDevice(spec: Spec, root: string, name: string, create: boolean): Record<string, unknown> | undefined {
   const list = (spec[root] as Array<Record<string, unknown>> | undefined) ?? (create ? (spec[root] = []) as Array<Record<string, unknown>> : undefined)
   if (!list) return undefined
-  let i = list.findIndex((d, n) => (d.name as string | undefined || (root === 'network' ? `eth${n}` : '')) === name)
+  let i = list.findIndex((d, n) => (d[idField(root)] as string | undefined || (root === 'network' ? `eth${n}` : '')) === name)
   if (i < 0 && create) {
-    list.push({ name })
+    list.push({ [idField(root)]: name })
     i = list.length - 1
   }
   return list[i]
@@ -154,7 +159,7 @@ export function validate(k: ConfigKey, value: string, m: Msgs): string | undefin
   if (v === '') return undefined
   switch (k.type) {
     case 'int': return /^-?\d+$/.test(v) ? undefined : m.int
-    case 'size': return /^[1-9][0-9]*[KMGTP]?$/.test(v) ? undefined : m.size
+    case 'size': return validSize(v) ? undefined : m.size
     case 'rate': return /^[1-9][0-9]*[KMGT]?$/.test(v) ? undefined : m.rate
     case 'bool': return ['true', 'false', 'yes', 'no', 'on', 'off', '1', '0'].includes(v) ? undefined : m.bool
     case 'mac': return /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(v) ? undefined : m.mac
@@ -241,4 +246,9 @@ export function sourcesOf(exp: { jail: { spec: JailSpec }; sources: Record<strin
   const out: Record<string, { value: string; source: string }> = {}
   for (const [k, v] of Object.entries(values)) out[k] = { value: v, source: (exp.sources[k] ?? 'jail').replace(/^profile:/, '') }
   return out
+}
+
+/** The help of a key as a user reads it: the registry's description, its spacing tidied. */
+export function helpText(d: string | undefined): string {
+  return (d ?? '').replace(/\s{2,}/g, ' ').trim()
 }

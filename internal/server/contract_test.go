@@ -65,8 +65,12 @@ func TestInfoAndExtensions(t *testing.T) {
 	if info.Auth != "untrusted" || info.APIVersion != "1.0" || info.Role != api.RoleHost || info.Hub {
 		t.Fatalf("%+v", info)
 	}
-	if info.HostUUID == "" || info.Hostname != "testhost" || info.Version != "test" {
+	// an anonymous caller learns no host name, id, software version or environment
+	if info.HostUUID != "" || info.Hostname != "" || info.Version != "" || info.Environment.Pool != "" {
 		t.Fatalf("%+v", info)
+	}
+	if ti, err := e.Admin.Info(ctxT(t)); err != nil || ti.HostUUID == "" || ti.Hostname != "testhost" || ti.Version != "test" {
+		t.Fatalf("%+v %v", ti, err)
 	}
 	for _, want := range []string{"operations", "etag", "events", "jails", "doctor", "audit_log"} {
 		if !slices.Contains(info.APIExtensions, want) {
@@ -398,7 +402,7 @@ func TestIPAMAndNetworks(t *testing.T) {
 	e := seeded(t)
 	c := ctxT(t)
 	net, err := e.Admin.Networks().Get(c, "lan")
-	if err != nil || net.Spec.Bridge != "jo0" || net.Metadata.Scope != api.ScopeFleet {
+	if err != nil || net.Metadata.Scope != api.ScopeFleet {
 		t.Fatalf("%v %+v", err, net)
 	}
 	a := mustJail(t, e, "a")
@@ -436,7 +440,7 @@ func TestIPAMAndNetworks(t *testing.T) {
 	// Exhaust the range.
 	small, _ := e.Admin.Networks().Create(c, api.Network{Metadata: api.ObjectMeta{Name: "tiny"}, Spec: api.NetworkSpec{
 		IPv4: &api.IPv4Net{Subnet: "10.30.0.0/24", Gateway: "10.30.0.1", Range: "10.30.0.5-10.30.0.5"}}})
-	if small.Spec.Bridge != "jo1" {
+	if small.Metadata.Name != "tiny" {
 		t.Fatalf("%+v", small.Spec)
 	}
 	pr, _ := e.Admin.Projects().Get(c, dtest.SeedProject)
@@ -458,11 +462,7 @@ func TestIPAMAndNetworks(t *testing.T) {
 	// A network in use cannot be deleted.
 	err = e.Admin.Networks().Delete(c, "lan")
 	wantCode(t, err, api.CodeBusy)
-	// Updates are validated and the bridge cannot change.
-	n2.Spec.Bridge = "jo9"
-	_, err = e.Admin.Networks().Update(c, "lan", n2, "")
-	wantCode(t, err, api.CodeInvalid)
-	n2.Spec.Bridge = "jo0"
+	// Updates are validated.
 	n2.Spec.IPv4.Subnet = "10.77.0.0/24"
 	n2.Spec.IPv4.Gateway = "10.77.0.1"
 	n2.Spec.IPv4.Range = "10.77.0.5-10.77.0.9"
@@ -476,16 +476,16 @@ func TestFirewall(t *testing.T) {
 	e := seeded(t)
 	c := ctxT(t)
 	fw := e.Admin.Firewall()
-	set, err := fw.AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "office"}, Spec: api.AddressSetSpec{Addresses: []string{"203.0.113.0/24"}}})
+	set, err := fw.AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "office"}, Spec: api.AddressSetSpec{Addresses: api.Entries("203.0.113.0/24")}})
 	if err != nil || set.Metadata.Generation != 1 {
 		t.Fatalf("%v %+v", err, set)
 	}
-	_, err = fw.AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "loop"}, Spec: api.AddressSetSpec{Includes: []string{"loop"}}})
+	_, err = fw.AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "loop"}, Spec: api.AddressSetSpec{Addresses: api.Entries("set:loop")}})
 	wantCode(t, err, api.CodeInvalid)
-	_, err = fw.AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "bad"}, Spec: api.AddressSetSpec{Addresses: []string{"not an address"}}})
+	_, err = fw.AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "bad"}, Spec: api.AddressSetSpec{Addresses: api.Entries("not an address")}})
 	wantCode(t, err, api.CodeInvalid)
 	pol := api.FirewallPolicy{Metadata: api.ObjectMeta{Name: "web"}, Spec: api.FirewallPolicySpec{DefaultIn: "deny", DefaultOut: "allow",
-		Rules: []api.FirewallRule{{Action: "allow", Direction: "in", Proto: "tcp", From: []string{"@office"}, Ports: []string{"22"}}}}}
+		Rules: []api.FirewallRule{{Action: "allow", Direction: "in", Proto: "tcp", From: []string{"set:office"}, Ports: []string{"22"}}}}}
 	if _, err := fw.Policies().Create(c, pol); err != nil {
 		t.Fatal(err)
 	}
@@ -497,8 +497,13 @@ func TestFirewall(t *testing.T) {
 	// A set that a policy uses cannot go.
 	err = fw.AddressSets().Delete(c, "office")
 	wantCode(t, err, api.CodeBusy)
+	// the refusal names the policies, in the message, the hint and the detail
+	var busy *api.Error
+	if !errors.As(err, &busy) || busy.Message != `address set "office" is used by firewall policy "web"` || busy.Detail["policies"] != "web" || !strings.Contains(busy.Hint, "set:office") {
+		t.Fatalf("refusal: %+v", err)
+	}
 	j := dtest.WebJail("web")
-	j.Spec.Firewall.Policy = "web"
+	j.Spec.Firewall.Policies = []string{"web"}
 	op, err := e.Admin.Jails().Create(c, j)
 	if err != nil {
 		t.Fatal(err)
@@ -523,7 +528,7 @@ func TestFirewall(t *testing.T) {
 		t.Fatalf("anchor not loaded: %q", live)
 	}
 	// Changing the set reloads the anchor of the running jail.
-	set.Spec.Addresses = []string{"198.51.100.0/24"}
+	set.Spec.Addresses = api.Entries("198.51.100.0/24")
 	if _, err := fw.AddressSets().Update(c, "office", set, `"1"`); err != nil {
 		t.Fatal(err)
 	}

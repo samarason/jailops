@@ -8,7 +8,7 @@ spec:
   image: freebsd-15@stable
   storage: default
   network: [{name: eth0, network: lan, ipv4: auto}]
-  firewall: {policy: web}
+  firewall: {policies: [web]}
   resources: {memory: 512M}
   proxy: [{name: http, listen: ":80", jail_port: 80}]
   provision:

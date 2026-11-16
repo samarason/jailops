@@ -14,10 +14,6 @@ import (
 // these argument vectors and paths, and the tests of the privileged helper
 // check the same ones against its allow-list.
 
-// DefaultAlias is the alias of the image an app is installed from when none
-// is named: the only FreeBSD image with this alias, as NAME@stable.
-const DefaultAlias = "stable"
-
 // SnapshotName is the snapshot the installer takes of the fresh installation.
 const SnapshotName = "app-installed"
 
@@ -28,11 +24,33 @@ const JailopsRepo = "jailops"
 // PkgInstallArgv is the host command that installs packages into a jail root
 // from the FreeBSD repository (repo ports) or from pkg.jailops.net.
 func PkgInstallArgv(root, repo string, names []string) []string {
-	argv := []string{"pkg", "-r", root, "install", "-y"}
+	return PkgInstallCachedArgv(root, repo, "", names)
+}
+
+// PkgInstallCachedArgv is PkgInstallArgv with the download cache of pkg set to a directory the host shares between
+// installs (pkg -r would otherwise keep a cache in every jail root and fetch the same packages again for each new
+// jail). An empty cache leaves pkg's own default.
+func PkgInstallCachedArgv(root, repo, cache string, names []string) []string {
+	argv := []string{"pkg", "-r", root}
+	if cache != "" {
+		argv = append(argv, "-o", "PKG_CACHEDIR="+cache)
+	}
+	argv = append(argv, "install", "-y")
 	if repo == JailopsRepo {
 		argv = append(argv, "-r", JailopsRepo)
 	}
 	return append(argv, names...)
+}
+
+// PkgJailArgv is a pkg command that runs inside a running jail (pkg -j): pkg enters the jail first, so what it writes
+// and the scripts it runs stay in the jail, and it reads the jail's own repository configuration.
+func PkgJailArgv(jail string, args ...string) []string {
+	return append([]string{"pkg", "-j", jail}, args...)
+}
+
+// PkgInstallInJailArgv installs packages from the repository the jail itself is configured for, inside a running jail.
+func PkgInstallInJailArgv(jail string, names []string) []string {
+	return PkgJailArgv(jail, append([]string{"install", "-y"}, names...)...)
 }
 
 // PkgVersionArgv is the host command that reports the installed version of
@@ -103,21 +121,40 @@ func PackageGroups(pkgs []api.AppPackage) (ports, jailops []string) {
 	return ports, jailops
 }
 
-// Volumes turns the data paths into the jail's volumes: one dataset per
-// path, named after the path. The names are unique and match the volume
-// name rule of the lifecycle.
-func Volumes(data []api.AppPath) []api.VolumeMount {
-	var out []api.VolumeMount
+// MaxVolumeName is the longest name of a volume (validate.MaxVolumeName).
+const MaxVolumeName = 32
+
+// Volumes turns the data paths into the volumes of the jail: one volume per path, named <jail>-<what the path is
+// called>. The names are unique and match the volume name rule; a name that is too long is cut at a dash.
+func Volumes(jail string, data []api.AppPath) []api.VolumeAttach {
+	var out []api.VolumeAttach
 	seen := map[string]bool{}
 	for _, d := range data {
-		n := VolumeName(d.Path)
+		base := VolumeName(d.Path)
+		n := volumeFullName(jail, base, "")
 		for i := 2; seen[n]; i++ {
-			n = VolumeName(d.Path) + "-" + strconv.Itoa(i)
+			n = volumeFullName(jail, base, "-"+strconv.Itoa(i))
 		}
 		seen[n] = true
-		out = append(out, api.VolumeMount{Name: n, Mount: d.Path})
+		out = append(out, api.VolumeAttach{Name: n, Mount: d.Path})
 	}
 	return out
+}
+
+// volumeFullName is <jail>-<base><suffix> within MaxVolumeName characters: the base gives way, the jail's name and
+// the suffix stay.
+func volumeFullName(jail, base, suffix string) string {
+	room := MaxVolumeName - len(jail) - 1 - len(suffix)
+	if room < 1 {
+		return strings.TrimRight(jail[:min(len(jail), MaxVolumeName-len(suffix))], "-") + suffix
+	}
+	if len(base) > room {
+		base = strings.TrimRight(base[:room], "-")
+		if base == "" {
+			base = "d"
+		}
+	}
+	return jail + "-" + base + suffix
 }
 
 // VolumeName derives a dataset name from a data path: lower case letters

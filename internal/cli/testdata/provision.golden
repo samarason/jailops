@@ -79,8 +79,8 @@ $ jailops provision web
 
 $ jailops provision web --again
 ! Run the provisioning of "web" again? [y/N]: 
-! usage: confirmation required
-! hint: answer on standard input, or pass -y
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: answer y on standard input, or pass -y to confirm without a question
 [exit 2]
 
 $ jailops provision web --again -y
@@ -96,6 +96,6 @@ again: false
 
 $ jailops provision ghost
 ! not_found: jail "ghost" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
 [exit 4]
 

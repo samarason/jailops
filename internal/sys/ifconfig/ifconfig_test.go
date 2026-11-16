@@ -24,7 +24,7 @@ func TestParseIfconfigGolden(t *testing.T) {
 	for _, i := range ifs {
 		byName[i.Name] = i
 	}
-	for _, n := range []string{"em0", "lo0", "jo0", "joweba"} {
+	for _, n := range []string{"em0", "lo0", "mybr", "joweba"} {
 		if _, ok := byName[n]; !ok {
 			t.Fatalf("missing %s in %v", n, ifs)
 		}
@@ -45,9 +45,9 @@ func TestParseIfconfigGolden(t *testing.T) {
 	if lo := byName["lo0"]; lo.MTU != 16384 || lo.Inet[0] != netip.MustParsePrefix("127.0.0.1/8") || lo.Inet6[0].Bits() != 128 {
 		t.Errorf("lo0: %+v", lo)
 	}
-	jo := byName["jo0"]
-	if jo.Description != "jailops:net-lan office bridge" || !reflect.DeepEqual(jo.Groups, []string{"bridge"}) {
-		t.Errorf("jo0: %+v", jo)
+	jo := byName["mybr"]
+	if jo.Description != "an administrator's bridge" || !reflect.DeepEqual(jo.Groups, []string{"bridge"}) {
+		t.Errorf("mybr: %+v", jo)
 	}
 	if len(jo.Members) != 2 || jo.Members[0].Name != "joweba" || !jo.Members[0].Private || jo.Members[1].Private {
 		t.Errorf("members: %+v", jo.Members)
@@ -90,52 +90,70 @@ func newCmd() (*Command, *run.Fake) {
 	return NewCommand(f, Options{}), f
 }
 
-func TestCommandBridgeAndEpair(t *testing.T) {
+// show is what `ifconfig <name>` prints for an interface of kind ("bridge", "epair", "vmx", "lo") with desc.
+func show(name, kind, desc string) string {
+	out := name + ": flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500\n"
+	if desc != "" {
+		out += "\tdescription: " + desc + "\n"
+	}
+	return out + "\tether 58:9c:fc:10:ff:01\n\tgroups: " + kind + "\n"
+}
+
+// mine answers `ifconfig <name>` with an interface of JailOps (the marker) for every name.
+func mine(f *run.Fake, kind string, names ...string) {
+	for _, n := range names {
+		f.On("ifconfig", []string{n}, show(n, kind, Marker))
+	}
+}
+
+// writes returns the calls that are not reads of one interface (ifconfig NAME, ifconfig -j JAIL NAME).
+func writes(argv []string) []string {
+	var out []string
+	for _, a := range argv {
+		f := strings.Fields(a)
+		if len(f) == 4 && f[1] == "-j" {
+			continue
+		}
+		if len(f) > 2 || a == "ifconfig -a" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func TestCommandAddressesAndLinks(t *testing.T) {
 	c, f := newCmd()
-	f.On("ifconfig", []string{"bridge", "create"}, "bridge0\n")
+	mine(f, "epair", "joweba")
 	f.Add(run.Rule{Name: "ifconfig", Args: []string{run.RestArgs}})
-	if err := c.BridgeCreate(ctx, "jo0"); err != nil {
+	if err := c.SetDescription(ctx, "joweba", "jailops jail=p/web net=lan (host side)"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SetDescription(ctx, "jo0", "jailops:abc"); err != nil {
+	if err := c.SetDescription(ctx, "joweba", ""); err != nil { // clearing keeps the marker
 		t.Fatal(err)
 	}
-	if err := c.BridgeAddMember(ctx, "jo0", "joweba", true); err != nil {
+	if err := c.AddrAdd(ctx, "joweba", netip.MustParsePrefix("10.77.0.1/32")); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.BridgeAddMember(ctx, "jo0", "jodbea", false); err != nil {
+	if err := c.AddrAdd(ctx, "joweba", netip.MustParsePrefix("fe80::1/64")); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.BridgeDeleteMember(ctx, "jo0", "joweba"); err != nil {
+	if err := c.AddrRemove(ctx, "joweba", netip.MustParsePrefix("fd00::1/64")); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.AddrAdd(ctx, "jo0", netip.MustParsePrefix("10.77.0.1/24")); err != nil {
+	if err := c.SetLink(ctx, "joweba", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.AddrRemove(ctx, "jo0", netip.MustParsePrefix("fd00::1/64")); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.SetLink(ctx, "jo0", true); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.SetLink(ctx, "jo0", false); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.BridgeDestroy(ctx, "jo0"); err != nil {
+	if err := c.SetLink(ctx, "joweba", false); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"ifconfig bridge create",
-		"ifconfig bridge0 name jo0",
-		"ifconfig jo0 description jailops:abc",
-		"ifconfig jo0 addm joweba private joweba",
-		"ifconfig jo0 addm jodbea",
-		"ifconfig jo0 deletem joweba",
-		"ifconfig jo0 inet 10.77.0.1/24 alias",
-		"ifconfig jo0 inet6 fd00::1 prefixlen 64 -alias",
-		"ifconfig jo0 up",
-		"ifconfig jo0 down",
-		"ifconfig jo0 destroy",
+		"ifconfig joweba", "ifconfig joweba description jailops jail=p/web net=lan (host side)",
+		"ifconfig joweba", "ifconfig joweba description " + Marker,
+		"ifconfig joweba", "ifconfig joweba inet 10.77.0.1/32 alias",
+		"ifconfig joweba", "ifconfig joweba inet6 fe80::1 prefixlen 64 alias",
+		"ifconfig joweba", "ifconfig joweba inet6 fd00::1 prefixlen 64 -alias",
+		"ifconfig joweba", "ifconfig joweba up",
+		"ifconfig joweba", "ifconfig joweba down",
 	}
 	if !reflect.DeepEqual(f.Argv(), want) {
 		t.Errorf("got  %q\nwant %q", f.Argv(), want)
@@ -145,6 +163,8 @@ func TestCommandBridgeAndEpair(t *testing.T) {
 func TestCommandEpair(t *testing.T) {
 	c, f := newCmd()
 	f.On("ifconfig", []string{"epair", "create"}, "epair3a\n")
+	mine(f, "epair", "joweba")
+	f.On("ifconfig", []string{"-j", "web", "joweba"}, show("joweba", "epair", "jailops jail=p/web net=lan (jail side)"))
 	f.Add(run.Rule{Name: "ifconfig", Args: []string{run.RestArgs}})
 	a, b, err := c.EpairCreate(ctx, "joweb")
 	if err != nil || a != "joweba" || b != "jowebb" {
@@ -153,12 +173,18 @@ func TestCommandEpair(t *testing.T) {
 	if err := c.MoveToJail(ctx, a, "web"); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.MoveFromJail(ctx, a, "web"); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.EpairDestroy(ctx, a); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"ifconfig epair create", "ifconfig epair3b name jowebb", "ifconfig epair3a name joweba",
-		"ifconfig joweba vnet web", "ifconfig joweba destroy",
+		"ifconfig epair create", "ifconfig epair3a description " + Marker, "ifconfig epair3b description " + Marker,
+		"ifconfig epair3b name jowebb", "ifconfig epair3a name joweba",
+		"ifconfig joweba", "ifconfig joweba vnet web",
+		"ifconfig -j web joweba", "ifconfig joweba -vnet web",
+		"ifconfig joweba", "ifconfig joweba destroy",
 	}
 	if !reflect.DeepEqual(f.Argv(), want) {
 		t.Errorf("%q", f.Argv())
@@ -168,6 +194,8 @@ func TestCommandEpair(t *testing.T) {
 func TestEpairRenameFailureCleansUp(t *testing.T) {
 	c, f := newCmd()
 	f.On("ifconfig", []string{"epair", "create"}, "epair3a\n")
+	f.Add(run.Rule{Name: "ifconfig", Args: []string{"epair3a", "description", Marker}})
+	f.Add(run.Rule{Name: "ifconfig", Args: []string{"epair3b", "description", Marker}})
 	f.OnFail("ifconfig", []string{"epair3b", "name", "jowebb"}, 1, "ifconfig: SIOCSIFNAME: File exists")
 	f.Add(run.Rule{Name: "ifconfig", Args: []string{"epair3a", "destroy"}})
 	if _, _, err := c.EpairCreate(ctx, "joweb"); !api.IsCode(err, api.CodeAlreadyExists) {
@@ -178,34 +206,85 @@ func TestEpairRenameFailureCleansUp(t *testing.T) {
 	}
 }
 
-func TestPrefixEnforcement(t *testing.T) {
-	c, f := newCmd()
-	for i, err := range []error{
-		c.BridgeDestroy(ctx, "bridge0"),
-		c.BridgeCreate(ctx, "em0"),
-		c.BridgeAddMember(ctx, "bridge0", "joweba", false),
-		c.SetLink(ctx, "em0", false),
-		c.AddrAdd(ctx, "em0", netip.MustParsePrefix("10.0.0.1/24")),
-		c.EpairDestroy(ctx, "epair0a"),
-		c.MoveToJail(ctx, "em0", "web"),
-		c.BridgeDestroy(ctx, "jo"), // prefix alone is not a name
+// Ownership is the kernel's description and kind, never the name: every refusal, and what is accepted.
+func TestOwnership(t *testing.T) {
+	type cas struct {
+		name, kind, desc string
+		owned            bool
+		msg              string
+	}
+	for _, k := range []cas{
+		{"joweba", "epair", Marker, true, ""},
+		{"joweba", "epair", "jailops jail=p/web net=lan (host side)", true, ""},
+		{"epair0a", "epair", "", false, "has no JailOps description"},               // an epair made by hand
+		{"jo7", "epair", "", false, "has no JailOps description"},                   // a name that looks like JailOps's is not a reason
+		{"jo1234567890aab", "epair", "", false, "has no JailOps description"},       // the same for an epair end
+		{"joweba", "epair", "jailops:0b0e7f3e", false, "is not one JailOps writes"}, // a description of another form
+		{"jo7", "epair", "customer vnet link", false, "is not one JailOps writes"},  // someone's description
+		{"epair1a", "epair", "jailopsx", false, "is not one JailOps writes"},
+		{"epair1a", "epair", "Jailops managed", false, "is not one JailOps writes"},
+		{"mybr", "bridge", Marker, false, "only epairs"}, // a bridge is never owned, whatever it says
+		{"vmx0", "vmx", "", false, "only epairs"},
+		{"vmx0", "vmx", Marker, false, "only epairs"}, // a forged description on the uplink
+		{"jo7", "vmx", "", false, "only epairs"},      // a renamed uplink with a JailOps-like name
+		{"lo0", "lo", Marker, false, "only epairs"},
+		{"wg0", "wg", "jailops wireguard=office", false, "only epairs"},
+		{"tap0", "tap", Marker, false, "only epairs"},
 	} {
-		if !api.IsCode(err, api.CodeForbidden) {
-			t.Errorf("case %d: %v", i, err)
+		i := ParseIfconfig(show(k.name, k.kind, k.desc))[0]
+		err := Options{}.Owns(i)
+		if (err == nil) != k.owned || (err == nil) != (k.msg == "") || err != nil && (!strings.Contains(err.Error(), k.msg) || !api.IsCode(err, api.CodeForbidden)) {
+			t.Errorf("%s/%s/%q: %v", k.name, k.kind, k.desc, err)
 		}
 	}
+}
+
+// Every mutating call reads the interface from the kernel first and touches nothing that is not JailOps's.
+func TestCommandRefusesForeign(t *testing.T) {
+	c, f := newCmd()
+	f.On("ifconfig", []string{"vmx0"}, show("vmx0", "vmx", ""))
+	f.On("ifconfig", []string{"lo0"}, show("lo0", "lo", ""))
+	f.On("ifconfig", []string{"mybr"}, show("mybr", "bridge", Marker))  // a bridge is never JailOps's
+	f.On("ifconfig", []string{"epair0a"}, show("epair0a", "epair", "")) // made by hand
+	f.On("ifconfig", []string{"forged"}, show("forged", "epair", "my jailops link"))
+	f.On("ifconfig", []string{"-j", "web", "lo0"}, show("lo0", "lo", ""))
+	f.OnFail("ifconfig", []string{"ghost"}, 1, "ifconfig: interface ghost does not exist")
+	for _, name := range []string{"vmx0", "lo0", "mybr", "epair0a", "forged"} {
+		for i, err := range []error{
+			c.SetDescription(ctx, name, Marker), // the daemon cannot have the marker written on a foreign interface
+			c.SetLink(ctx, name, false),
+			c.AddrAdd(ctx, name, netip.MustParsePrefix("10.0.0.1/24")),
+			c.AddrRemove(ctx, name, netip.MustParsePrefix("10.0.0.1/24")),
+			c.EpairDestroy(ctx, name),
+			c.MoveToJail(ctx, name, "web"),
+			c.RouteAdd(ctx, Route{Dest: "2001:db8::5/128", Interface: name}),
+		} {
+			if !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), "not managed by JailOps") {
+				t.Errorf("%s case %d: %v", name, i, err)
+			}
+		}
+	}
+	if !api.IsCode(c.MoveFromJail(ctx, "lo0", "web"), api.CodeForbidden) {
+		t.Error("the loopback of a jail was moved")
+	}
+	if !api.IsCode(c.SetLink(ctx, "ghost", true), api.CodeNotFound) {
+		t.Error("a missing interface is not_found")
+	}
+	if w := writes(f.Argv()); len(w) != 0 {
+		t.Errorf("foreign interface touched: %q", w)
+	}
+	// a create under a driver's name runs nothing at all
+	f.Reset()
+	for _, n := range []string{"epair0"} {
+		if _, _, err := c.EpairCreate(ctx, n); !api.IsCode(err, api.CodeInvalid) {
+			t.Errorf("%s: %v", n, err)
+		}
+	}
+	if err := c.SetDescription(ctx, "joweba", "my text"); !api.IsCode(err, api.CodeInvalid) {
+		t.Errorf("the marker was removable: %v", err)
+	}
 	if len(f.Calls()) != 0 {
-		t.Error("foreign interface touched")
-	}
-	// explicit opt-in
-	f2 := run.NewFake()
-	f2.Add(run.Rule{Name: "ifconfig", Args: []string{run.RestArgs}})
-	if err := NewCommand(f2, Options{AllowForeign: true}).SetLink(ctx, "em0", true); err != nil {
-		t.Fatal(err)
-	}
-	// custom prefix
-	if err := NewCommand(f2, Options{Prefixes: []string{"jail"}}).SetLink(ctx, "jail0", true); err != nil {
-		t.Fatal(err)
+		t.Errorf("ran %q", f.Argv())
 	}
 }
 
@@ -213,7 +292,6 @@ func TestInvalidArguments(t *testing.T) {
 	c, f := newCmd()
 	for i, err := range []error{
 		c.SetLink(ctx, "jo0;reboot", true),
-		c.BridgeAddMember(ctx, "jo0", "-x", false),
 		c.MoveToJail(ctx, "joweba", "-j"),
 		c.MoveToJail(ctx, "joweba", "a b"),
 		c.SetDescription(ctx, "jo0", "line\nbreak"),
@@ -234,12 +312,16 @@ func TestInvalidArguments(t *testing.T) {
 
 func TestRoutes(t *testing.T) {
 	c, f := newCmd()
+	mine(f, "epair", "jo0")
 	f.Add(run.Rule{Name: "route", Args: []string{run.RestArgs}})
 	for _, err := range []error{
 		c.RouteAdd(ctx, Route{Dest: "10.1.2.3/24", Gateway: "10.0.0.1"}),
 		c.RouteAdd(ctx, Route{Dest: "default", Gateway: "fe80::1"}),
 		c.RouteAdd(ctx, Route{Dest: "2001:db8::5", Interface: "jo0"}),
 		c.RouteDelete(ctx, Route{Dest: "2001:db8:1::/64", Gateway: "fd00::1"}),
+		c.RouteAdd(ctx, Route{Dest: "10.77.0.0/24", Reject: true}),
+		c.RouteDelete(ctx, Route{Dest: "10.77.0.0/24", Reject: true}),
+		c.RouteAdd(ctx, Route{Dest: "2001:db8:5::/64", Reject: true}),
 	} {
 		if err != nil {
 			t.Fatal(err)
@@ -248,8 +330,12 @@ func TestRoutes(t *testing.T) {
 	want := []string{
 		"route -n add -inet 10.1.2.0/24 10.0.0.1",
 		"route -n add -inet6 default fe80::1",
+		"ifconfig jo0",
 		"route -n add -inet6 2001:db8::5 -interface jo0",
 		"route -n delete -inet6 2001:db8:1::/64 fd00::1",
+		"route -n add -inet 10.77.0.0/24 127.0.0.1 -reject",
+		"route -n delete -inet 10.77.0.0/24",
+		"route -n add -inet6 2001:db8:5::/64 ::1 -reject",
 	}
 	if !reflect.DeepEqual(f.Argv(), want) {
 		t.Errorf("%q", f.Argv())
@@ -285,28 +371,23 @@ func TestFake(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	must(f.BridgeCreate(ctx, "jo0"))
-	if !api.IsCode(f.BridgeCreate(ctx, "jo0"), api.CodeAlreadyExists) {
-		t.Fatal("dup bridge")
-	}
 	a, b, err := f.EpairCreate(ctx, "joweb")
 	must(err)
-	must(f.BridgeAddMember(ctx, "jo0", a, true))
-	if !api.IsCode(f.BridgeAddMember(ctx, "jo0", a, false), api.CodeAlreadyExists) {
-		t.Fatal("dup member")
+	if _, _, err := f.EpairCreate(ctx, "joweb"); !api.IsCode(err, api.CodeAlreadyExists) {
+		t.Fatalf("dup epair: %v", err)
 	}
-	must(f.AddrAdd(ctx, "jo0", netip.MustParsePrefix("10.0.0.1/24")))
-	must(f.SetLink(ctx, "jo0", true))
+	must(f.AddrAdd(ctx, a, netip.MustParsePrefix("10.0.0.1/32")))
+	must(f.SetLink(ctx, a, true))
 	must(f.MoveToJail(ctx, b, "web"))
 	ifs, _ := f.List(ctx)
 	names := []string{}
 	for _, i := range ifs {
 		names = append(names, i.Name)
 	}
-	if !reflect.DeepEqual(names, []string{"em0", "jo0", "joweba", "lo0"}) {
+	if !reflect.DeepEqual(names, []string{"em0", "joweba", "lo0"}) {
 		t.Fatalf("%v", names)
 	}
-	if !ifs[1].Up() || len(ifs[1].Members) != 1 || !ifs[1].Members[0].Private {
+	if !ifs[1].Up() || len(ifs[1].Inet) != 1 {
 		t.Fatalf("%+v", ifs[1])
 	}
 	if !api.IsCode(f.SetLink(ctx, "em0", false), api.CodeForbidden) {
@@ -317,9 +398,11 @@ func TestFake(t *testing.T) {
 		t.Fatal("dup route")
 	}
 	must(f.RouteDelete(ctx, Route{Dest: "default", Gateway: "10.0.0.254"}))
+	must(f.RouteAdd(ctx, Route{Dest: "10.0.0.0/24", Reject: true}))
+	must(f.RouteDelete(ctx, Route{Dest: "10.0.0.0/24", Reject: true}))
 	must(f.EpairDestroy(ctx, a))
 	ifs, _ = f.List(ctx)
-	if len(ifs) != 3 || len(ifs[1].Members) != 0 {
+	if len(ifs) != 2 {
 		t.Fatalf("%+v", ifs)
 	}
 	f.Forwarding = true
@@ -332,6 +415,7 @@ func TestFake(t *testing.T) {
 // old one must go when the host route does, and before the route of the next jail is made.
 func TestHostRoutesForgetTheNeighborEntry(t *testing.T) {
 	c, f := newCmd()
+	mine(f, "epair", "jo0")
 	f.Add(run.Rule{Name: "route", Args: []string{run.RestArgs}})
 	f.Add(run.Rule{Name: "ndp", Args: []string{run.RestArgs}})
 	r := Route{Dest: "2001:db8:1:2:100::10/128", Interface: "jo0"}
@@ -342,8 +426,10 @@ func TestHostRoutesForgetTheNeighborEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
+		"ifconfig jo0",
 		"route -n delete -inet6 2001:db8:1:2:100::10/128 -interface jo0",
 		"ndp -d 2001:db8:1:2:100::10",
+		"ifconfig jo0",
 		"ndp -d 2001:db8:1:2:100::10",
 		"route -n add -inet6 2001:db8:1:2:100::10/128 -interface jo0",
 	}
@@ -380,46 +466,63 @@ func TestParseVlan(t *testing.T) {
 	}
 }
 
-// A static neighbor entry replaces whatever is there (delete first), and a link-local address carries its interface.
-func TestCommandNeighbor(t *testing.T) {
-	c, f := newCmd()
-	f.Add(run.Rule{Name: "ndp", Args: []string{run.RestArgs}})
-	f.Add(run.Rule{Name: "arp", Args: []string{run.RestArgs}})
-	mac := "ca:64:60:d0:bb:57"
-	if err := c.NeighborSet(ctx, "jo0gb", netip.MustParseAddr("2001:db8:2::100"), mac); err != nil {
+// The fake stores descriptions and reads them back as the kernel does, with the same ownership rule as Command.
+func TestFakeOwnership(t *testing.T) {
+	f := NewFake(Options{})
+	f.AddForeign("vmx0", true)
+	f.AddIface(Iface{Name: "mybr", Groups: []string{"bridge"}, Description: Marker})
+	f.AddIface(Iface{Name: "epair7a", Groups: []string{"epair"}})
+	a, _, err := f.EpairCreate(ctx, "joweb")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.NeighborSet(ctx, "jo0gb", netip.MustParseAddr("fe80::c864:60ff:fed0:bb57"), mac); err != nil {
+	if i, _ := f.Show(ctx, a); i.Description != Marker {
+		t.Fatalf("created without the marker: %+v", i)
+	}
+	if err := f.SetDescription(ctx, a, "jailops jail=p/web net=lan (host side)"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.NeighborDelete(ctx, "jo0gb", netip.MustParseAddr("fe80::c864:60ff:fed0:bb57")); err != nil {
-		t.Fatal(err)
+	if i, _ := f.Show(ctx, a); i.Description != "jailops jail=p/web net=lan (host side)" {
+		t.Fatalf("%+v", i)
 	}
-	if err := c.NeighborSet(ctx, "jo0gb", netip.MustParseAddr("10.20.0.12"), mac); err != nil { // IPv4 is ARP
-		t.Fatal(err)
-	}
-	if err := c.NeighborDelete(ctx, "jo0gb", netip.MustParseAddr("10.20.0.12")); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{
-		"ndp -d 2001:db8:2::100", "ndp -s 2001:db8:2::100 " + mac,
-		"ndp -d fe80::c864:60ff:fed0:bb57%jo0gb", "ndp -s fe80::c864:60ff:fed0:bb57%jo0gb " + mac,
-		"ndp -d fe80::c864:60ff:fed0:bb57%jo0gb",
-		"arp -d 10.20.0.12", "arp -s 10.20.0.12 " + mac, "arp -d 10.20.0.12",
-	}
-	if !reflect.DeepEqual(f.Argv(), want) {
-		t.Errorf("got  %q\nwant %q", f.Argv(), want)
-	}
-	for _, bad := range []func() error{
-		func() error { return c.NeighborSet(ctx, "em0", netip.MustParseAddr("2001:db8::1"), mac) },          // not ours
-		func() error { return c.NeighborSet(ctx, "jo0gb", netip.MustParseAddr("2001:db8::1"), "nonsense") }, // not a MAC
-		func() error { return c.NeighborSet(ctx, "jo0gb", netip.MustParseAddr("ff02::1"), mac) },            // multicast
-	} {
-		if bad() == nil {
-			t.Error("accepted")
+	for _, err := range []error{f.SetLink(ctx, "vmx0", false), f.SetLink(ctx, "mybr", true), f.SetDescription(ctx, "mybr", Marker),
+		f.SetLink(ctx, "epair7a", true)} {
+		if !api.IsCode(err, api.CodeForbidden) {
+			t.Errorf("foreign: %v", err)
 		}
 	}
-	if len(f.Argv()) != len(want) {
-		t.Error("a refused entry ran a command")
+	// a marker travels into the jail's vnet and back
+	_, b, err := f.EpairCreate(ctx, "jox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.MoveToJail(ctx, b, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Show(ctx, b); !api.IsCode(err, api.CodeNotFound) {
+		t.Errorf("a jail's interface is visible on the host: %v", err)
+	}
+	if i, err := f.ShowInJail(ctx, "web", b); err != nil || i.Description != Marker {
+		t.Errorf("%+v %v", i, err)
+	}
+	f.AddToJail("web", Iface{Name: "mine", Groups: []string{"epair"}, Description: "the jail's"})
+	if err := f.MoveFromJail(ctx, "mine", "web"); !api.IsCode(err, api.CodeForbidden) {
+		t.Errorf("an interface the jail made: %v", err)
+	}
+	if err := f.MoveFromJail(ctx, b, "web"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Removing an address that is not on the interface is "not found", whatever the kernel calls it: `ifconfig X inet A
+// -alias` answers "Can't assign requested address" (EADDRNOTAVAIL), which is what a jail started by an earlier version
+// gives a stop that removes the gateway alias of the routed link.
+func TestAddrRemoveOfAnAddressThatIsNotThereIsNotFound(t *testing.T) {
+	c, f := newCmd()
+	mine(f, "epair", "joweba")
+	f.OnFail("ifconfig", []string{"joweba", "inet", "10.77.0.1/32", "-alias"}, 1, "ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address\n")
+	err := c.AddrRemove(ctx, "joweba", netip.MustParsePrefix("10.77.0.1/32"))
+	if !api.IsCode(err, api.CodeNotFound) {
+		t.Fatalf("got %v, want not found", err)
 	}
 }

@@ -1,0 +1,9 @@
+apiVersion: jailops/v1
+kind: Volume
+hosts: [nas1]
+metadata:
+  name: music
+spec:
+  path: /mnt/archive/music   # a directory of the host, below an admin-host-mount directory of its priv.conf
+  watch: true
+  comment: the music archive

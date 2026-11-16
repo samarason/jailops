@@ -1,9 +1,17 @@
 # Managed by JailOps. Do not edit; changes are overwritten.
 # anchor jailops/alpha/web
 # tags: tier-1 web
+# the host's own addresses (a jail reaches none of them unless a rule says so)
+table <host> persist
+# what an allow rule to any does not reach: the host and the networks of other projects (name them to open them)
+table <not_any> persist
 table <jail_addrs> persist { 10.20.0.10, fe80::/10 }
 block drop out quick on jo0123456789a0a from any to ! <jail_addrs>
 block drop out quick on jo0123456789a0a inet proto icmp from any to any icmp-type redir
+# policy web
+# the host: closed unless a rule above opened it; ping and the network's resolver stay open
+pass in quick on jo0123456789a0a inet proto icmp from any to <host> label "jo-5af657cde82a" keep state (if-bound)
+block drop in quick on jo0123456789a0a from any to <host>
 # defaults: final (quick), so that no rule of the host's own pf.conf after the anchor line changes them
-pass out quick on jo0123456789a0a all label "jo-71f8c0984dae"
+pass out quick on jo0123456789a0a all label "jo-2a02f363a529" keep state (if-bound)
 block drop in quick on jo0123456789a0a all

@@ -18,27 +18,32 @@ import (
 // its update history and the networks it is attached to, gathered into one
 // view. -o json and -o yaml print it as it is.
 type jailInfo struct {
-	Name          string            `json:"name"`
-	Project       string            `json:"project,omitempty"`
-	UUID          string            `json:"uuid,omitempty"`
-	Hostname      string            `json:"hostname,omitempty"`
-	State         api.PowerState    `json:"state"`
-	JID           int               `json:"jid,omitempty"`
-	OS            api.OS            `json:"os,omitempty"`
-	Layout        api.Layout        `json:"layout,omitempty"`
-	Image         string            `json:"image"`
-	Generation    string            `json:"generation,omitempty"`
-	Storage       string            `json:"storage,omitempty"`
-	Profiles      []string          `json:"profiles,omitempty"`
-	CreatedAt     time.Time         `json:"created_at,omitzero"`
-	StartedAt     time.Time         `json:"started_at,omitzero"`
-	ProvisionedAt time.Time         `json:"provisioned_at,omitzero"`
-	Resources     infoResources     `json:"resources"`
-	Interfaces    []infoInterface   `json:"interfaces"`
-	Volumes       []api.VolumeMount `json:"volumes,omitempty"`
-	Snapshots     infoSnapshots     `json:"snapshots"`
-	Update        infoUpdate        `json:"update"`
-	Labels        map[string]string `json:"labels,omitempty"`
+	Name          string          `json:"name"`
+	Project       string          `json:"project,omitempty"`
+	UUID          string          `json:"uuid,omitempty"`
+	Hostname      string          `json:"hostname,omitempty"`
+	State         api.PowerState  `json:"state"`
+	JID           int             `json:"jid,omitempty"`
+	OS            api.OS          `json:"os,omitempty"`
+	Layout        api.Layout      `json:"layout,omitempty"`
+	Image         string          `json:"image"`
+	Generation    string          `json:"generation,omitempty"`
+	Storage       string          `json:"storage,omitempty"`
+	Profiles      []string        `json:"profiles,omitempty"`
+	CreatedAt     time.Time       `json:"created_at,omitzero"`
+	StartedAt     time.Time       `json:"started_at,omitzero"`
+	ProvisionedAt time.Time       `json:"provisioned_at,omitzero"`
+	Resources     infoResources   `json:"resources"`
+	Interfaces    []infoInterface `json:"interfaces"`
+	// FirewallPolicies are the policies the jail is rendered with, in the order they are rendered; empty when it has
+	// none and is open.
+	FirewallPolicies []infoPolicy `json:"firewall_policies,omitempty"`
+	// DNS says how the jail resolves names; absent when it has no network.
+	DNS       *infoDNS           `json:"dns,omitempty"`
+	Volumes   []api.VolumeAttach `json:"volumes,omitempty"`
+	Snapshots infoSnapshots      `json:"snapshots"`
+	Update    infoUpdate         `json:"update"`
+	Labels    map[string]string  `json:"labels,omitempty"`
 	// Problems are the conditions that are not True, and the drift.
 	Problems []string `json:"problems,omitempty"`
 }
@@ -74,6 +79,61 @@ type infoAddress struct {
 	Scope   string `json:"scope"`  // global or link
 	// Configured says the server saw the address on the running jail.
 	Configured bool `json:"configured"`
+}
+
+// infoDNS is how a jail resolves names: where it asks, the names it has itself and where every other name goes.
+type infoDNS struct {
+	Source      api.DNSSource `json:"source"`
+	Nameservers []string      `json:"nameservers,omitempty"`
+	Search      string        `json:"search,omitempty"`
+	// Names are the names of the jail itself, when the host's resolver gives them.
+	Names []string `json:"names,omitempty"`
+	// Others says where every other name goes; Note says why the jail has no names of its own.
+	Others string `json:"others,omitempty"`
+	Note   string `json:"note,omitempty"`
+}
+
+// jailDNS reads the DNS of a jail out of the status of its first network and its own addresses.
+func jailDNS(j api.Jail, nw api.Network, addrs []string) *infoDNS {
+	d := nw.Status.DNS
+	if d == nil {
+		return nil
+	}
+	out := &infoDNS{Source: d.Source, Nameservers: d.Nameservers}
+	switch {
+	case d.Suffix != "":
+		zone := j.Metadata.Project + "." + d.Suffix
+		out.Search = zone
+		name := j.Metadata.Name
+		out.Names = []string{name + "." + zone, name}
+		var v4, v6 bool
+		for _, a := range addrs {
+			if ip, ok := addrOf(a); ok && !ip.IsLinkLocalUnicast() {
+				v4, v6 = v4 || ip.Is4(), v6 || ip.Is6()
+			}
+		}
+		if v4 {
+			out.Names = append(out.Names, name+".v4."+zone)
+		}
+		if v6 {
+			out.Names = append(out.Names, name+".v6."+zone)
+		}
+		switch {
+		case len(d.Forward) > 0:
+			out.Others = "forwarded to " + strings.Join(d.Forward, ", ")
+		case d.Recurse:
+			out.Others = "resolved from the root servers"
+		}
+	case d.Source == api.DNSFromNetwork:
+		out.Note = "the network names its own nameservers, so the jails have no names of each other"
+		out.Others = "the network's own nameservers"
+	case d.Source == api.DNSFromHost:
+		out.Note = "no names: the host resolver does not give them (jailops doctor, dns.unbound)"
+		out.Others = "the host's nameservers"
+	default:
+		out.Note = "no names: the host resolver does not give them (jailops doctor, dns.unbound)"
+	}
+	return out
 }
 
 type infoSnapshots struct {
@@ -130,6 +190,13 @@ as structured data.`,
 			return nil
 		},
 	}
+}
+
+// infoPolicy is a firewall policy of a jail; Source says where it comes from when it is not the jail's own: "project"
+// for a mandatory policy of the project, "managed by app-access" for the policy app access keeps.
+type infoPolicy struct {
+	Name   string `json:"name"`
+	Source string `json:"source,omitempty"`
 }
 
 // gatherJailInfo builds the report. The jail itself is already read; the
@@ -193,6 +260,15 @@ func (a *app) gatherJailInfo(ctx context.Context, c *sdk.Client, j api.Jail) jai
 	if info.Interfaces == nil {
 		info.Interfaces = []infoInterface{}
 	}
+	if len(s.Network) > 0 {
+		if nw, err := c.Networks().Get(ctx, s.Network[0].Network); err == nil {
+			addrs := append([]string{}, st.Addresses...)
+			for _, n := range s.Network {
+				addrs = append(addrs, fixedAddr(n.IPv4), fixedAddr(n.IPv6))
+			}
+			info.DNS = jailDNS(j, nw, addrs)
+		}
+	}
 	if u, err := c.Jails().Usage(ctx, m.Name); err != nil {
 		info.Resources.UsageError = err.Error()
 	} else {
@@ -206,6 +282,18 @@ func (a *app) gatherJailInfo(ctx context.Context, c *sdk.Client, j api.Jail) jai
 		if n := len(snaps); n > 0 {
 			info.Snapshots.Newest, info.Snapshots.NewestAt = snaps[n-1].Metadata.Name, snaps[n-1].Metadata.CreatedAt
 		}
+	}
+	if pr, err := c.Projects().Get(ctx, m.Project); err == nil {
+		for _, n := range pr.Spec.FirewallPolicies {
+			info.FirewallPolicies = append(info.FirewallPolicies, infoPolicy{Name: n, Source: "project"})
+		}
+	}
+	// an app's jail has the policy that app access keeps for it
+	if p, err := c.Firewall().Policies().Get(ctx, "app-"+m.Name); err == nil && p.Metadata.ManagedBy != "" {
+		info.FirewallPolicies = append(info.FirewallPolicies, infoPolicy{Name: p.Metadata.Name, Source: "managed by " + p.Metadata.ManagedBy})
+	}
+	for _, n := range s.Firewall.Policies {
+		info.FirewallPolicies = append(info.FirewallPolicies, infoPolicy{Name: n})
 	}
 	hist, err := c.Jails().UpdateHistory(ctx, m.Name)
 	if err != nil {
@@ -257,7 +345,7 @@ func (a *app) printJailInfo(w io.Writer, info jailInfo) {
 	kv("Hostname", dash(info.Hostname))
 	state := a.paint(w, stateStyle(0), string(info.State))
 	if info.JID > 0 {
-		state += fmt.Sprintf(" (jid %d)", info.JID)
+		state += colored(fmt.Sprintf(" (jid %d)", info.JID))
 	}
 	kv("State", state)
 	kind := []string{}
@@ -299,21 +387,37 @@ func (a *app) printJailInfo(w io.Writer, info jailInfo) {
 		lim = append(lim, fmt.Sprintf("cpu %d", l.CPU))
 	}
 	if l.Memory != "" {
-		lim = append(lim, "memory "+l.Memory)
+		lim = append(lim, "memory "+sizeText(l.Memory))
 	}
 	if l.Disk != "" {
-		lim = append(lim, "disk "+l.Disk)
+		lim = append(lim, "disk "+sizeText(l.Disk))
 	}
 	if l.DiskReservation != "" {
-		lim = append(lim, "disk reservation "+l.DiskReservation)
+		lim = append(lim, "disk reservation "+sizeText(l.DiskReservation))
 	}
 	if l.PIDs > 0 {
 		lim = append(lim, fmt.Sprintf("pids %d", l.PIDs))
+	}
+	if l.States > 0 {
+		lim = append(lim, fmt.Sprintf("pf states %d per rule", l.States))
 	}
 	if len(lim) == 0 {
 		lim = []string{"none"}
 	}
 	kv("Limits", strings.Join(lim, ", "))
+	if len(info.FirewallPolicies) == 0 {
+		kv("Firewall", "open: no firewall policy (the host answers ping and DNS only)")
+	} else {
+		var ps []string
+		for _, p := range info.FirewallPolicies {
+			if p.Source != "" {
+				ps = append(ps, p.Name+" ("+p.Source+")")
+			} else {
+				ps = append(ps, p.Name)
+			}
+		}
+		kv("Firewall", strings.Join(ps, ", "))
+	}
 	switch u := info.Resources.Usage; {
 	case u == nil:
 		kv("Usage", "not available: "+info.Resources.UsageError)
@@ -341,9 +445,6 @@ func (a *app) printJailInfo(w io.Writer, info jailInfo) {
 		if v.ReadOnly {
 			mount += " (read-only)"
 		}
-		if v.Quota != "" {
-			mount += ", quota " + v.Quota
-		}
 		kv("Volume "+v.Name, mount)
 	}
 
@@ -360,7 +461,7 @@ func (a *app) printJailInfo(w io.Writer, info jailInfo) {
 		if ifc.MAC != "" {
 			mac = ifc.MAC
 		}
-		kv(ifc.Name, fmt.Sprintf("network %s, mac %s, mtu %s, %s", ifc.Network, mac, mtu, a.paint(w, stateStyle(0), ifc.State)))
+		kv(ifc.Name, colored(fmt.Sprintf("network %s, mac %s, mtu %s, %s", termText(ifc.Network, false), termText(mac, false), termText(mtu, false), a.paint(w, stateStyle(0), ifc.State))))
 		if len(ifc.Addresses) == 0 {
 			fprintln(w, "    no addresses")
 		}
@@ -370,6 +471,29 @@ func (a *app) printJailInfo(w io.Writer, info jailInfo) {
 				note = ", configured"
 			}
 			fprintf(w, "    %-42s %s %s%s\n", ad.Address, ad.Family, ad.Scope, note)
+		}
+	}
+
+	if dn := info.DNS; dn != nil {
+		section("DNS")
+		ns := strings.Join(dn.Nameservers, ", ")
+		switch dn.Source {
+		case api.DNSFromGateway:
+			ns += " (the gateway)"
+		case api.DNSFromNetwork:
+			ns += " (the network's own)"
+		case api.DNSNone:
+			ns = "none"
+		}
+		kv("Nameserver", ns)
+		if dn.Search != "" {
+			kv("Search", dn.Search)
+			kv("Names", strings.Join(dn.Names, ", "))
+		} else if dn.Note != "" {
+			kv("Names", dn.Note)
+		}
+		if dn.Others != "" {
+			kv("Other names", dn.Others)
 		}
 	}
 
@@ -401,14 +525,14 @@ func (a *app) printJailInfo(w io.Writer, info jailInfo) {
 	case u.Last == nil:
 		kv("Last", "no update yet")
 	default:
-		res := u.Last.Kind + " " + a.paint(w, updateStyle, u.Last.Result)
+		res := colored(termText(u.Last.Kind, false)) + " " + a.paint(w, updateStyle, u.Last.Result)
 		if u.Last.RootRolledBack {
 			res += " (root rolled back)"
 		}
 		if u.Last.To != "" {
-			res += ", " + dash(u.Last.From) + " -> " + u.Last.To
+			res += colored(termText(", "+dash(u.Last.From)+" -> "+u.Last.To, false))
 		}
-		res += ", " + age(now, u.Last.Started) + " ago"
+		res += colored(", " + age(now, u.Last.Started) + " ago")
 		kv("Last", res)
 	}
 

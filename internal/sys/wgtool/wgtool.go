@@ -228,6 +228,26 @@ func (t Tool) RouteAdd(ctx context.Context, iface string, p netip.Prefix) error 
 	return err
 }
 
+// DefaultGateways returns the gateways of the host's IPv4 and IPv6 default routes (route -n get), the ones there are.
+// UNVERIFIED: the "gateway:" line of route -n get on FreeBSD 15.1.
+func (t Tool) DefaultGateways(ctx context.Context) []netip.Addr {
+	var out []netip.Addr
+	for _, fam := range []string{"-inet", "-inet6"} {
+		res, err := t.R.Run(ctx, run.Cmd{Name: "route", Args: []string{"-n", "get", fam, "default"}, Timeout: timeout})
+		if err != nil {
+			continue
+		}
+		for _, ln := range strings.Split(string(res.Stdout), "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(ln), "gateway:"); ok {
+				if a, err := netip.ParseAddr(strings.TrimSpace(v)); err == nil {
+					out = append(out, a.WithZone(""))
+				}
+			}
+		}
+	}
+	return out
+}
+
 // ModuleLoaded reports whether if_wg is loaded (kldstat -q -n if_wg).
 func (t Tool) ModuleLoaded(ctx context.Context) bool {
 	_, err := t.R.Run(ctx, run.Cmd{Name: "kldstat", Args: []string{"-q", "-n", wireguard.Module}, Timeout: 10 * time.Second})

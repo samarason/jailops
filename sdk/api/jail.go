@@ -31,8 +31,10 @@ type Jail struct {
 
 // JailSpec is the desired state of a jail.
 type JailSpec struct {
-	// Image is an alias such as "freebsd-15.0@stable" or a pinned generation
-	// such as "freebsd-15.0#g3".
+	// Comment is what the object is for: one line of free text.
+	Comment string `json:"comment,omitempty"`
+	// Image is an image name such as "freebsd-15-1" (its newest generation),
+	// NAME@alias, or a pinned generation such as "freebsd-15-1#g3".
 	Image string `json:"image"`
 	// OS is the guest family. It defaults to the image's OS and is set by the
 	// server so validators and renderers can apply OS-specific rules.
@@ -49,20 +51,21 @@ type JailSpec struct {
 	Resources Resources       `json:"resources,omitempty"`
 	Network   []NetworkAttach `json:"network,omitempty"`
 	Firewall  FirewallAttach  `json:"firewall,omitempty"`
-	Volumes   []VolumeMount   `json:"volumes,omitempty"`
-	// HostMounts mount existing host directories, usually datasets of a pool JailOps does not manage (a large
-	// archive pool), into the jail with nullfs. Only a global admin may set them, the source must lie below a
-	// directory the host operator approved in the helper's configuration (admin-host-mount), and a profile cannot
-	// carry them.
-	HostMounts []HostMount `json:"host_mounts,omitempty"`
-	Boot       BootPolicy  `json:"boot,omitempty"`
+	Volumes   []VolumeAttach  `json:"volumes,omitempty"`
+	Boot      BootPolicy      `json:"boot,omitempty"`
 	// Packages is reserved: installing packages at creation is not implemented and creation with it set is refused.
 	Packages []string          `json:"packages,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`
-	// Shell is the path of the shell `jailops shell` starts inside the jail;
-	// empty means /bin/sh. It is a management setting and does not touch
-	// /etc/passwd.
+	// Shell is the path of the shell `jailops shell` and the console start inside the jail; empty means /bin/sh. It
+	// is a management setting and does not touch /etc/passwd. A new FreeBSD jail gets BashPath (bash installed at
+	// its first start) unless the request or jails.shell of jailopsd.yaml says otherwise.
 	Shell string `json:"shell,omitempty"`
+	// Prompt is the bash prompt of a FreeBSD jail: "default" (DefaultPS1 in the colour of jails.prompt_color),
+	// "short" (ShortPS1, the same without the tag), "none" (no prompt file; the variables of EnvFile stay), or a PS1
+	// text (CheckPrompt) that may hold the words {jail}, {project} and {host} (ExpandPrompt: they read the variables of
+	// EnvFile). JailOps writes it into PromptFile in the jail's /usr/local; empty leaves the jail's files alone. A new jail whose shell is bash gets jails.prompt of
+	// jailopsd.yaml.
+	Prompt string `json:"prompt,omitempty"`
 	// Provision is a short, repeatable creation step: packages, files,
 	// services and commands, run once and then marked complete in the status
 	// (design 8.5). There is no agent in the jail and no convergence.
@@ -77,10 +80,10 @@ type JailSpec struct {
 	Proxy []ProxyDevice `json:"proxy,omitempty"`
 	// Encrypted is reserved: native ZFS encryption of jails is not implemented and creation with it set is refused.
 	Encrypted bool `json:"encrypted,omitempty"`
-	// Delegate asks for the jail's data datasets to be handed to the jail (jailed=on, zfs
-	// allow). It is accepted and rendered into jail.conf (allow.mount.zfs), but the helper does not hand the
-	// datasets over yet. Only a global admin may set it, and a project is not a security boundary for a jail that
-	// has it.
+	// Delegate hands the jail one ZFS dataset of its own, <container>/delegated (jailed=on, zfs.dataset in
+	// jail.conf, allow.mount.zfs): root in the jail can create datasets, snapshots and mounts below it, outside
+	// the rules JailOps applies to the jail's data. Only a global admin may set it, the host's priv.conf must allow it
+	// (admin-zfs-delegation), and a project is not a security boundary for a jail that has it.
 	Delegate bool `json:"zfs_delegation,omitempty"`
 	// SysVIPC gives the jail System V message queues, semaphores and shared memory of its own (sysvmsg, sysvsem
 	// and sysvshm = new in jail.conf): separate from the host's and from every other jail's. Some servers
@@ -140,14 +143,19 @@ const (
 	RebootAuto   UpdateReboot = "auto"
 )
 
-// Resources limits a jail. Enforcement uses jail parameters and rctl.
+// Resources limits a jail. CPU, Memory and PIDs are enforced with rctl rules added when the jail starts (they need
+// kern.racct.enable=1), Disk and DiskReservation are ZFS properties of the jail's container dataset, and States is
+// the limit of pf states each rule of the jail's anchor may create.
 type Resources struct {
-	CPU    int    `json:"cpu,omitempty"`    // cores
-	Memory string `json:"memory,omitempty"` // "2G"
-	Disk   string `json:"disk,omitempty"`   // ZFS quota on the root and data
-	PIDs   int    `json:"pids,omitempty"`
-	// DiskReservation is an optional ZFS reservation for the jail's root.
+	CPU    int    `json:"cpu,omitempty"`    // cores: rctl pcpu, the jail is slowed down to that share
+	Memory string `json:"memory,omitempty"` // "2G": rctl swapuse, the anonymous memory the jail may reserve; an allocation beyond it fails
+	Disk   string `json:"disk,omitempty"`   // ZFS quota of the container: root, persistent datasets, volumes and snapshots
+	PIDs   int    `json:"pids,omitempty"`   // rctl maxproc: fork fails at that many processes
+	// DiskReservation is an optional ZFS reservation of the jail's container.
 	DiskReservation string `json:"disk_reservation,omitempty"`
+	// States is the maximum number of pf states each pass rule of the jail's anchor may create. 0 means the host's
+	// default (jails.max_states of jailopsd.yaml, 10000), which is itself 0 for no limit on a host that sets it so.
+	States int `json:"states,omitempty"`
 }
 
 // NetworkAttach connects a jail to a managed network. Every jail uses VNET;
@@ -157,15 +165,14 @@ type NetworkAttach struct {
 	// identified by name when profiles are merged.
 	Name    string `json:"name,omitempty"`
 	Network string `json:"network"`
-	// MTU overrides the network's MTU for this interface; zero keeps it.
+	// MTU of this interface (both ends of its epair). Zero takes the network's.
 	MTU int `json:"mtu,omitempty"`
-	// Ingress and Egress are rate limits in bits per second ("10M", "1G")
-	// for traffic into and out of the jail. UNVERIFIED: enforcement needs a
-	// shaper (dummynet pipes loaded by the root helper); until that is wired
-	// the limit is stored and reported as a condition "RateLimit" with status
-	// False, never as enforced.
+	// Egress is a rate limit in bits per second ("10M" is 10 Mbit/s, "1G" 1 Gbit/s; decimal units) for what the jail
+	// sends through this device, whoever started the connection. The host enforces it with a dummynet pipe that the
+	// jail's anchor sends the traffic into.
+	Egress string `json:"egress,omitempty"`
+	// Ingress is the same limit for what the jail receives through this device, from whoever sends it.
 	Ingress string `json:"ingress,omitempty"`
-	Egress  string `json:"egress,omitempty"`
 	// IPv4 and IPv6 are "auto" (allocate from the network's range), "none",
 	// or a fixed address. The allocation is written back to the spec so it
 	// travels with the jail.
@@ -174,31 +181,20 @@ type NetworkAttach struct {
 	MAC  string `json:"mac,omitempty"` // derived from the jail UUID when empty
 }
 
-// FirewallAttach selects the policy applied to the jail's anchor.
+// FirewallAttach selects the policies applied to the jail's anchor.
 type FirewallAttach struct {
-	Policy string   `json:"policy,omitempty"`
-	Tags   []string `json:"tags,omitempty"`
+	// Policies are the names of the jail's own policies, rendered in this order after the project's.
+	Policies []string `json:"policies,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
 }
 
-// VolumeMount is a data dataset mounted into the jail.
-type VolumeMount struct {
-	// Name is the device name and the name of the volume dataset.
-	Name     string `json:"name"`
+// VolumeAttach attaches a volume of the jail's project to the jail: the volume's dataset is mounted into the jail at
+// Mount with nullfs, read-only when ReadOnly is set. The volume is its own object (see Volume): creating, sizing,
+// owning, snapshotting and deleting it are done there, and one volume can be attached to several jails.
+type VolumeAttach struct {
+	// Name is the name of the volume (jailops volume list).
+	Name     string `json:"volume"`
 	Mount    string `json:"mount"`
-	Quota    string `json:"quota,omitempty"`
-	ReadOnly bool   `json:"read_only,omitempty"`
-	// Encrypted makes the volume a ZFS encryption root (aes-256-gcm, a passphrase typed by a person). It is set
-	// when the jail is created and never changes. The passphrase is entered after every host boot
-	// (POST /api/v1/jails/{name}/unlock); until then the jail is locked and does not start.
-	Encrypted bool `json:"encrypted,omitempty"`
-}
-
-// HostMount is an existing directory of the host mounted into the jail.
-type HostMount struct {
-	// Source is the absolute path on the host, for example the mountpoint of a dataset of another pool.
-	Source string `json:"source"`
-	// Target is the absolute path inside the jail.
-	Target   string `json:"target"`
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
@@ -221,11 +217,21 @@ type ProxyDevice struct {
 	Proto string `json:"proto,omitempty"`
 }
 
-// BootPolicy orders jails at host start.
+// DefaultStopTimeout is the stop timeout of a jail that does not set boot.stop_timeout, in seconds: the time the stop
+// commands of the jail get to shut a service down cleanly, and the jail then to exit after SIGTERM, before it is removed.
+const DefaultStopTimeout = 30
+
+// MaxStopTimeout is the largest BootPolicy.StopTimeout, in seconds.
+const MaxStopTimeout = 3600
+
+// BootPolicy orders jails at host start and stop.
 type BootPolicy struct {
 	Autostart bool     `json:"autostart,omitempty"`
 	Priority  int      `json:"priority,omitempty"`
 	Depends   []string `json:"depends,omitempty"`
+	// StopTimeout is how many seconds the jail has to shut down by itself before it is killed (jail(8) stop.timeout);
+	// zero is jail(8)'s own default of ten seconds.
+	StopTimeout int `json:"stop_timeout,omitempty"`
 }
 
 // PowerState is the observed run state of a jail.
@@ -248,6 +254,9 @@ type JailStatus struct {
 	JID int `json:"jid,omitempty"`
 	// Generation is the image generation the root currently uses.
 	Generation string `json:"generation,omitempty"`
+	// FreeBSDVersion is the FreeBSD version of that generation (ImageGeneration.FreeBSDVersion); empty when it was
+	// not recorded.
+	FreeBSDVersion string `json:"freebsd_version,omitempty"`
 	// Addresses are the addresses actually configured.
 	Addresses []string  `json:"addresses,omitempty"`
 	StartedAt time.Time `json:"started_at,omitzero"`
@@ -269,29 +278,6 @@ type JailAction struct {
 	Action  string `json:"action"` // start, stop, restart
 	Timeout int    `json:"timeout,omitempty"`
 	Force   bool   `json:"force,omitempty"`
-}
-
-// JailCreate is the body of POST /api/v1/jails: a Jail and, when a volume is encrypted, the passphrase of its
-// encrypted volumes. The passphrase is used once to create them; it is never stored, logged or returned.
-type JailCreate struct {
-	Metadata ObjectMeta `json:"metadata"`
-	Spec     JailSpec   `json:"spec"`
-	// VolumePassphrase is between MinPassphrase and MaxPassphrase bytes, without line breaks.
-	VolumePassphrase string `json:"volume_passphrase,omitempty"`
-}
-
-// JailUnlock is the body of POST /api/v1/jails/{name}/unlock (extension volume_unlock).
-type JailUnlock struct {
-	Passphrase string `json:"passphrase"`
-	// Start starts the jail once its volumes are unlocked.
-	Start bool `json:"start,omitempty"`
-}
-
-// JailPassphraseChange is the body of POST /api/v1/jails/{name}/passphrase (extension volume_unlock): the
-// passphrase of every encrypted volume of the jail changes from Old to New. The jail must be unlocked.
-type JailPassphraseChange struct {
-	Old string `json:"old_passphrase"`
-	New string `json:"new_passphrase"`
 }
 
 // Passphrase limits of encrypted volumes. ZFS itself accepts 8 to 512 bytes; JailOps asks for at least 12.

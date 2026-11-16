@@ -27,7 +27,7 @@ nothing changes. Every change keeps a copy of the files it touches first
 func (a *app) addHostManagement(hc *cobra.Command) {
 	hc.Short = "Manage this host, and the hosts a hub controls"
 	hc.Long += "\n" + hostMgmtLong
-	hc.Example = "jailops host show\njailops host identity set --hostname web1.example.org --dry-run\n" + hc.Example
+	hc.Example = "jailops host show\njailops host identity set --hostname web1.example.org --dry-run\njailops host certificate show\n" + hc.Example
 	for _, c := range hc.Commands() {
 		if c.Name() != "show" {
 			continue
@@ -45,7 +45,7 @@ func (a *app) addHostManagement(hc *cobra.Command) {
 			return a.hostShow(cmd.Context())
 		}
 	}
-	hc.AddCommand(a.hostIdentityCmd(), a.hostSnapshotsCmd(), a.hostRestoreCmd(), a.hostFirewallCmd())
+	hc.AddCommand(a.hostIdentityCmd(), a.hostSnapshotsCmd(), a.hostRestoreCmd(), a.hostFirewallCmd(), a.hostCertificateCmd())
 	hc.AddCommand(a.hostPendingCmds()...)
 }
 
@@ -170,7 +170,7 @@ drift ('host show', 'doctor'), never overwritten silently.`,
 	var ns, search, ntpServers []string
 	set := &cobra.Command{
 		Use:   "set [--hostname H] [--nameserver IP]... [--search DOMAIN]... [--ntp-server S]... [--ntp enable|disable]",
-		Short: "Change the host name, the resolvers or NTP (admin)",
+		Short: "Change the host name, the resolvers or NTP",
 		Long: `Change the parts named by the flags; the others stay as they are. --nameserver
 and --search replace the resolvers (the search list is kept when only nameservers
 are given); --ntp-server replaces the NTP servers JailOps manages, --ntp turns
@@ -297,12 +297,12 @@ last 20 are kept, in a directory of the privileged helper the daemon cannot writ
 func (a *app) hostRestoreCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "restore [SNAPSHOT]",
-		Short: "Put the host files of a snapshot back (admin)",
+		Short: "Put the host files of a snapshot back",
 		Long: `Put the files of a snapshot back as they were, byte for byte (default: the
 latest), set the host name it recorded and restart or stop ntpd to match. Any
 other change made to those files since is undone too; --dry-run shows the diff
 first. The restore keeps a copy of what it replaces, so it can be undone with
-another restore.`,
+another restore. It needs the admin role.`,
 		Example:           "jailops host restore --dry-run\njailops host restore 20261030T101500Z\njailops host restore latest -y",
 		Args:              cobra.MaximumNArgs(1),
 		ValidArgsFunction: a.completeHostSnapshots(),

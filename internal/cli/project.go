@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -20,7 +19,12 @@ func (a *app) projectDesc() *kindDesc[api.Project] {
 		func(p *api.Project) *api.ObjectMeta { return &p.Metadata },
 		func(p *api.Project) *api.ProjectSpec { return &p.Spec })
 	fromResource(&d, func(c *sdk.Client) *sdk.Resource[api.Project] { return c.Projects().Resource })
-	d.head = []string{"", "NAME", "HOSTS", "NETWORKS", "STORAGE", "JAILS", "DESCRIPTION"}
+	renameFrom(&d, func(c *sdk.Client) *sdk.Resource[api.Project] { return c.Projects().Resource })
+	d.renameLong = renameLong("project", `its policies, address sets, backup policies and profiles, its
+datasets on every storage with the mountpoints of its jails, their records and state, its firewall anchor,
+its provisioning files, the project lists of users, tokens, trust tokens and certificates, and the stored
+log sinks that select it. Every jail of the project must be stopped`)
+	d.head = []string{"", "NAME", "HOSTS", "NETWORKS", "STORAGE", "JAILS", "COMMENT"}
 	d.style = func(col int, v string) string {
 		if col == 0 && v == "*" {
 			return "32"
@@ -43,17 +47,18 @@ func (a *app) projectDesc() *kindDesc[api.Project] {
 		if q := p.Spec.Quotas.Jails; q > 0 {
 			jails += "/" + strconv.Itoa(q)
 		}
-		return []string{mark, p.Metadata.Name, joinOrDash(p.Spec.Hosts), joinOrDash(nets), joinOrDash(stor), jails, dash(p.Spec.Description)}
+		return []string{mark, p.Metadata.Name, joinOrDash(p.Spec.Hosts), joinOrDash(nets), joinOrDash(stor), jails, dash(p.Spec.Comment)}
 	}
-	d.show = func(a *app, p api.Project) error { return a.showObject(p.Metadata, nil, p.Spec, p.Status) }
+	d.show = func(a *app, p api.Project) error { return a.showProject(p) }
+	d.emptyHint = "jailops project create NAME --new-network"
 	return &d
 }
 
 // projectOpts holds the flags that describe a project; create and set share them.
 type projectOpts struct {
-	description, firewall, maxMemory    string
-	networks, storage, images, hosts    []string
-	revokeNet, revokeStor               []string
+	comment, maxMemory                  string
+	images, hosts                       []string
+	firewall                            []string
 	maxJails, maxCPU, maxPIDs, maxAddrs int
 	clearImages, newNetwork             bool
 }
@@ -61,23 +66,19 @@ type projectOpts struct {
 func projectFlags(cmd *cobra.Command, forSet bool) *projectOpts {
 	o := &projectOpts{}
 	f := cmd.Flags()
-	f.StringVar(&o.description, "description", "", "what the project is for")
-	f.StringArrayVar(&o.networks, "network", nil, "grant a network to the project (repeatable); a network belongs to one project")
-	f.StringArrayVar(&o.storage, "storage", nil, "grant a storage: NAME or NAME=QUOTA, for example fast=500G (repeatable)")
+	f.StringVar(&o.comment, "comment", "", "what the project is for")
 	f.IntVar(&o.maxJails, "max-jails", 0, "quota: number of jails (0 = unlimited)")
 	f.IntVar(&o.maxCPU, "max-cpu", 0, "quota: total CPU cores (0 = unlimited)")
 	f.StringVar(&o.maxMemory, "max-memory", "", "quota: total memory, for example 16G")
 	f.IntVar(&o.maxPIDs, "max-pids", 0, "quota: total processes (0 = unlimited)")
 	f.IntVar(&o.maxAddrs, "max-addresses", 0, "quota: total addresses (0 = unlimited)")
-	f.StringVar(&o.firewall, "firewall", "", "mandatory firewall policy rendered before every jail's own (global admins only)")
+	f.StringArrayVar(&o.firewall, "firewall-policy", nil, "mandatory firewall policy rendered before every jail's own (repeatable, in order; an empty value clears the list; global admins only)")
 	f.StringArrayVar(&o.images, "image", nil, "image allow-list entry (repeatable; empty allows every image)")
 	f.StringSliceVar(&o.hosts, "hosts", nil, "hosts a fleet project spans, comma separated (managed by a hub)")
 	if forSet {
-		f.StringArrayVar(&o.revokeNet, "revoke-network", nil, "withdraw the grant of a network (repeatable)")
-		f.StringArrayVar(&o.revokeStor, "revoke-storage", nil, "withdraw the grant of a storage (repeatable)")
 		f.BoolVar(&o.clearImages, "any-image", false, "remove the image allow-list")
 	} else {
-		f.BoolVar(&o.newNetwork, "new-network", false, "also create a dedicated bridge and subnet and grant it to the project")
+		f.BoolVar(&o.newNetwork, "new-network", false, "also create a dedicated network with a subnet and grant it to the project")
 	}
 	return o
 }
@@ -85,31 +86,8 @@ func projectFlags(cmd *cobra.Command, forSet bool) *projectOpts {
 // apply changes spec according to the flags that were given.
 func (o *projectOpts) apply(cmd *cobra.Command, spec *api.ProjectSpec) error {
 	ch := cmd.Flags().Changed
-	if ch("description") {
-		spec.Description = o.description
-	}
-	for _, name := range o.networks {
-		if strings.Contains(name, "=") {
-			return usagef("--network %q: a network is granted whole; ranges are not reserved any more", name)
-		}
-		if !slices.ContainsFunc(spec.Networks, func(x api.ProjectNetwork) bool { return x.Network == name }) {
-			spec.Networks = append(spec.Networks, api.ProjectNetwork{Network: name})
-		}
-	}
-	for _, n := range o.revokeNet {
-		spec.Networks = slices.DeleteFunc(spec.Networks, func(x api.ProjectNetwork) bool { return x.Network == n })
-	}
-	for _, s := range o.storage {
-		name, quota, _ := strings.Cut(s, "=")
-		g := api.ProjectStorage{Storage: name, Quota: quota}
-		if i := slices.IndexFunc(spec.Storage, func(x api.ProjectStorage) bool { return x.Storage == name }); i >= 0 {
-			spec.Storage[i] = g
-		} else {
-			spec.Storage = append(spec.Storage, g)
-		}
-	}
-	for _, n := range o.revokeStor {
-		spec.Storage = slices.DeleteFunc(spec.Storage, func(x api.ProjectStorage) bool { return x.Storage == n })
+	if ch("comment") {
+		spec.Comment = o.comment
 	}
 	if ch("max-jails") {
 		spec.Quotas.Jails = o.maxJails
@@ -126,8 +104,13 @@ func (o *projectOpts) apply(cmd *cobra.Command, spec *api.ProjectSpec) error {
 	if ch("max-addresses") {
 		spec.Quotas.Addresses = o.maxAddrs
 	}
-	if ch("firewall") {
-		spec.Firewall = o.firewall
+	if ch("firewall-policy") {
+		spec.FirewallPolicies = nil
+		for _, n := range o.firewall { // an empty value clears the list
+			if n != "" {
+				spec.FirewallPolicies = append(spec.FirewallPolicies, n)
+			}
+		}
 	}
 	if o.clearImages {
 		spec.Images = nil
@@ -177,21 +160,24 @@ The current project is client-side state: 'project switch' stores it per remote
 in the client configuration, so switching remotes and switching projects are
 independent and each remote remembers its last project. --project and
 JAILOPS_PROJECT override it for one command.`,
-		`jailops network create br-web --ipv4 10.50.0.1/24
+		`jailops network create web --ipv4 10.50.0.1/24
 jailops storage create fast --dataset tank/jailops
 jailops project create web
-jailops project set web --network br-web --storage fast
+jailops network grant web --project web
+jailops storage grant fast --project web --quota 500G
 jailops project switch web`, "projects")
-	crudCommands(a, pc, d, `Create a project. Networks and storage are granted, not created: use --network
-and --storage with existing ones, or --new-network to create a dedicated bridge
-and subnet from the server's pool. Only global admins create projects.`,
+	d.noSet = true // project set also grants and revokes
+	crudCommands(a, pc, d, `Create a project. Networks and storage are granted afterwards ('jailops network grant',
+'jailops storage grant'); --new-network creates a dedicated network with a subnet from the
+server's pool and grants it. Only global admins create projects.
+
+A project name has at most 13 characters. --new-network names the network after
+the project.`,
 		`jailops project create web
-jailops project create web --network br-web --storage fast=500G --max-jails 20 --max-memory 32G
+jailops project create web --max-jails 20 --max-memory 32G
 jailops project create shop --new-network --hosts freebsd01,freebsd02`,
 		func(cmd *cobra.Command) func(string) (api.Project, error) {
 			o := projectFlags(cmd, false)
-			a.completeFlag(cmd, "network", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Networks().List(ctx), netName) }))
-			a.completeFlag(cmd, "storage", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Storage().List(ctx), storName) }))
 			return func(name string) (api.Project, error) {
 				p := api.Project{Metadata: api.ObjectMeta{Name: name}}
 				return p, o.apply(cmd, &p.Spec)
@@ -234,17 +220,15 @@ func (a *app) projectSet(d *kindDesc[api.Project]) *cobra.Command {
 	var o *projectOpts
 	cmd := &cobra.Command{
 		Use:   "set NAME",
-		Short: "Change a project's grants, quotas and settings",
-		Long: `Change a project in place: grant or withdraw networks and storage, set quotas,
-the mandatory firewall policy, the image allow-list or the hosts of a fleet
-project. Only the flags you give change anything. The update carries the ETag
-of the version it read, and is retried on a conflict.
-
-A network belongs to one project: granting one that another project holds is refused.
+		Short: "Change a project's quotas and settings",
+		Long: `Change a project in place: set quotas, the mandatory firewall policies, the image
+allow-list or the hosts of a fleet project. Only the flags you give change anything.
+The update carries the ETag of the version it read, and is retried on a conflict.
+Networks and storage are granted with 'jailops network grant' and 'jailops storage grant'.
 Only global admins change projects.`,
-		Example: `jailops project set web --network br-web --storage fast
-jailops project set web --max-jails 20 --max-memory 32G
-jailops project set web --revoke-network old --hosts freebsd01,freebsd02`,
+		Example: `jailops project set web --max-jails 20 --max-memory 32G
+jailops project set web --firewall-policy default
+jailops project set web --hosts freebsd01,freebsd02`,
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: a.completeProjects(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -267,9 +251,44 @@ jailops project set web --revoke-network old --hosts freebsd01,freebsd02`,
 		},
 	}
 	o = projectFlags(cmd, true)
-	a.completeFlag(cmd, "network", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Networks().List(ctx), netName) }))
-	a.completeFlag(cmd, "storage", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Storage().List(ctx), storName) }))
+	// the policies are the ones of the project that is being changed (its name is the argument), not of the current project
+	_ = cmd.RegisterFlagCompletionFunc("firewall-policy", a.completeWith(func(ctx context.Context, c *sdk.Client, args []string) ([]string, error) {
+		if len(args) == 0 {
+			return nil, nil
+		}
+		items, err := collect(c.Project(args[0]).Firewall().Policies().List(ctx))
+		var n []string
+		for _, p := range items {
+			n = append(n, p.Metadata.Name)
+		}
+		return n, err
+	}))
 	return cmd
+}
+
+// followProjectRename makes the renamed project the current one again where the user configuration chose it.
+func (a *app) followProjectRename(from, to string) error {
+	if a.conn == nil || a.conn.Project != from {
+		return nil
+	}
+	if src := a.conn.Sources["project"]; src == "env JAILOPS_PROJECT" || src == "flag --project" {
+		fprintf(a.env.Stderr, "note: %s names the old project %s; use %s from now on\n", src, from, to)
+		return nil
+	}
+	path := a.userConfigPath()
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	if cfg.Projects[keyOf(a.conn.Name)] != from {
+		return nil
+	}
+	cfg.Projects[keyOf(a.conn.Name)] = to
+	if err := saveConfig(path, cfg); err != nil {
+		return err
+	}
+	a.say("remote %s now uses project %s\n", keyOf(a.conn.Name), to)
+	return nil
 }
 
 // projectSwitch stores the current project of the current remote.
@@ -395,11 +414,15 @@ func storageDesc() *kindDesc[api.Storage] {
 		func(p *api.Storage) *api.ObjectMeta { return &p.Metadata },
 		func(p *api.Storage) *api.StorageSpec { return &p.Spec })
 	fromResource(&d, func(c *sdk.Client) *sdk.Resource[api.Storage] { return c.Storage() })
+	renameFrom(&d, func(c *sdk.Client) *sdk.Resource[api.Storage] { return c.Storage() })
+	d.renameLong = renameLong("storage", `the projects it is granted to, the volumes and the jails on it (running ones too: nothing moves, the datasets stay where they are) and the profiles that name it. The default storage keeps its name`)
 	d.head = []string{"NAME", "DATASET", "POOL", "HEALTH", "USED", "AVAILABLE"}
 	d.row = func(_ time.Time, s api.Storage) []string {
 		return []string{s.Metadata.Name, s.Spec.Dataset, dash(s.Status.Pool), dash(s.Status.Health), humanBytes(s.Status.Used), humanBytes(s.Status.Available)}
 	}
 	d.style = stateStyle(3)
+	d.show = func(a *app, s api.Storage) error { return a.showStorage(s) }
+	d.emptyHint = "jailops storage create NAME --dataset POOL/jailops"
 	return &d
 }
 
@@ -412,93 +435,101 @@ projects, each project with its own dataset and quota. Storage is ZFS only.
 Deleting a storage never destroys data; it is refused while a project grants it
 or a jail uses it. Only global admins write storage.`,
 		"jailops storage create fast --dataset tank/jailops\njailops storage list\njailops storage show fast", "storages")
-	crudCommands(a, sc, d, "Register an existing ZFS dataset as a storage. The dataset must exist and be empty or already owned by JailOps.",
+	crudCommands(a, sc, d, "Register an existing ZFS dataset as a storage. The dataset must exist and be empty or already owned by JailOps.\nThe dataset name has at most 88 characters: the datasets of jails, volumes and snapshots are named below it, and ZFS allows 255.",
 		"jailops storage create fast --dataset tank/jailops\njailops storage create slow --dataset hdd/jailops --compression zstd",
 		func(cmd *cobra.Command) func(string) (api.Storage, error) {
 			var dataset, desc, comp string
 			cmd.Flags().StringVar(&dataset, "dataset", "", "ZFS dataset, for example tank/jailops (required without -f)")
-			cmd.Flags().StringVar(&desc, "description", "", "what the storage is for")
+			cmd.Flags().StringVar(&desc, "comment", "", "what the storage is for")
 			cmd.Flags().StringVar(&comp, "compression", "", "compression for new datasets: zstd or lz4")
 			enumFlag(cmd, "compression", "zstd", "lz4")
 			return func(name string) (api.Storage, error) {
-				if dataset == "" {
+				if dataset == "" && !a.partial {
 					return api.Storage{}, usagef("--dataset is required (or use -f FILE)")
 				}
-				return api.Storage{Metadata: api.ObjectMeta{Name: name}, Spec: api.StorageSpec{Dataset: dataset, Description: desc, Compression: comp}}, nil
+				return api.Storage{Metadata: api.ObjectMeta{Name: name}, Spec: api.StorageSpec{Dataset: dataset, Comment: desc, Compression: comp}}, nil
 			}
 		})
+	sc.AddCommand(a.storageGrantCmds(d)...)
 	return sc
 }
 
 // network additions: grants -----------------------------------------------------
 
 func (a *app) networkGrantCmds(nd *kindDesc[api.Network]) []*cobra.Command {
-	var project string
+	// project is the project to change: the global --project, JAILOPS_PROJECT or the current project.
+	project := func() (string, error) {
+		if err := a.requireProject(); err != nil {
+			return "", err
+		}
+		conn, err := a.resolveConnection()
+		if err != nil {
+			return "", err
+		}
+		return conn.CurrentProject(), nil
+	}
 	grant := &cobra.Command{
-		Use:   "grant NETWORK --project PROJECT",
+		Use:   "grant NETWORK",
 		Short: "Grant a network to a project",
-		Long: `Grant a network to a project. A network belongs to one project: it is used whole by
-that project and is never shared, so the server refuses to grant a network that another
+		Long: `Grant a network to a project: --project, JAILOPS_PROJECT or the current project
+('project switch'). A network belongs to one project: it is used whole by that
+project and is never shared, so the server refuses to grant a network that another
 project already holds. Only global admins change projects.`,
-		Example:           "jailops network grant br-web --project web",
+		Example:           "jailops network grant web --project web\njailops network grant web",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completeKind(a, nd),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if project == "" {
-				return usagef("--project is required")
+			p, err := project()
+			if err != nil {
+				return err
 			}
-			if ok, err := a.dry("grant network "+args[0]+" to project "+project, nil); ok || err != nil {
+			if ok, err := a.dry("grant network "+args[0]+" to project "+p, nil); ok || err != nil {
 				return err
 			}
 			c, err := a.connect(cmd.Context())
 			if err != nil {
 				return err
 			}
-			err = sdk.Modify(cmd.Context(), c.Projects(), project, func(p *api.Project) {
-				if !slices.ContainsFunc(p.Spec.Networks, func(x api.ProjectNetwork) bool { return x.Network == args[0] }) {
-					p.Spec.Networks = append(p.Spec.Networks, api.ProjectNetwork{Network: args[0]})
+			err = sdk.Modify(cmd.Context(), c.Projects(), p, func(pr *api.Project) {
+				if !slices.ContainsFunc(pr.Spec.Networks, func(x api.ProjectNetwork) bool { return x.Network == args[0] }) {
+					pr.Spec.Networks = append(pr.Spec.Networks, api.ProjectNetwork{Network: args[0]})
 				}
 			})
 			if err != nil {
 				return err
 			}
-			return a.finishOp(cmd.Context(), nil, "network", args[0], "granted to project "+project, nil)
+			return a.finishOp(cmd.Context(), nil, "network", args[0], "granted to project "+p, nil)
 		},
 	}
-	grant.Flags().StringVar(&project, "project", "", "the project to grant to (required)")
-	a.completeFlag(grant, "project", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Projects().List(ctx), projName) }))
-
-	var rproject string
 	revoke := &cobra.Command{
-		Use:               "revoke NETWORK --project PROJECT",
-		Short:             "Withdraw a network grant from a project",
-		Long:              "Withdraw the grant of a network from a project. The server refuses while a jail of the project still uses the network.",
-		Example:           "jailops network revoke br-web --project web",
+		Use:   "revoke NETWORK",
+		Short: "Withdraw a network grant from a project",
+		Long: `Withdraw the grant of a network from a project: --project, JAILOPS_PROJECT or the
+current project. The server refuses while a jail of the project still uses the network.`,
+		Example:           "jailops network revoke web --project web",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completeKind(a, nd),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if rproject == "" {
-				return usagef("--project is required")
+			p, err := project()
+			if err != nil {
+				return err
 			}
-			if ok, err := a.dry("revoke network "+args[0]+" from project "+rproject, nil); ok || err != nil {
+			if ok, err := a.dry("revoke network "+args[0]+" from project "+p, nil); ok || err != nil {
 				return err
 			}
 			c, err := a.connect(cmd.Context())
 			if err != nil {
 				return err
 			}
-			err = sdk.Modify(cmd.Context(), c.Projects(), rproject, func(p *api.Project) {
-				p.Spec.Networks = slices.DeleteFunc(p.Spec.Networks, func(x api.ProjectNetwork) bool { return x.Network == args[0] })
+			err = sdk.Modify(cmd.Context(), c.Projects(), p, func(pr *api.Project) {
+				pr.Spec.Networks = slices.DeleteFunc(pr.Spec.Networks, func(x api.ProjectNetwork) bool { return x.Network == args[0] })
 			})
 			if err != nil {
 				return err
 			}
-			return a.finishOp(cmd.Context(), nil, "network", args[0], "revoked from project "+rproject, nil)
+			return a.finishOp(cmd.Context(), nil, "network", args[0], "revoked from project "+p, nil)
 		},
 	}
-	revoke.Flags().StringVar(&rproject, "project", "", "the project to withdraw from (required)")
-	a.completeFlag(revoke, "project", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Projects().List(ctx), projName) }))
-
 	return []*cobra.Command{grant, revoke}
 }
 
@@ -536,10 +567,10 @@ func lastAddr(p netip.Prefix) netip.Addr {
 func cidr6Network(s string) (*api.IPv6Net, error) {
 	p, err := netip.ParsePrefix(s)
 	if err != nil || !p.Addr().Is6() || p.Bits() > 120 {
-		return nil, usagef("--ipv6 %q must look like fd50::1/64", s)
+		return nil, usagef("--ipv6 %q must look like fd50::/64", s)
 	}
-	gw := p.Addr()
-	lo := gw.Next()
+	p = p.Masked()
+	lo := p.Addr().Next()
 	hi := lo
 	for i := 0; i < 0xfffe; i++ {
 		nx := hi.Next()
@@ -548,11 +579,11 @@ func cidr6Network(s string) (*api.IPv6Net, error) {
 		}
 		hi = nx
 	}
-	return &api.IPv6Net{Mode: api.IPv6Routed, Subnet: p.Masked().String(), Gateway: gw.String(), Range: lo.String() + "-" + hi.String()}, nil
+	return &api.IPv6Net{Mode: api.IPv6Routed, Subnet: p.String(), Range: lo.String() + "-" + hi.String()}, nil
 }
 
-// cidr6Proxy describes a proxy-mode IPv6 network from the prefix the provider put on the shared segment: the gateway is
-// the link-local fe80::1 and the range starts a few addresses in, so the low addresses stay free for the operator.
+// cidr6Proxy describes a proxy-mode IPv6 network from the prefix the provider put on the shared segment: the range
+// starts a few addresses in, so the low addresses stay free for the operator.
 func cidr6Proxy(s string) (*api.IPv6Net, error) {
 	p, err := netip.ParsePrefix(s)
 	if err != nil || !p.Addr().Is6() || p.Bits() > 126 {
@@ -573,5 +604,92 @@ func cidr6Proxy(s string) (*api.IPv6Net, error) {
 		}
 		hi = nx
 	}
-	return &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: p.String(), Gateway: "fe80::1", Range: lo.String() + "-" + hi.String()}, nil
+	return &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: p.String(), Range: lo.String() + "-" + hi.String()}, nil
+}
+
+// storage additions: grants -----------------------------------------------------
+
+func (a *app) storageGrantCmds(sd *kindDesc[api.Storage]) []*cobra.Command {
+	project := func() (string, error) {
+		if err := a.requireProject(); err != nil {
+			return "", err
+		}
+		conn, err := a.resolveConnection()
+		if err != nil {
+			return "", err
+		}
+		return conn.CurrentProject(), nil
+	}
+	var quota string
+	grant := &cobra.Command{
+		Use:   "grant STORAGE",
+		Short: "Grant a storage to a project",
+		Long: `Grant a storage to a project: --project, JAILOPS_PROJECT or the current project
+('project switch'). The project gets its own datasets below the storage; --quota limits
+the space they may use (for example 500G; without it the project is not limited).
+Granting again changes the quota. Only global admins change projects.`,
+		Example:           "jailops storage grant fast --project web\njailops storage grant fast --project web --quota 500G",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeKind(a, sd),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			p, err := project()
+			if err != nil {
+				return err
+			}
+			if ok, err := a.dry("grant storage "+args[0]+" to project "+p, nil); ok || err != nil {
+				return err
+			}
+			c, err := a.connect(cmd.Context())
+			if err != nil {
+				return err
+			}
+			err = sdk.Modify(cmd.Context(), c.Projects(), p, func(pr *api.Project) {
+				g := api.ProjectStorage{Storage: args[0], Quota: quota}
+				if i := slices.IndexFunc(pr.Spec.Storage, func(x api.ProjectStorage) bool { return x.Storage == args[0] }); i >= 0 {
+					if !cmd.Flags().Changed("quota") {
+						g.Quota = pr.Spec.Storage[i].Quota
+					}
+					pr.Spec.Storage[i] = g
+				} else {
+					pr.Spec.Storage = append(pr.Spec.Storage, g)
+				}
+			})
+			if err != nil {
+				return err
+			}
+			return a.finishOp(cmd.Context(), nil, "storage", args[0], "granted to project "+p, nil)
+		},
+	}
+	grant.Flags().StringVar(&quota, "quota", "", "space the project may use of the storage, for example 500G (default: no limit)")
+	_ = grant.RegisterFlagCompletionFunc("quota", completeNone)
+	revoke := &cobra.Command{
+		Use:   "revoke STORAGE",
+		Short: "Withdraw a storage grant from a project",
+		Long: `Withdraw the grant of a storage from a project: --project, JAILOPS_PROJECT or the
+current project. The server refuses while a jail or a volume of the project still lives on the storage.`,
+		Example:           "jailops storage revoke fast --project web",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeKind(a, sd),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			p, err := project()
+			if err != nil {
+				return err
+			}
+			if ok, err := a.dry("revoke storage "+args[0]+" from project "+p, nil); ok || err != nil {
+				return err
+			}
+			c, err := a.connect(cmd.Context())
+			if err != nil {
+				return err
+			}
+			err = sdk.Modify(cmd.Context(), c.Projects(), p, func(pr *api.Project) {
+				pr.Spec.Storage = slices.DeleteFunc(pr.Spec.Storage, func(x api.ProjectStorage) bool { return x.Storage == args[0] })
+			})
+			if err != nil {
+				return err
+			}
+			return a.finishOp(cmd.Context(), nil, "storage", args[0], "revoked from project "+p, nil)
+		},
+	}
+	return []*cobra.Command{grant, revoke}
 }

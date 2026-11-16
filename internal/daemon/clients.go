@@ -37,6 +37,8 @@ type Clients struct {
 	// Dial connects from the host to a jail (the health checks of an app
 	// installation); nil uses the network.
 	Dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// HostFile reads a world-readable file of the host as the daemon (nil: the file system; tests: the simulated host).
+	HostFile func(path string) ([]byte, error)
 	// Host is the helper (nil in tests); the NDP proxy opens BPF through it.
 	Host priv.Host
 	// HostSystem changes the host itself (host management; the helper in production, nil: unsupported).

@@ -42,6 +42,7 @@ const (
 	CodeNotManaged      Code = "not_managed"      // a host management module is not enabled (HTTP 403); the hint names the lines to add
 	CodeLocked          Code = "locked"           // an encrypted volume waits for its passphrase (HTTP 409); unlock the jail first
 	CodeBadPassphrase   Code = "bad_passphrase"   // the passphrase of an encrypted volume is wrong (HTTP 403); nothing else is said
+	CodeStopForced      Code = "stop_forced"      // a stop that did not finish within its budget was forced: the jail is gone (a warning to the daemon, not an error)
 )
 
 // Error is the error body of the API and the error type of the SDK.

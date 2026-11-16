@@ -74,9 +74,36 @@ type Config struct {
 	// from the jail's spec). Nil, or an unknown key, means the storage
 	// described by Root and MountBase.
 	Locate func(key string) (Storage, bool)
+	// Attached says which volumes of the project are attached to a jail (the service knows it from the jail's spec
+	// and from the volumes). Nil means none. An error is a volume that is attached and cannot be found: the jail does
+	// not start without it.
+	Attached func(key string) ([]Attached, error)
 	// Storages lists every storage to search when jails are discovered. Nil
 	// means the one storage described by Root and MountBase.
 	Storages func() []Storage
+}
+
+// Attached is a volume attached to a jail: the volume's dataset and where the host mounts it, where the jail sees it,
+// and whether it is read-only and encrypted.
+type Attached struct {
+	Dataset    string
+	Mountpoint string
+	Path       string
+	ReadOnly   bool
+	Encrypted  bool
+	// HostDir marks a volume that is a directory of the host: there is no dataset, Mountpoint is the directory, and the
+	// jail does not start while the directory is not on a mount (with WriteProbe: and takes a file).
+	HostDir    bool
+	WriteProbe bool
+	// Name is the name of the volume.
+	Name string
+}
+
+func (c Config) attached(key string) ([]Attached, error) {
+	if c.Attached == nil {
+		return nil, nil
+	}
+	return c.Attached(key)
 }
 
 func (c Config) persistent() []PersistentPath {
@@ -144,6 +171,9 @@ func (c Config) ContainerDS(key string) string { return c.at(key).containerDS() 
 // RootDS is the root dataset of a jail.
 func (c Config) RootDS(key string) string { return c.at(key).rootDS() }
 
+// DelegatedDS is the dataset a jail with zfs_delegation manages itself: a child of its container.
+func (c Config) DelegatedDS(key string) string { return c.at(key).delegatedDS() }
+
 // ContainerMP is where the container dataset of a jail is mounted.
 func (c Config) ContainerMP(key string) string { return c.at(key).containerMP() }
 
@@ -152,6 +182,19 @@ func (c Config) RootMP(key string) string { return c.at(key).rootMP() }
 
 // ProjectDS is the dataset of a project on a storage.
 func ProjectDS(st Storage, project string) string { return path.Join(st.Root, "projects", project) }
+
+// ProjectVolumesDS is the parent of the volume datasets of a project.
+func ProjectVolumesDS(st Storage, project string) string {
+	return path.Join(st.Root, "projects", project, "volumes")
+}
+
+// VolumeDS is the dataset of the volume name of a project on a storage, and VolumeMP where the host mounts it.
+func VolumeDS(st Storage, project, name string) string {
+	return path.Join(ProjectVolumesDS(st, project), name)
+}
+func VolumeMP(st Storage, project, name string) string {
+	return path.Join(st.MountBase, "projects", project, "volumes", name)
+}
 
 // ProjectJailsDS is the parent of the container datasets of a project.
 func ProjectJailsDS(st Storage, project string) string {
@@ -163,14 +206,13 @@ type jpaths struct {
 	project, name string
 }
 
-func (p jpaths) jailsDS() string          { return ProjectJailsDS(p.st, p.project) }
-func (p jpaths) containerDS() string      { return path.Join(p.jailsDS(), p.name) }
-func (p jpaths) rootDS() string           { return p.containerDS() + "/root" }
-func (p jpaths) rootNewDS() string        { return p.containerDS() + "/root.new" }
-func (p jpaths) rootOldDS() string        { return p.containerDS() + "/root.old" }
-func (p jpaths) rootStaleDS() string      { return p.containerDS() + "/root.stale" }
-func (p jpaths) volumesDS() string        { return p.containerDS() + "/data" }
-func (p jpaths) volumeDS(v string) string { return p.containerDS() + "/data/" + v }
+func (p jpaths) jailsDS() string     { return ProjectJailsDS(p.st, p.project) }
+func (p jpaths) containerDS() string { return path.Join(p.jailsDS(), p.name) }
+func (p jpaths) rootDS() string      { return p.containerDS() + "/root" }
+func (p jpaths) rootNewDS() string   { return p.containerDS() + "/root.new" }
+func (p jpaths) rootOldDS() string   { return p.containerDS() + "/root.old" }
+func (p jpaths) rootStaleDS() string { return p.containerDS() + "/root.stale" }
+func (p jpaths) delegatedDS() string { return p.containerDS() + "/delegated" }
 func (p jpaths) containerMP() string {
 	return path.Join(p.st.MountBase, "projects", p.project, "jails", p.name)
 }
@@ -179,3 +221,10 @@ func (p jpaths) rootNewMP() string  { return p.containerMP() + "/root.new" }
 func (p jpaths) rootOldMP() string  { return p.containerMP() + "/root.old" }
 func (p jpaths) specPath() string   { return p.containerMP() + "/spec.json" }
 func (p jpaths) bundlePath() string { return p.containerMP() + "/bundle.json" }
+
+// ContainerOn is the container dataset of the jail name of project on st, and where it is mounted: what a rename
+// moves a container to.
+func ContainerOn(st Storage, project, name string) (ds, mountpoint string) {
+	p := jpaths{st: st, project: project, name: name}
+	return p.containerDS(), p.containerMP()
+}

@@ -3,7 +3,6 @@ kind: Network
 metadata:
   name: lan
 spec:
-  bridge: jo10
   # The VM's uplink: `route -n get default | grep interface`.
   uplink: vtnet0
   ipv4: {subnet: 10.10.0.0/24, gateway: 10.10.0.1, range: 10.10.0.10-10.10.0.250, nat: true}

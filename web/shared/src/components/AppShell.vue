@@ -8,6 +8,7 @@ import { theme, cycleTheme } from '../composables/theme'
 import Icon from './Icon.vue'
 import BrandMark from './BrandMark.vue'
 import ToastHost from './ToastHost.vue'
+import ConfirmHost from './ConfirmHost.vue'
 import type { IconName } from '../lib/icons'
 
 export interface NavItem { to: string; label: string; icon: IconName }
@@ -28,6 +29,11 @@ watch(() => session.authed, (a) => {
   }
 }, { immediate: true })
 watch(() => route.fullPath, () => (menuOpen.value = false))
+// Escape closes the drawer and gives the focus back to the menu button
+function closeMenu(): void {
+  menuOpen.value = false
+  ;(document.querySelector('.menu-btn') as HTMLElement | null)?.focus()
+}
 
 async function out(): Promise<void> {
   await logout()
@@ -44,10 +50,15 @@ async function out(): Promise<void> {
       <button class="btn btn-ghost btn-icon menu-btn" type="button" :aria-label="s.app.menu" :aria-expanded="menuOpen" aria-controls="sidebar" @click="menuOpen = !menuOpen"><Icon name="menu" /></button>
       <span class="brand"><BrandMark />{{ brand }}<span v-if="subtitle" class="faint sub"> {{ subtitle }}</span></span>
       <span class="grow"></span>
+      <slot name="search" where="top" />
       <span class="host mono faint">{{ session.info?.hostname }}</span>
     </header>
-    <nav id="sidebar" class="sidebar" :aria-label="s.app.mainNav">
-      <div class="brand brand-side"><BrandMark :size="26" />{{ brand }}<span v-if="subtitle" class="faint sub"> {{ subtitle }}</span></div>
+    <nav id="sidebar" class="sidebar" :aria-label="s.app.mainNav" @keydown.esc="menuOpen && closeMenu()">
+      <div class="brand brand-side"><BrandMark :size="26" />{{ brand }}<span v-if="subtitle" class="faint sub"> {{ subtitle }}</span>
+        <button class="btn btn-ghost btn-icon drawer-close" type="button" :aria-label="s.app.closeMenu" data-test="drawer-close" @click="closeMenu"><Icon name="x" /></button>
+      </div>
+      <!-- an app's search: once in the side bar and once in the phone's top bar -->
+      <div v-if="$slots.search" class="side-search"><slot name="search" where="side" /></div>
       <router-link v-for="i in items" :key="i.to" :to="i.to" class="navlink" exact-active-class="active" :active-class="i.to === '/' ? '' : 'active'">
         <Icon :name="i.icon" />{{ i.label }}
       </router-link>
@@ -70,6 +81,7 @@ async function out(): Promise<void> {
     </main>
   </div>
   <ToastHost />
+  <ConfirmHost />
 </template>
 
 <style>
@@ -78,13 +90,17 @@ async function out(): Promise<void> {
 .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 12px 8px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
 .brand { font-weight: 600; letter-spacing: 0.02em; }
 .brand-side { padding: 4px 10px 12px; font-size: 16px; color: var(--accent); }
+.drawer-close { display: none; margin-left: auto; color: var(--text-2); }
 .brand .sub { font-size: 12px; font-weight: 400; color: var(--text-3); margin-left: 6px; }
-.navlink { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: var(--radius); color: var(--text-2); text-decoration: none; min-height: 32px; }
+@media (max-width: 480px) { .topbar .sub { display: none; } }
+.navlink { display: flex; align-items: center; gap: 10px; padding: 4px 10px; border-radius: var(--radius); color: var(--text-2); text-decoration: none; min-height: 30px; flex: none; }
 .navlink:hover { background: var(--surface-2); color: var(--text); }
 .navlink.active { background: var(--accent-soft); color: var(--text); font-weight: 600; }
 .navlink.active .icon { color: var(--accent); }
-.side-foot { margin-top: auto; display: grid; gap: 8px; padding: 12px 4px 0; }
+/* the theme switch and sign out stay in view on a short screen: the footer sticks to the bottom of the scrolling bar */
+.side-foot { margin-top: auto; display: grid; gap: 6px; padding: 10px 4px 0; position: sticky; bottom: -12px; padding-bottom: 12px; background: var(--surface); border-top: 1px solid var(--border); }
 .link-state { font-size: 12px; }
+.side-search { padding: 0 2px 8px; }
 .main { padding: 16px 20px 80px; min-width: 0; max-width: 1400px; width: 100%; }
 .main:focus { outline: none; }
 .demo-banner { margin-bottom: 12px; }
@@ -97,6 +113,8 @@ async function out(): Promise<void> {
   .host { font-size: 12px; overflow: hidden; text-overflow: ellipsis; max-width: 45vw; }
   .sidebar { position: fixed; z-index: 40; left: 0; top: 0; width: min(280px, 85vw); transform: translateX(-100%); transition: transform var(--dur); visibility: hidden; }
   .menu-open .sidebar { transform: none; visibility: visible; }
+  .drawer-close { display: inline-flex; }
+  .brand-side { display: flex; }
   .menu-open .scrim { display: block; position: fixed; inset: 0; background: rgb(0 0 0 / 0.4); z-index: 30; }
   .main { padding: 12px var(--gutter) 96px; }
 }

@@ -1,14 +1,11 @@
 package auth
 
 import (
-	"regexp"
 	"slices"
 	"strings"
 
 	"jailops.net/jailops/sdk/api"
 )
-
-var projectNameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 
 // Scope is the project scope of an identity. An empty Projects list with
 // Global false means no access at all, never "everything".
@@ -31,7 +28,7 @@ func (s Scope) Normalize() (Scope, error) {
 	var out []string
 	for _, p := range s.Projects {
 		p = strings.TrimSpace(p)
-		if !projectNameRE.MatchString(p) {
+		if !api.IsName(p, api.MaxName) {
 			return Scope{}, api.Errorf(api.CodeInvalid, "invalid project name %q", p)
 		}
 		out = append(out, p)

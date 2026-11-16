@@ -101,7 +101,7 @@ func TestApplianceInit(t *testing.T) {
 		}
 		all := strings.Join(r.cmds, "\n")
 		for _, want := range []string{"zfs list -H -o name /", "zfs get -H -r -s local -o name,value -t filesystem jailops:managed zroot",
-			"zfs create -o mountpoint=/jailops -o jailops:managed=on zroot/jailops"} {
+			"zfs create -o mountpoint=/usr/local/jailops -o jailops:managed=on zroot/jailops"} {
 			if !strings.Contains(all, want) {
 				t.Errorf("missing %q in\n%s", want, all)
 			}
@@ -150,6 +150,17 @@ func TestApplianceInit(t *testing.T) {
 		var out bytes.Buffer
 		if err := a.do(&out); err != nil {
 			t.Fatal(err)
+		}
+	})
+	t.Run("a pool with a leading dash", func(t *testing.T) {
+		r := &recorder{exist: map[string]bool{}, flag: map[string]string{}}
+		a, _, _ := setup(t, r, "-n")
+		if err := a.do(&bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "not a pool name") || len(r.cmds) != 0 {
+			t.Fatalf("%v %v", err, r.cmds)
+		}
+		o := initOptions{pool: "-dtank", mount: "/usr/local/jailops"}
+		if err := o.validate(); err == nil {
+			t.Error("init accepted a pool with a leading dash")
 		}
 	})
 	t.Run("no zfs root", func(t *testing.T) {
@@ -256,5 +267,47 @@ func TestSetupTokenCommand(t *testing.T) {
 	}
 	if got := setupTokenText(api.SetupToken{Token: "T", ExpiresAt: exp, Hint: "set jailopsd_web=YES"}); !strings.Contains(got, "The web console is off: set jailopsd_web=YES") {
 		t.Error(got)
+	}
+}
+
+// The banner goes to root's terminal and to the system console, and everything in it comes from the daemon: an escape
+// sequence, a bidirectional control or another control character never reaches them, a token of another shape is
+// refused, and an address that is not https://HOST:PORT/ is left out.
+func TestSetupTokenBannerIsCleaned(t *testing.T) {
+	exp := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	good := "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRST"
+	text := setupTokenText(api.SetupToken{Token: good, ExpiresAt: exp, URLs: []string{
+		"https://web1.example.com:39110/",
+		"https://evil.example.com/\x1b]0;owned\x07",
+		"http://web1.example.com:39110/",
+		"https://web1.example.com:39110/‮gnp.exe",
+		"javascript:alert(1)",
+	}})
+	if !strings.Contains(text, "Open the console:  https://web1.example.com:39110/\n") || !strings.Contains(text, "4 address(es) of the daemon were not shown") {
+		t.Errorf("%q", text)
+	}
+	hint := setupTokenText(api.SetupToken{Token: good, ExpiresAt: exp, Hint: "set jailopsd_web=YES\x1b[2J\x1b]52;c;aGk=\x07\r\nfake line‮\x9b" + strings.Repeat("x", 300)})
+	for _, bad := range []string{"\x1b", "\x07", "\r", "‮", "\x9b", "\nfake line"} {
+		if strings.Contains(hint, bad) {
+			t.Errorf("the banner holds %q: %q", bad, hint)
+		}
+	}
+	if !strings.Contains(hint, "set jailopsd_web=YES�[2J") || strings.Contains(hint, strings.Repeat("x", 201)) {
+		t.Errorf("%q", hint)
+	}
+	for _, tok := range []string{"", "abc", good + "A", strings.ToLower(good), good[:51] + "\x1b", good[:51] + "1"} {
+		if strings.Contains(setupTokenText(api.SetupToken{Token: tok, ExpiresAt: exp}), "Setup token:       "+tok+"\n") && tok != "" {
+			t.Errorf("token %q was shown", tok)
+		}
+	}
+	// the command refuses a malformed token from the daemon and prints nothing of it
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "d.sock")
+	defer fakeDaemon(t, sock, 200, api.SetupToken{Token: "\x1b]0;owned\x07", ExpiresAt: exp})()
+	var out, errb bytes.Buffer
+	clock := func() time.Time { return exp }
+	if code := setupToken(context.Background(), setupTokenEnv{socket: sock, now: clock, sleep: func(time.Duration) {}}, &out, &errb); code != 1 ||
+		out.Len() != 0 || !strings.Contains(errb.String(), "malformed setup token") {
+		t.Errorf("%d %q %q", code, out.String(), errb.String())
 	}
 }

@@ -54,8 +54,11 @@ type App struct {
 	Setup [][]string `json:"setup,omitempty" yaml:"setup"`
 	// SysVIPC asks for System V IPC in the jail (JailSpec.SysVIPC): the server needs
 	// shared memory, semaphores or message queues, which a jail has none of by default.
-	SysVIPC bool       `json:"sysvipc,omitempty" yaml:"sysvipc"`
-	Health  *AppHealth `json:"health,omitempty" yaml:"health"`
+	SysVIPC bool `json:"sysvipc,omitempty" yaml:"sysvipc"`
+	// StopTimeout is the shutdown budget the app recommends, in seconds: a database that needs a minute to close says
+	// 60. It becomes boot.stop_timeout of the jail (1 to MaxStopTimeout); empty leaves the default of JailOps.
+	StopTimeout int        `json:"stop_timeout,omitempty" yaml:"stop_timeout"`
+	Health      *AppHealth `json:"health,omitempty" yaml:"health"`
 	// Resources are hints for the jail's limits, not limits.
 	Resources AppResources `json:"resources,omitempty" yaml:"resources"`
 	// Notes is shown after the installation.
@@ -221,9 +224,9 @@ type AppInstall struct {
 	// is granted exactly one of a kind it is the default.
 	Network string `json:"network,omitempty"`
 	Storage string `json:"storage,omitempty"`
-	// Image is the image reference (default: the only FreeBSD image with the
-	// alias stable, as NAME@stable); its release must be at least the
-	// definition's release_min.
+	// Image is the image reference (default: the FreeBSD image of the highest
+	// release the host runs, by its bare name); its release must be at least
+	// the definition's release_min.
 	Image string `json:"image,omitempty"`
 	// Limits replaces the definition's resource hints as the jail's limits.
 	Limits *Resources `json:"limits,omitempty"`

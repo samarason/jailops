@@ -39,7 +39,7 @@ describe('sink form', () => {
   })
 
   it('round-trips a sink through the form, leaving out what does not apply', () => {
-    const k: LogSink = { name: 'alerts', type: 'webhook', to: 'https://hooks.example.com/l', token_file: '/usr/local/etc/jailops/hook.token', queue: 2000,
+    const k: LogSink = { name: 'alerts', type: 'webhook', to: 'https://hooks.example.com/l', token_file: '/usr/local/etc/jailops/sinks/hook.token', queue: 2000,
       sources: { projects: ['web'], labels: { role: 'web' }, exclude_jails: ['build'], exclude_labels: { tier: 'test' }, files: ['messages', 'auth.log'], no_app_logs: true, audit: true } }
     expect(sinkBody(formOf(k))).toEqual(k)
     const syslog = sinkBody(form({ name: 'a', to: 'udp://192.0.2.5', tokenFile: '/x', caFile: '/y', facility: 'local0', jailLogs: false, audit: true }))

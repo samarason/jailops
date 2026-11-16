@@ -1,0 +1,121 @@
+$ jailops boot
+! No jail starts at boot. Give one autostart: jailops config set JAIL boot.autostart true
+
+$ jailops create db --image freebsd-15@stable --storage default --network lan
+jail/db created
+
+$ jailops create web --image freebsd-15@stable --storage default --network lan --autostart --depends db --boot-priority 2
+jail/web created
+
+$ jailops create cache --image freebsd-15@stable --storage default --network lan --autostart
+jail/cache created
+
+$ jailops create ghost-user --image freebsd-15@stable --storage default --network lan --autostart --depends db
+jail/ghost-user created
+
+$ jailops volume create secrets --encrypted --passphrase-file <dir>/vault.pass
+volume/secrets created
+
+$ jailops create vault --image freebsd-15@stable --storage default --network lan --autostart
+jail/vault created
+
+$ jailops volume attach vault secrets /srv/db
+volume/secrets attached to jail vault
+
+$ jailops create report --image freebsd-15@stable --storage default --network lan --autostart --depends vault
+jail/report created
+
+$ jailops boot
+#   JAIL         PRIORITY   WHY
+1   cache        0          autostart
+2   db           0          dependency of ghost-user
+3   ghost-user   0          autostart, after db
+4   web          2          autostart, after db
+
+NOT STARTED   WHY
+vault         waits for the passphrase of an encrypted volume (jailops volume unlock VOLUME), then starts
+report        depends on vault, which waits for its passphrase
+
+$ jailops boot -o json
+{
+  "order": [
+    {
+      "position": 1,
+      "project": "main",
+      "jail": "cache",
+      "priority": 0,
+      "reason": "autostart"
+    },
+    {
+      "position": 2,
+      "project": "main",
+      "jail": "db",
+      "priority": 0,
+      "reason": "dependency of ghost-user"
+    },
+    {
+      "position": 3,
+      "project": "main",
+      "jail": "ghost-user",
+      "priority": 0,
+      "depends": [
+        "db"
+      ],
+      "reason": "autostart"
+    },
+    {
+      "position": 4,
+      "project": "main",
+      "jail": "web",
+      "priority": 2,
+      "depends": [
+        "db"
+      ],
+      "reason": "autostart"
+    }
+  ],
+  "not_started": [
+    {
+      "project": "main",
+      "jail": "vault",
+      "reason": "waits for the passphrase of an encrypted volume (jailops volume unlock VOLUME), then starts"
+    },
+    {
+      "project": "main",
+      "jail": "report",
+      "reason": "depends on vault, which waits for its passphrase"
+    }
+  ]
+}
+
+$ jailops boot -o name
+cache
+db
+ghost-user
+web
+
+$ jailops boot -o csv
+! usage: -o csv is not available for this command
+! hint: run 'jailops boot --help' for usage
+[exit 2]
+
+$ jailops list -c name,state,autostart
+NAME         STATE     AUTOSTART
+cache        stopped   yes
+db           stopped   -
+ghost-user   stopped   yes
+report       stopped   yes
+vault        stopped   yes
+web          stopped   yes
+
+$ jailops boot --project main
+#   JAIL         PRIORITY   WHY
+1   cache        0          autostart
+2   db           0          dependency of ghost-user
+3   ghost-user   0          autostart, after db
+4   web          2          autostart, after db
+
+NOT STARTED   WHY
+vault         waits for the passphrase of an encrypted volume (jailops volume unlock VOLUME), then starts
+report        depends on vault, which waits for its passphrase
+

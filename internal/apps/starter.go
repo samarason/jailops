@@ -69,7 +69,7 @@ func Starter(o StarterOptions) (Draft, error) {
 	if len(o.Services) > 0 {
 		base = o.Services[0]
 	}
-	if !shortRE.MatchString(base) {
+	if !api.IsName(base, 32) {
 		base = "main"
 	}
 	for i, spec := range o.Ports {

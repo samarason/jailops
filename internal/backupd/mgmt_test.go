@@ -3,6 +3,7 @@ package backupd_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -149,6 +150,15 @@ func TestManagementAPI(t *testing.T) {
 	check(ops, "POST", "/api/v1/hosts", backupd.HostBody{Name: "x", Fingerprint: strings.Repeat("a", 64)}, 403)
 	check(rootW, "GET", "/api/v1/audit", nil, 200)
 	check(rootW, "GET", "/api/v1/users", nil, 200)
+	// the remedies for a wrong chunk or escrow blob of a host of the key domain: backup-admin, audited
+	cid := r.Fix.NewChunk(t).ID.String()
+	check(eye, "POST", "/api/v1/quarantine/"+cid, nil, 403)
+	check(eye, "DELETE", "/api/v1/escrow/0123456789abcdef", nil, 403)
+	check(eye, "GET", "/api/v1/escrow", nil, 200)
+	check(ops, "POST", "/api/v1/quarantine/"+cid, nil, 200)
+	check(ops, "POST", "/api/v1/quarantine/nonsense", nil, 400)
+	check(ops, "DELETE", "/api/v1/escrow/0123456789abcdef", nil, 404)
+	check(ops, "DELETE", "/api/v1/escrow/nonsense", nil, 400)
 	// a response never carries a password hash
 	if _, _, b := rootW.do("GET", "/api/v1/users", nil); strings.Contains(b, "argon2") || strings.Contains(b, "password_hash") {
 		t.Fatalf("the user list leaks hashes: %s", b)
@@ -221,7 +231,7 @@ func TestManagementAPI(t *testing.T) {
 	for _, e := range entries {
 		seen[e.Action] = true
 	}
-	for _, want := range []string{"host.enroll", "host.revoke", "token.create", "token.delete", "user.update", "maintenance.set", "auth.login", "auth.login.failed", "gc.start"} {
+	for _, want := range []string{"host.enroll", "host.revoke", "token.create", "token.delete", "user.update", "maintenance.set", "auth.login", "auth.login.failed", "gc.start", "quarantine.add"} {
 		if !seen[want] {
 			t.Errorf("no audit entry %q (have %v)", want, seen)
 		}
@@ -283,9 +293,11 @@ func TestLoginHardening(t *testing.T) {
 	}
 	// A spray over many names from one source is stopped by the source key, not only the pair keys.
 	spray := r.web2("192.0.2.50")
+	// (the source key is ten times looser than one user's, so that people behind one address are not locked out by a
+	// stranger: sixty names are more than it allows)
 	locked := false
-	for _, n := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "root"} {
-		if spray.login(n, "wrong password here") == 429 {
+	for i := 0; i < 60; i++ {
+		if spray.login(fmt.Sprintf("name%d", i), "wrong password here") == 429 {
 			locked = true
 		}
 	}
@@ -352,5 +364,54 @@ func TestLoginHardening(t *testing.T) {
 	}
 	if !got429 {
 		t.Fatal("bad bearer tokens are not limited")
+	}
+}
+
+// The node's console turns off the browser features it does not use, and never sends Strict-Transport-Security: its
+// certificate is self-signed and pinned, and a browser that remembered the header could not be told to accept it.
+func TestManagementSecurityHeaders(t *testing.T) {
+	r := startRig(t, memKind, nil)
+	for _, p := range []string{"/api/v1", "/"} {
+		req := httptest.NewRequest("GET", "https://node.test"+p, nil)
+		rec := httptest.NewRecorder()
+		r.Srv.WebHandler().ServeHTTP(rec, req)
+		h := rec.Header()
+		if pp := h.Get("Permissions-Policy"); !strings.Contains(pp, "camera=()") || !strings.Contains(pp, "geolocation=()") {
+			t.Errorf("%s: Permissions-Policy %q", p, pp)
+		}
+		if h.Get("Strict-Transport-Security") != "" {
+			t.Errorf("%s: Strict-Transport-Security %q", p, h.Get("Strict-Transport-Security"))
+		}
+	}
+}
+
+// A user at an address is locked after a few wrong passwords, but another user at the same address is not; an IPv6 source
+// is counted by its /64, so rotating addresses inside it does not give a fresh allowance.
+func TestLoginLockoutIsPerUserAndPrefix(t *testing.T) {
+	r := startRig(t, memKind, nil)
+	const pw = "correct horse battery staple"
+	for _, n := range []string{"ann", "bob"} {
+		if err := backupd.CreateUser(ctx, r.DB, n, pw, "admin", testParams); err != nil {
+			t.Fatal(err)
+		}
+	}
+	one := r.web2("192.0.2.70")
+	for i := 0; i < 6; i++ {
+		one.login("ann", "wrong password here")
+	}
+	if st := one.login("ann", pw); st != 429 {
+		t.Fatalf("ann after six wrong passwords: %d", st)
+	}
+	if st := one.login("bob", pw); st != 200 {
+		t.Fatalf("bob at the same address: %d", st)
+	}
+	locked := 0
+	for i := 1; i <= 12; i++ {
+		if r.web2(fmt.Sprintf("[2001:db8:7:7::%x]", i)).login("bob", "wrong password here") == 429 {
+			locked++
+		}
+	}
+	if locked < 5 {
+		t.Fatalf("12 wrong passwords for bob from 12 addresses of one /64: only %d refused", locked)
 	}
 }

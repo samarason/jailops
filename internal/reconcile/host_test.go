@@ -12,7 +12,7 @@ import (
 func TestHostPassLoadsModulesBeforeSysctlsAndGivesBack(t *testing.T) {
 	w := newWorld(t, reconcile.Config{})
 	loaded := map[string]bool{}
-	vals := map[string]string{"net.link.bridge.pfil_bridge": "0", "net.link.bridge.pfil_member": "1", "net.link.bridge.pfil_onlyip": "1", "kern.elf64.fallback_brand": "-1"}
+	vals := map[string]string{"net.link.epair.q1": "0", "net.link.epair.q2": "1", "net.link.epair.q3": "1", "kern.elf64.fallback_brand": "-1"}
 	var log []string
 	f := run.NewFake()
 	f.Add(run.Rule{Name: "kldstat", Args: []string{run.RestArgs}, Fn: func(c run.Cmd) (run.Result, error) {
@@ -28,7 +28,7 @@ func TestHostPassLoadsModulesBeforeSysctlsAndGivesBack(t *testing.T) {
 	}})
 	f.Add(run.Rule{Name: "sysctl", Args: []string{run.RestArgs}, Fn: func(c run.Cmd) (run.Result, error) {
 		k, v, _ := strings.Cut(c.Args[0], "=")
-		if !loaded["if_bridge"] && strings.HasPrefix(k, "net.link.bridge") {
+		if !loaded["if_epair"] && strings.HasPrefix(k, "net.link.epair") {
 			return run.Result{}, &run.ExitError{Code: 1, Stderr: "unknown oid"}
 		}
 		vals[k] = v
@@ -36,8 +36,8 @@ func TestHostPassLoadsModulesBeforeSysctlsAndGivesBack(t *testing.T) {
 		return run.Result{}, nil
 	}})
 	want := reconcile.HostDesired{
-		Modules: []string{"if_bridge", "pf", "linux64"},
-		Sysctls: map[string]string{"net.link.bridge.pfil_bridge": "1", "net.link.bridge.pfil_member": "0", "net.link.bridge.pfil_onlyip": "0", "kern.elf64.fallback_brand": "3"},
+		Modules: []string{"if_epair", "pf", "linux64"},
+		Sysctls: map[string]string{"net.link.epair.q1": "1", "net.link.epair.q2": "0", "net.link.epair.q3": "0", "kern.elf64.fallback_brand": "3"},
 		Release: map[string]string{"kern.elf64.fallback_brand": "-1"},
 	}
 	rd := func(_ context.Context, n string) (string, error) { return vals[n], nil }
@@ -48,7 +48,7 @@ func TestHostPassLoadsModulesBeforeSysctlsAndGivesBack(t *testing.T) {
 		t.Fatalf("%v", rep.Failures)
 	}
 	got := strings.Join(log, "; ")
-	wantLog := "kldload if_bridge; kldload pf; kldload linux64; sysctl kern.elf64.fallback_brand=3; sysctl net.link.bridge.pfil_bridge=1; sysctl net.link.bridge.pfil_member=0; sysctl net.link.bridge.pfil_onlyip=0"
+	wantLog := "kldload if_epair; kldload pf; kldload linux64; sysctl kern.elf64.fallback_brand=3; sysctl net.link.epair.q1=1; sysctl net.link.epair.q2=0; sysctl net.link.epair.q3=0"
 	if got != wantLog {
 		t.Fatalf("%s", got)
 	}
@@ -59,9 +59,9 @@ func TestHostPassLoadsModulesBeforeSysctlsAndGivesBack(t *testing.T) {
 		t.Fatalf("%v", log)
 	}
 	// Drift is corrected again.
-	vals["net.link.bridge.pfil_member"] = "1"
+	vals["net.link.epair.q2"] = "1"
 	r.Pass(bg)
-	if strings.Join(log, ";") != "sysctl net.link.bridge.pfil_member=0" {
+	if strings.Join(log, ";") != "sysctl net.link.epair.q2=0" {
 		t.Fatalf("%v", log)
 	}
 	// The last Linux jail is gone: the brand returns to -1, the others stay.
@@ -78,10 +78,10 @@ func TestHostPassLoadsModulesBeforeSysctlsAndGivesBack(t *testing.T) {
 	f2.Add(run.Rule{Name: "sysctl", Args: []string{run.RestArgs}, Fn: func(run.Cmd) (run.Result, error) {
 		return run.Result{}, &run.ExitError{Code: 1, Stderr: "forbidden"}
 	}})
-	vals["net.link.bridge.pfil_member"] = "1"
+	vals["net.link.epair.q2"] = "1"
 	r2 := reconcile.New(reconcile.Config{}, reconcile.Env{Source: w, Sink: w, Actions: w, Net: w.Net, PF: w.PF, Jails: w.Jails, Run: f2, Sysctl: rd, Clock: w.clock})
 	rep = r2.Pass(bg)
-	if !strings.Contains(rep.Failures["host/sysctl/net.link.bridge.pfil_member"], "forbidden") {
+	if !strings.Contains(rep.Failures["host/sysctl/net.link.epair.q2"], "forbidden") {
 		t.Fatalf("%v", rep.Failures)
 	}
 }

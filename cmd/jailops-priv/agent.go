@@ -23,6 +23,7 @@ func agentMain(args []string, stderr io.Writer, euid int) int {
 	fs.SetOutput(stderr)
 	mode := fs.String("mode", "", "read or write")
 	root := fs.String("root", "", "the directory the agent is confined to")
+	special := fs.Bool("special", false, "a write agent may make device nodes and setuid and setgid files (a jail's root only)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -60,7 +61,7 @@ func agentMain(args []string, stderr io.Writer, euid int) int {
 		fmt.Fprintf(stderr, "fsagent: chdir: %v\n", err)
 		return 1
 	}
-	if err := fsagent.Serve(conn, fsagent.Config{Mode: fsagent.Mode(*mode), Root: "/"}); err != nil {
+	if err := fsagent.Serve(conn, fsagent.Config{Mode: fsagent.Mode(*mode), Root: "/", Special: *special && *mode == priv.AgentWrite}); err != nil {
 		fmt.Fprintf(stderr, "fsagent: %v\n", err)
 		return 1
 	}

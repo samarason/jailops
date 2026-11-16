@@ -16,7 +16,9 @@ import (
 	"strings"
 	"sync"
 
+	"jailops.net/jailops/internal/hostdir"
 	"jailops.net/jailops/internal/lifecycle/fault"
+	"jailops.net/jailops/internal/mounts"
 )
 
 // Exec is a scripted command runner.
@@ -55,15 +57,26 @@ func (e *Exec) Commands() []string {
 
 // Files is an in-memory file store with atomic writes.
 type Files struct {
-	F     *fault.Injector
-	mu    sync.Mutex
-	Data  map[string][]byte
-	Dirs  map[string]bool
-	Trees map[string][]string // CopyTree: src -> file paths relative to src to copy
+	F      *fault.Injector
+	mu     sync.Mutex
+	Data   map[string][]byte
+	Dirs   map[string]bool
+	Trees  map[string][]string // CopyTree: src -> file paths relative to src to copy
+	Owners map[string]string   // SetOwner: path -> uid:gid:mode
+	// Stale are the leftover mounts StaleMounts reports.
+	Stale []mounts.Stale
+	// Sources are the directories of the host that are mounts, and ReadOnlySources those that take no file: what
+	// ProbeSource answers from.
+	Sources         map[string]bool
+	ReadOnlySources map[string]bool
+	// ProbeHold, when set, makes ProbeSource block until it is closed (a share that does not answer), and ProbeCalls
+	// counts the probes that reached the fake.
+	ProbeHold  chan struct{}
+	ProbeCalls int
 }
 
 func NewFiles(f *fault.Injector) *Files {
-	return &Files{F: f, Data: map[string][]byte{}, Dirs: map[string]bool{}, Trees: map[string][]string{}}
+	return &Files{F: f, Data: map[string][]byte{}, Dirs: map[string]bool{}, Trees: map[string][]string{}, Sources: map[string]bool{}, ReadOnlySources: map[string]bool{}}
 }
 
 func (f *Files) WriteAtomic(_ context.Context, p string, data []byte) error {
@@ -94,6 +107,75 @@ func (f *Files) Exists(_ context.Context, p string) (bool, error) {
 	defer f.mu.Unlock()
 	_, ok := f.Data[p]
 	return ok || f.Dirs[p], nil
+}
+
+// SetOwner records the owner and the mode set on a path.
+func (f *Files) SetOwner(_ context.Context, p string, uid, gid int, mode uint32) error {
+	if err := f.F.Hit("setowner " + p); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Owners == nil {
+		f.Owners = map[string]string{}
+	}
+	f.Owners[p] = fmt.Sprintf("%d:%d:%04o", uid, gid, mode)
+	return nil
+}
+
+// Probes is how many probes of a source reached the fake.
+func (f *Files) Probes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ProbeCalls
+}
+
+// StaleMounts are the leftover mounts the fake reports; HealJail takes the ones of a jail off the list.
+func (f *Files) StaleMounts(context.Context) ([]mounts.Stale, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]mounts.Stale(nil), f.Stale...), nil
+}
+
+func (f *Files) HealJail(_ context.Context, jail string) (mounts.Healed, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var res mounts.Healed
+	keep := f.Stale[:0:0]
+	for _, m := range f.Stale {
+		if m.Jail == jail {
+			res.Unmounted = append(res.Unmounted, m.Path)
+			continue
+		}
+		keep = append(keep, m)
+	}
+	f.Stale = keep
+	return res, nil
+}
+
+// Sources are the directories of the host the fake knows as mounts; ProbeSource answers from it.
+// ProbeSource says whether a path is in Sources (a mount) and, with write, whether it is not in Readonly.
+func (f *Files) ProbeSource(_ context.Context, p string, write bool) (hostdir.Probe, error) {
+	if err := f.F.Hit("probe " + p); err != nil {
+		return hostdir.Probe{}, err
+	}
+	f.mu.Lock()
+	f.ProbeCalls++
+	hold := f.ProbeHold
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Sources[p] {
+		return hostdir.Probe{Detail: "the directory is not on a mount"}, nil
+	}
+	out := hostdir.Probe{Mounted: true, Writable: !f.ReadOnlySources[p]}
+	if write && !out.Writable {
+		out.Detail = "no file can be created in the directory"
+	}
+	return out, nil
 }
 
 func (f *Files) MkdirAll(_ context.Context, p string) error {
@@ -181,6 +263,8 @@ type Jails struct {
 	Release string
 	// OnStart runs before a start succeeds, to let tests check the pool.
 	OnStart func(name string) error
+	// OnStop runs before a stop succeeds; an error from it is the stop's (jail(8) refusing to remove the jail).
+	OnStop func(name string) error
 	// ExecFn answers commands run inside a jail (health checks).
 	ExecFn func(name string, argv []string) ([]byte, error)
 	// Never makes Running report false after Start (readiness timeout).
@@ -212,6 +296,11 @@ func (j *Jails) Start(_ context.Context, name string) error {
 func (j *Jails) Stop(_ context.Context, name string) error {
 	if err := j.F.Hit("jail stop " + name); err != nil {
 		return err
+	}
+	if j.OnStop != nil {
+		if err := j.OnStop(name); err != nil {
+			return err
+		}
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -274,4 +363,14 @@ func (f *Files) SeedKeys(_ context.Context, root string) error {
 	defer f.mu.Unlock()
 	f.Dirs[path.Join(root, "usr/share/keys")] = true
 	return nil
+}
+
+// DNSUnbound is off in the fake: no helper, no unbound.
+func (f *Files) DNSUnbound(context.Context, bool) (mounts.UnboundState, error) {
+	return mounts.UnboundState{}, nil
+}
+
+// HealNetwork destroys nothing: the fake has no interfaces.
+func (f *Files) HealNetwork(context.Context) (mounts.NetHealed, error) {
+	return mounts.NetHealed{}, nil
 }

@@ -79,9 +79,9 @@ func (s *Service) Rebuild(ctx context.Context, name string) (Recovered, error) {
 			}
 		}
 	}
-	for _, v := range rec.Spec.Volumes {
-		if ok, _ := s.ZFS.Exists(ctx, s.Cfg.at(name).volumeDS(v.Name)); !ok {
-			out.Problems = append(out.Problems, "volume dataset is missing: "+v.Name)
+	for _, v := range st.Volumes {
+		if ok, _ := s.ZFS.Exists(ctx, v.DS); !ok {
+			out.Problems = append(out.Problems, "volume dataset is missing: "+volumeName(v.DS))
 		}
 	}
 	for _, e := range st.Extra {

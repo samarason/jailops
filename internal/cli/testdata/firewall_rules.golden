@@ -1,0 +1,144 @@
+$ jailops firewall address-set create office --address 192.0.2.0/24 --comment the office
+address set/office created
+
+$ jailops firewall policy create web --comment the public web server
+firewall policy/web created
+
+$ jailops firewall rule add web in --action allow --proto tcp --port 80,443 --name site --comment the site
+firewall policy/web: rule 1 added: allow in tcp port 80,443
+
+$ jailops firewall rule add web in --action allow --proto tcp --from set:office --port 22 --comment ssh from the office
+firewall policy/web: rule 2 added: allow in tcp from set:office port 22
+
+$ jailops firewall rule add web out --action allow --proto tcp --to 192.0.2.50 --port 5432 --comment the database
+firewall policy/web: rule 3 added: allow out tcp to 192.0.2.50 port 5432
+
+$ jailops firewall rule add web in --action deny --at 1 --from 198.51.100.0/24 --comment a network that is not welcome
+firewall policy/web: rule 1 added: deny in from 198.51.100.0/24
+
+$ jailops firewall rule list web
+#   NAME   ACTION   DIRECTION   PROTO   FROM              TO           PORT     ON    COMMENT
+1   -      deny     in          -       198.51.100.0/24   -            -        yes   a network that is not welcome
+2   site   allow    in          tcp     -                 -            80,443   yes   the site
+3   -      allow    in          tcp     set:office        -            22       yes   ssh from the office
+4   -      allow    out         tcp     -                 192.0.2.50   5432     yes   the database
+
+$ jailops firewall rule list web -o json
+[
+  {
+    "comment": "a network that is not welcome",
+    "action": "deny",
+    "direction": "in",
+    "from": [
+      "198.51.100.0/24"
+    ]
+  },
+  {
+    "name": "site",
+    "comment": "the site",
+    "action": "allow",
+    "direction": "in",
+    "proto": "tcp",
+    "ports": [
+      "80",
+      "443"
+    ]
+  },
+  {
+    "comment": "ssh from the office",
+    "action": "allow",
+    "direction": "in",
+    "proto": "tcp",
+    "from": [
+      "set:office"
+    ],
+    "ports": [
+      "22"
+    ]
+  },
+  {
+    "comment": "the database",
+    "action": "allow",
+    "direction": "out",
+    "proto": "tcp",
+    "to": [
+      "192.0.2.50"
+    ],
+    "ports": [
+      "5432"
+    ]
+  }
+]
+
+$ jailops firewall policy show web
+Firewall policy web
+  Comment:      the public web server
+  Default in:   deny
+  Default out:  allow
+  Age:          3h
+
+#   RULE                                    COMMENT
+1   deny in from 198.51.100.0/24            a network that is not welcome
+2   allow in tcp port 80,443                site: the site
+3   allow in tcp from set:office port 22    ssh from the office
+4   allow out tcp to 192.0.2.50 port 5432   the database
+
+$ jailops firewall rule edit web site --port 80,443,8080 --comment the site and the test site
+firewall policy/web: rule 2 changed: allow in tcp port 80,443,8080
+
+$ jailops firewall rule edit web 3 --from set:office,203.0.113.7
+firewall policy/web: rule 3 changed: allow in tcp from set:office,203.0.113.7 port 22
+
+$ jailops firewall rule edit web 3 --from 
+firewall policy/web: rule 3 changed: allow in tcp port 22
+
+$ jailops firewall rule disable web 2 site
+firewall policy/web: rule 2 disabled
+
+$ jailops firewall rule enable web site
+firewall policy/web: rule 2 enabled
+
+$ jailops firewall rule move web 4 --to 1
+firewall policy/web: rule 4 moved to 1: allow out tcp to 192.0.2.50 port 5432
+
+$ jailops firewall rule move web site --after 4
+firewall policy/web: rule 3 moved to 4: allow in tcp port 80,443,8080
+
+$ jailops firewall rule move web 2 --before 1
+firewall policy/web: rule 2 moved to 1: deny in from 198.51.100.0/24
+
+$ jailops firewall rule move web 1 --to 1
+firewall policy/web: rule 1 stays where it is
+
+$ jailops firewall rule list web
+#   NAME   ACTION   DIRECTION   PROTO   FROM              TO           PORT          ON    COMMENT
+1   -      deny     in          -       198.51.100.0/24   -            -             yes   a network that is not welcome
+2   -      allow    out         tcp     -                 192.0.2.50   5432          yes   the database
+3   -      allow    in          tcp     -                 -            22            yes   ssh from the office
+4   site   allow    in          tcp     -                 -            80,443,8080   yes   the site and the test site
+
+$ jailops firewall rule remove web --name site
+firewall policy/web: rule 4 removed: allow in tcp port 80,443,8080
+
+$ jailops firewall rule remove web 1
+firewall policy/web: rule 1 removed: deny in from 198.51.100.0/24
+
+$ jailops firewall rule list web
+#   NAME   ACTION   DIRECTION   PROTO   FROM   TO           PORT   ON    COMMENT
+1   -      allow    out         tcp     -      192.0.2.50   5432   yes   the database
+2   -      allow    in          tcp     -      -            22     yes   ssh from the office
+
+$ jailops firewall --dry-run rule remove web 1
+dry-run: would change firewall policy web: rule 1 removed: allow out tcp to 192.0.2.50 port 5432
+rules:
+  - comment: ssh from the office
+    action: allow
+    direction: in
+    proto: tcp
+    ports:
+      - "22"
+
+$ jailops firewall rule list web -o name
+1
+2
+

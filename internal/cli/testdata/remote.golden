@@ -1,33 +1,33 @@
-$ jailops remote add lab https://<addr> --token-stdin -y
+$ jailops remote add lab https://<addr> --token-file - -y
 ! The server at <addr> presented a certificate that no trusted authority signed.
-!   Subject:  O=Acme Co
-!   Issuer:   O=Acme Co
-!   Expires:  2084-01-29
 !   SHA-256:  <fingerprint>
+!   Subject:  "O=Acme Co"
+!   Issuer:   "O=Acme Co"
+!   Expires:  2084-01-29
 ! Compare this fingerprint with the one the server reports ('jailops server info' there) before trusting it.
 ! Pin this certificate for remote "lab"? [y/N]: 
 ! usage: confirmation required
 ! hint: answer on standard input, or pass --fingerprint after checking it with the server's administrator
 [exit 2]
 
-$ jailops remote add lab https://<addr> --token-stdin
+$ jailops remote add lab https://<addr> --token-file -
 ! The server at <addr> presented a certificate that no trusted authority signed.
-!   Subject:  O=Acme Co
-!   Issuer:   O=Acme Co
-!   Expires:  2084-01-29
 !   SHA-256:  <fingerprint>
+!   Subject:  "O=Acme Co"
+!   Issuer:   "O=Acme Co"
+!   Expires:  2084-01-29
 ! Compare this fingerprint with the one the server reports ('jailops server info' there) before trusting it.
 ! Pin this certificate for remote "lab"? [y/N]: aborted: the certificate was not trusted; the remote was not added
 [exit 1]
 
-$ jailops remote add lab https://<addr> --token-stdin
+$ jailops remote add lab https://<addr> --token-file -
 remote/lab added (now the current remote)
 connected to tls-host (version fake), seen as trusted
 ! The server at <addr> presented a certificate that no trusted authority signed.
-!   Subject:  O=Acme Co
-!   Issuer:   O=Acme Co
-!   Expires:  2084-01-29
 !   SHA-256:  <fingerprint>
+!   Subject:  "O=Acme Co"
+!   Issuer:   "O=Acme Co"
+!   Expires:  2084-01-29
 ! Compare this fingerprint with the one the server reports ('jailops server info' there) before trusting it.
 ! Pin this certificate for remote "lab"? [y/N]: 
 
@@ -61,7 +61,7 @@ $ jailops remote switch known
 now using remote known
 
 $ jailops jail list
-! No resources found.
+! No jails in project main. Create one with: jailops jail create NAME --image IMAGE --network NETWORK --storage STORAGE
 
 $ jailops remote switch nowhere
 ! usage: unknown remote "nowhere"

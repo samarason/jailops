@@ -4,12 +4,14 @@ import (
 	"context"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"jailops.net/jailops/internal/sys/ifconfig"
 	"jailops.net/jailops/internal/sys/jailos"
 	"jailops.net/jailops/internal/sys/pfctl"
 	"jailops.net/jailops/internal/sys/run"
+	"jailops.net/jailops/sdk/api"
 )
 
 // ---- jails ----
@@ -81,7 +83,36 @@ func (g jailGuard) Create(ctx context.Context, confPath, name string) error {
 	if err != nil {
 		return err
 	}
+	if err := g.vnetIfacesOwned(ctx, p); err != nil {
+		return err
+	}
 	return g.l.d.Jails.Create(ctx, p, name)
+}
+
+// vnetIfacesOwned checks the interfaces jail(8) will move into the jail (vnet.interface): each one that exists now
+// must be JailOps's in the kernel. One that does not exist yet is made by the prestart hook, which creates only new
+// interfaces (netGuard.EpairCreate); one that appears in between under that name can only be root's doing.
+func (g jailGuard) vnetIfacesOwned(ctx context.Context, confPath string) error {
+	b, err := g.l.ReadFile(ctx, confPath)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		m := paramRE.FindStringSubmatch(strings.TrimLeft(line, "\t"))
+		if m == nil || m[1] != "vnet.interface" {
+			continue
+		}
+		for _, part := range strings.Split(m[2], ", ") {
+			n, ok := unquote(part)
+			if !ok {
+				return invalid("vnet.interface: bad value")
+			}
+			if err := g.l.ifOwned(ctx, n); err != nil && !api.IsCode(err, api.CodeNotFound) {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (g jailGuard) Remove(ctx context.Context, confPath, name string) error {
@@ -146,6 +177,9 @@ func (g pfGuard) Load(ctx context.Context, anchor, rs string) error {
 		return err
 	}
 	if err := g.l.cfg.checkRuleset(ctx, rs); err != nil {
+		return err
+	}
+	if err := g.l.checkAnchorInterfaces(ctx, anchor, rs); err != nil {
 		return err
 	}
 	return g.l.d.PF.Load(ctx, anchor, rs)
@@ -214,150 +248,152 @@ type netGuard struct{ l *Local }
 
 var _ ifconfig.Client = netGuard{}
 
-func (g netGuard) owned(names ...string) error {
-	for _, n := range names {
-		if err := g.l.cfg.ifOwned(n); err != nil {
-			return err
-		}
-	}
-	return nil
+// owned checks in the kernel that JailOps owns every name (ifown.go).
+func (g netGuard) owned(ctx context.Context, names ...string) error {
+	return g.l.ifsOwned(ctx, names...)
 }
 
 func (g netGuard) List(ctx context.Context) ([]ifconfig.Iface, error) { return g.l.d.Net.List(ctx) }
 
-func (g netGuard) BridgeCreate(ctx context.Context, name string) error {
-	if err := g.owned(name); err != nil {
-		return err
-	}
-	return g.l.d.Net.BridgeCreate(ctx, name)
-}
-
-func (g netGuard) BridgeDestroy(ctx context.Context, name string) error {
-	if err := g.owned(name); err != nil {
-		return err
-	}
-	return g.l.d.Net.BridgeDestroy(ctx, name)
-}
-
-func (g netGuard) BridgeAddMember(ctx context.Context, bridge, member string, private bool) error {
-	if err := g.owned(bridge, member); err != nil {
-		return err
-	}
-	return g.l.d.Net.BridgeAddMember(ctx, bridge, member, private)
-}
-
-func (g netGuard) BridgeDeleteMember(ctx context.Context, bridge, member string) error {
-	if err := g.owned(bridge, member); err != nil {
-		return err
-	}
-	return g.l.d.Net.BridgeDeleteMember(ctx, bridge, member)
-}
-
+// SetDescription writes a description JailOps writes on an interface it owns: the marker cannot be put on anything
+// else, and cannot be taken off (clearing writes the marker).
 func (g netGuard) SetDescription(ctx context.Context, iface, desc string) error {
-	if err := g.owned(iface); err != nil {
+	if err := checkIfaceDesc(desc, true); err != nil {
 		return err
 	}
-	if err := checkIfaceDesc(desc, true); err != nil {
+	if err := g.owned(ctx, iface); err != nil {
 		return err
 	}
 	return g.l.d.Net.SetDescription(ctx, iface, desc)
 }
 
 func (g netGuard) EpairCreate(ctx context.Context, name string) (string, string, error) {
-	if err := g.owned(name + "a"); err != nil {
-		return "", "", err
+	for _, n := range []string{name + "a", name + "b"} {
+		if err := ifconfig.CheckNewName(n); err != nil {
+			return "", "", err
+		}
 	}
-	if err := ifconfig.ValidateIfName(name + "b"); err != nil {
-		return "", "", err
+	for _, n := range []string{name + "a", name + "b"} {
+		if err := g.l.ifCreatable(ctx, n); err != nil {
+			return "", "", err
+		}
 	}
 	return g.l.d.Net.EpairCreate(ctx, name)
 }
 
 func (g netGuard) EpairDestroy(ctx context.Context, iface string) error {
-	if err := g.owned(iface); err != nil {
+	if err := g.owned(ctx, iface); err != nil {
 		return err
 	}
 	return g.l.d.Net.EpairDestroy(ctx, iface)
 }
 
-func (g netGuard) move(iface, jail string) error {
-	if err := g.owned(iface); err != nil {
+func (g netGuard) MoveToJail(ctx context.Context, iface, jail string) error {
+	if err := ifconfig.ValidateIfName(iface); err != nil {
 		return err
 	}
-	return jailGuard{g.l}.managed(jail)
-}
-
-func (g netGuard) MoveToJail(ctx context.Context, iface, jail string) error {
-	if err := g.move(iface, jail); err != nil {
+	if err := (jailGuard{g.l}).managed(jail); err != nil {
+		return err
+	}
+	if err := g.owned(ctx, iface); err != nil {
 		return err
 	}
 	return g.l.d.Net.MoveToJail(ctx, iface, jail)
 }
 
+// MoveFromJail brings an interface of JailOps back from a managed jail's vnet (read there).
 func (g netGuard) MoveFromJail(ctx context.Context, iface, jail string) error {
-	if err := g.move(iface, jail); err != nil {
+	if err := ifconfig.ValidateIfName(iface); err != nil {
+		return err
+	}
+	if err := (jailGuard{g.l}).managed(jail); err != nil {
+		return err
+	}
+	if err := g.l.ifOwnedInJail(ctx, jail, iface); err != nil {
+		return err
+	}
+	// The kernel brings an interface back although the host has one of that name (two interfaces then share it,
+	// verified on FreeBSD 15.2): refuse that here, a name of the host is never doubled through the helper.
+	rd, err := g.l.ifReader(iface)
+	if err != nil {
+		return err
+	}
+	if _, err := rd.Show(ctx, iface); err == nil {
+		return forbidden("interface %q exists on the host; the helper does not bring a second one of that name back from jail %s", iface, jail)
+	} else if !api.IsCode(err, api.CodeNotFound) {
 		return err
 	}
 	return g.l.d.Net.MoveFromJail(ctx, iface, jail)
 }
 
 func (g netGuard) SetLink(ctx context.Context, iface string, up bool) error {
-	if err := g.owned(iface); err != nil {
+	if err := g.owned(ctx, iface); err != nil {
 		return err
 	}
 	return g.l.d.Net.SetLink(ctx, iface, up)
 }
 
-func (g netGuard) addr(iface string, p netip.Prefix) error {
-	if err := g.owned(iface); err != nil {
+func (g netGuard) addr(ctx context.Context, iface string, p netip.Prefix) error {
+	if err := ifconfig.ValidateIfName(iface); err != nil {
 		return err
 	}
 	if !p.IsValid() || p.Addr().Zone() != "" {
 		return invalid("invalid address %q", p)
 	}
-	return nil
+	return g.owned(ctx, iface)
 }
 
 func (g netGuard) AddrAdd(ctx context.Context, iface string, p netip.Prefix) error {
-	if err := g.addr(iface, p); err != nil {
+	if err := g.addr(ctx, iface, p); err != nil {
+		return err
+	}
+	if err := g.l.checkStoredNetworkAddr(p.Addr(), "an address on an interface of JailOps"); err != nil {
 		return err
 	}
 	return g.l.d.Net.AddrAdd(ctx, iface, p)
 }
 
 func (g netGuard) AddrRemove(ctx context.Context, iface string, p netip.Prefix) error {
-	if err := g.addr(iface, p); err != nil {
+	if err := g.addr(ctx, iface, p); err != nil {
 		return err
 	}
 	return g.l.d.Net.AddrRemove(ctx, iface, p)
 }
 
-func (g netGuard) RouteAdd(ctx context.Context, r ifconfig.Route) error {
+func (g netGuard) route(ctx context.Context, r ifconfig.Route) error {
+	if r.Reject {
+		return g.l.checkRejectRoute(ctx, r)
+	}
 	if err := g.l.cfg.checkRoute(ctx, r); err != nil {
 		return err
+	}
+	if r.Interface != "" {
+		return g.owned(ctx, r.Interface)
+	}
+	return nil
+}
+
+func (g netGuard) RouteAdd(ctx context.Context, r ifconfig.Route) error {
+	if err := g.route(ctx, r); err != nil {
+		return err
+	}
+	if !r.Reject && r.Dest != "default" && !(isAdmin(ctx) && g.l.cfg.Admin.Routes) {
+		a, err := netip.ParseAddr(strings.SplitN(r.Dest, "/", 2)[0])
+		if err != nil {
+			return invalid("invalid route %q", r.Dest)
+		}
+		if err := g.l.checkStoredNetworkAddr(a, "a route through an interface of JailOps"); err != nil {
+			return err
+		}
 	}
 	return g.l.d.Net.RouteAdd(ctx, r)
 }
 
 func (g netGuard) RouteDelete(ctx context.Context, r ifconfig.Route) error {
-	if err := g.l.cfg.checkRoute(ctx, r); err != nil {
+	if err := g.route(ctx, r); err != nil {
 		return err
 	}
 	return g.l.d.Net.RouteDelete(ctx, r)
-}
-
-func (g netGuard) NeighborSet(ctx context.Context, iface string, a netip.Addr, mac string) error {
-	if err := g.l.cfg.ifOwned(iface); err != nil {
-		return err
-	}
-	return g.l.d.Net.NeighborSet(ctx, iface, a, mac)
-}
-
-func (g netGuard) NeighborDelete(ctx context.Context, iface string, a netip.Addr) error {
-	if err := g.l.cfg.ifOwned(iface); err != nil {
-		return err
-	}
-	return g.l.d.Net.NeighborDelete(ctx, iface, a)
 }
 
 func (g netGuard) IPv6Forwarding(ctx context.Context) (bool, error) {
@@ -385,10 +421,25 @@ func (g runGuard) Run(ctx context.Context, c run.Cmd) (run.Result, error) {
 			defer g.l.freeze(d)()
 		}
 	}
+	if rule.Name == "tar" && len(argv) == 5 && argv[1] == "-C" && argv[3] == "-xpzf" {
+		sealed, cleanup, err := g.l.sealArchive(argv[4])
+		if err != nil {
+			return run.Result{}, err
+		}
+		defer cleanup()
+		argv = append(append([]string(nil), argv[:4]...), sealed)
+	}
 	if rule.Verify != nil {
 		if err := rule.Verify(ctx, g.l, argv[1:]); err != nil {
 			return run.Result{}, err
 		}
+	}
+	if rule.Name == "pkg" {
+		var cleanup func()
+		if argv, cleanup, err = g.l.sealRepos(ctx, argv); err != nil {
+			return run.Result{}, err
+		}
+		defer cleanup()
 	}
 	max := time.Duration(rule.MaxTimeoutSeconds) * time.Second
 	if c.Timeout == 0 || c.Timeout == run.NoTimeout || c.Timeout > max {
@@ -401,6 +452,14 @@ func (g runGuard) Run(ctx context.Context, c run.Cmd) (run.Result, error) {
 	c.Name, c.Args = argv[0], argv[1:]
 	if rule.Env != nil {
 		c.Env = rule.Env
+	}
+	if rule.Name == "mount" && len(argv) > 1 {
+		before := g.l.mountPoints(ctx)
+		res, err := g.l.d.Runner.Run(ctx, c)
+		if err == nil {
+			err = g.l.checkMountLanded(ctx, before, argv[len(argv)-1])
+		}
+		return res, err
 	}
 	return g.l.d.Runner.Run(ctx, c)
 }

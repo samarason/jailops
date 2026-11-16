@@ -1,10 +1,10 @@
 $ jailops list w*
-NAME   STATE     IMAGE               GEN   ADDRESSES    AGE
-web    running   freebsd-15@stable   g1    10.20.0.10   3h
+NAME   STATE     IMAGE               GEN   ADDRESSES    AUTOSTART   AGE
+web    running   freebsd-15@stable   g1    10.20.0.10   -           3h
 
 $ jailops list nothing* d?
-NAME   STATE     IMAGE               GEN   ADDRESSES                                   AGE
-db     stopped   freebsd-15@stable   g1    10.20.0.11,10.94.0.2,2001:db8:1:2:100::10   3h
+NAME   STATE     IMAGE               GEN   ADDRESSES                                   AUTOSTART   AGE
+db     stopped   freebsd-15@stable   g1    10.20.0.11,10.94.0.2,2001:db8:1:2:100::10   -           3h
 
 $ jailops list [
 ! usage: bad name pattern "["
@@ -17,21 +17,21 @@ db     stopped   3h
 web    running   3h
 
 $ jailops list --sort state
-NAME   STATE     IMAGE               GEN   ADDRESSES                                   AGE
-web    running   freebsd-15@stable   g1    10.20.0.10                                  3h
-db     stopped   freebsd-15@stable   g1    10.20.0.11,10.94.0.2,2001:db8:1:2:100::10   3h
+NAME   STATE     IMAGE               GEN   ADDRESSES                                   AUTOSTART   AGE
+web    running   freebsd-15@stable   g1    10.20.0.10                                  -           3h
+db     stopped   freebsd-15@stable   g1    10.20.0.11,10.94.0.2,2001:db8:1:2:100::10   -           3h
 
 $ jailops list --sort state -o name
 web
 db
 
 $ jailops list -c name,bogus
-! usage: unknown column "bogus" (columns: name, state, image, gen, addresses, age)
+! usage: unknown column "bogus" (columns: name, state, image, gen, addresses, autostart, age, ipv4, ipv6)
 ! hint: run 'jailops list --help' for usage
 [exit 2]
 
 $ jailops list --sort bogus
-! usage: unknown column "bogus" (columns: name, state, image, gen, addresses, age)
+! usage: unknown column "bogus" (columns: name, state, image, gen, addresses, autostart, age, ipv4, ipv6)
 ! hint: run 'jailops list --help' for usage
 [exit 2]
 
@@ -41,18 +41,18 @@ $ jailops list --state foo
 [exit 2]
 
 $ jailops list -o csv
-NAME,STATE,IMAGE,GEN,ADDRESSES,AGE
-db,stopped,freebsd-15@stable,g1,"10.20.0.11,10.94.0.2,2001:db8:1:2:100::10",3h
-web,running,freebsd-15@stable,g1,10.20.0.10,3h
+NAME,STATE,IMAGE,GEN,ADDRESSES,AUTOSTART,AGE
+db,stopped,freebsd-15@stable,g1,"10.20.0.11,10.94.0.2,2001:db8:1:2:100::10",-,3h
+web,running,freebsd-15@stable,g1,10.20.0.10,-,3h
 
 $ jailops list -o csv --no-headers -c name,addresses
 db,"10.20.0.11,10.94.0.2,2001:db8:1:2:100::10"
 web,10.20.0.10
 
 $ jailops network list -o csv
-NAME,BRIDGE,IPV4,GATEWAY,RANGE,USED,FREE,UPLINK
-lan,-,10.20.0.0/24,10.20.0.1,10.20.0.10-10.20.0.20,2,9,em0
-sw,-,10.94.0.0/24,10.94.0.1,10.94.0.2-10.94.0.254,2,251,em0
+NAME,IPV4,GATEWAY,RANGE,USED,FREE,UPLINK
+lan,10.20.0.0/24,10.20.0.1,10.20.0.10-10.20.0.20,2,9,em0
+sw,10.94.0.0/24,10.94.0.1,10.94.0.2-10.94.0.254,2,251,em0
 
 $ jailops jail show web -o csv
 ! usage: -o csv is not available for this command
@@ -60,9 +60,9 @@ $ jailops jail show web -o csv
 [exit 2]
 
 $ jailops list -o compact
-NAME   STATE     IMAGE               GEN   ADDRESSES                                   AGE
-db     stopped   freebsd-15@stable   g1    10.20.0.11,10.94.0.2,2001:db8:1:2:100::10   3h
-web    running   freebsd-15@stable   g1    10.20.0.10                                  3h
+NAME   STATE     IMAGE               GEN   ADDRESSES                                   AUTOSTART   AGE
+db     stopped   freebsd-15@stable   g1    10.20.0.11,10.94.0.2,2001:db8:1:2:100::10   -           3h
+web    running   freebsd-15@stable   g1    10.20.0.10                                  -           3h
 
 $ jailops list -c name,state
 ┌──────┬─────────┐
@@ -82,7 +82,7 @@ $ jailops -q jail snapshot create db s1
 
 $ jailops -q stop ghost
 ! not_found: jail "ghost" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops -q start web -o name

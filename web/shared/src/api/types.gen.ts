@@ -67,8 +67,17 @@ export type Code =
   | "not_managed"
   | "locked"
   | "bad_passphrase"
+  | "stop_forced"
 
-export const CodeValues: readonly Code[] = ['invalid', 'not_found', 'already_exists', 'conflict', 'unauthorized', 'forbidden', 'unsupported', 'busy', 'internal', 'ip_conflict', 'pool_exhausted', 'image_in_use', 'data_loss_unconfirmed', 'version_skew', 'not_leader', 'no_quorum', 'unverified_platform', 'zfs_incompatible', 'chain_broken', 'merge_conflict', 'quota_exceeded', 'rate_limited', 'key_not_escrowed', 'plaintext_denied', 'maintenance', 'missing_chunks', 'lease_expired', 'not_managed', 'locked', 'bad_passphrase']
+export const CodeValues: readonly Code[] = ['invalid', 'not_found', 'already_exists', 'conflict', 'unauthorized', 'forbidden', 'unsupported', 'busy', 'internal', 'ip_conflict', 'pool_exhausted', 'image_in_use', 'data_loss_unconfirmed', 'version_skew', 'not_leader', 'no_quorum', 'unverified_platform', 'zfs_incompatible', 'chain_broken', 'merge_conflict', 'quota_exceeded', 'rate_limited', 'key_not_escrowed', 'plaintext_denied', 'maintenance', 'missing_chunks', 'lease_expired', 'not_managed', 'locked', 'bad_passphrase', 'stop_forced']
+
+export type DNSSource =
+  | "network"
+  | "host"
+  | "gateway"
+  | "none"
+
+export const DNSSourceValues: readonly DNSSource[] = ['network', 'host', 'gateway', 'none']
 
 export type DoctorStatus =
   | "ok"
@@ -123,11 +132,12 @@ export type Kind =
   | "Storage"
   | "HostIdentity"
   | "WireGuard"
+  | "Volume"
   | "LogForward"
   | "HostFirewall"
   | "HostCertificate"
 
-export const KindValues: readonly Kind[] = ['Jail', 'Image', 'Network', 'FirewallPolicy', 'AddressSet', 'BackupPolicy', 'BackupTarget', 'HostGroup', 'Rollout', 'JailTemplate', 'Remote', 'User', 'Token', 'Certificate', 'Host', 'ImageGeneration', 'JailSnapshot', 'Backup', 'Operation', 'Project', 'Storage', 'HostIdentity', 'WireGuard', 'LogForward', 'HostFirewall', 'HostCertificate']
+export const KindValues: readonly Kind[] = ['Jail', 'Image', 'Network', 'FirewallPolicy', 'AddressSet', 'BackupPolicy', 'BackupTarget', 'HostGroup', 'Rollout', 'JailTemplate', 'Remote', 'User', 'Token', 'Certificate', 'Host', 'ImageGeneration', 'JailSnapshot', 'Backup', 'Operation', 'Project', 'Storage', 'HostIdentity', 'WireGuard', 'Volume', 'LogForward', 'HostFirewall', 'HostCertificate']
 
 export type Layout =
   | "thin"
@@ -257,14 +267,19 @@ export interface ACMEStatus {
   terms_url?: string
 }
 
+export interface AddressEntry {
+  address: string
+  comment?: string
+}
+
 export interface AddressSet {
   metadata: ObjectMeta
   spec: AddressSetSpec
 }
 
 export interface AddressSetSpec {
-  addresses: string[]
-  includes?: string[]
+  comment?: string
+  addresses: AddressEntry[]
 }
 
 export interface App {
@@ -286,6 +301,7 @@ export interface App {
   logs?: AppLog[]
   setup?: string[][]
   sysvipc?: boolean
+  stop_timeout?: number
   health?: AppHealth
   resources?: AppResources
   notes?: string
@@ -314,7 +330,6 @@ export interface AppAccessDef {
 export interface AppAccessGrant {
   source: string
   source_kind: string
-  source_project?: string
   addresses?: string[]
   ports: string[]
   database?: string
@@ -534,11 +549,13 @@ export interface BackupPolicy {
 }
 
 export interface BackupPolicySpec {
+  comment?: string
   selector?: Record<string, string>
   targets: string[]
   schedule: string
   retention: RetentionPolicy
   include_state?: boolean
+  exclude_volumes?: boolean
   full_every?: number
   verify_schedule?: string
   verify_mode?: string
@@ -571,11 +588,14 @@ export interface BackupRun {
 
 export interface BackupRunRequest {
   policy: string
+  no_volumes?: boolean
 }
 
 export interface BackupSpec {
+  kind?: string
   jail: string
   jail_uuid: string
+  volume?: VolumeSpec
   host_uuid: string
   policy?: string
   target?: string
@@ -604,6 +624,7 @@ export interface BackupTarget {
 }
 
 export interface BackupTargetSpec {
+  comment?: string
   kind: string
   address?: string
   fingerprint?: string
@@ -618,6 +639,7 @@ export interface BootPolicy {
   autostart?: boolean
   priority?: number
   depends?: string[]
+  stop_timeout?: number
 }
 
 export interface Certificate {
@@ -638,6 +660,7 @@ export interface CertificateInfo {
 }
 
 export interface CertificateSpec {
+  comment?: string
   fingerprint: string
   permission: Permission
   kind: string
@@ -668,6 +691,7 @@ export interface ConfigKey {
   restart_required: boolean
   profile: boolean
   admin?: boolean
+  global?: boolean
   path: string
 }
 
@@ -734,7 +758,7 @@ export interface ExecRequest {
 }
 
 export interface FirewallAttach {
-  policy?: string
+  policies?: string[]
   tags?: string[]
 }
 
@@ -744,14 +768,16 @@ export interface FirewallPolicy {
 }
 
 export interface FirewallPolicySpec {
-  default_in?: string
-  default_out?: string
+  comment?: string
+  default_in: string
+  default_out: string
   rules?: FirewallRule[]
   raw?: string
 }
 
 export interface FirewallRule {
   name?: string
+  comment?: string
   action: string
   direction: string
   proto?: string
@@ -759,7 +785,62 @@ export interface FirewallRule {
   to?: string[]
   ports?: string[]
   log?: boolean
+  disabled?: boolean
   redirect?: Redirect
+}
+
+export interface FirewallTestCase {
+  family: string
+  from: string
+  to: string
+  proto: string
+  port?: number
+  icmp_type?: string
+  verdict: string
+  hops: FirewallTestHop[]
+}
+
+export interface FirewallTestHop {
+  side: string
+  jail: string
+  anchor: string
+  direction: string
+  verdict: string
+  decided_by?: FirewallTestRule
+  why?: string
+  skipped?: FirewallTestSkipped[]
+  loaded_matches_rendered?: string
+}
+
+export interface FirewallTestRequest {
+  from: string
+  to: string
+  proto?: string
+  port?: number
+  icmp_type?: string
+  family?: string
+}
+
+export interface FirewallTestResult {
+  verdict: string
+  cases: FirewallTestCase[]
+  caveats?: string[]
+}
+
+export interface FirewallTestRule {
+  stage: string
+  policy?: string
+  project_policy?: boolean
+  managed?: boolean
+  rule?: number
+  name?: string
+  comment?: string
+  pf: string
+}
+
+export interface FirewallTestSkipped {
+  rule: FirewallTestRule
+  why: string
 }
 
 export interface HostCertificate {
@@ -815,7 +896,7 @@ export interface HostFirewallApply {
   spec: HostFirewallSpec
   dry_run?: boolean
   confirm_within?: number
-  i_know?: boolean
+  confirm_lockout?: boolean
 }
 
 export interface HostFirewallConsole {
@@ -901,12 +982,6 @@ export interface HostIdentityStatus {
   ntp_sync?: HostNTPSync
 }
 
-export interface HostMount {
-  source: string
-  target: string
-  read_only?: boolean
-}
-
 export interface HostNTP {
   servers: string[]
   enable: boolean
@@ -974,7 +1049,6 @@ export interface IPv4Net {
 export interface IPv6Net {
   mode: IPv6Mode
   subnet: string
-  gateway: string
   range: string
   exclude?: string[]
 }
@@ -998,6 +1072,17 @@ export interface ImageAliasSet {
   generation?: number
 }
 
+export interface ImageAutoUpgrade {
+  enabled: boolean
+  at?: string
+  packages?: boolean
+}
+
+export interface ImageAutoUpgradeStatus {
+  next?: string
+  recent?: ImageUpgradeRun[]
+}
+
 export interface ImageBuild {
   from_generation?: number
   dry_run?: boolean
@@ -1010,6 +1095,7 @@ export interface ImageGeneration {
   parent?: number
   manifest: string
   packages?: number
+  freebsd_version?: string
   dataset?: string
   created_at?: string
   refs?: string[]
@@ -1029,17 +1115,20 @@ export interface ImageSource {
 }
 
 export interface ImageSpec {
+  comment?: string
   os: OS
   release: string
   arch: string
   source: ImageSource
   aliases?: string[]
   retention?: ImageRetention
+  auto_upgrade?: ImageAutoUpgrade
 }
 
 export interface ImageStatus {
   generations?: ImageGeneration[]
   aliases?: Record<string, number>
+  auto_upgrade?: ImageAutoUpgradeStatus
 }
 
 export interface ImageUpgrade {
@@ -1068,6 +1157,17 @@ export interface ImageUpgradeResult {
   jails: ImageUpgradeJail[]
 }
 
+export interface ImageUpgradeRun {
+  started: string
+  finished: string
+  result: string
+  generation?: string
+  jails_moved?: number
+  jails_upgraded?: number
+  jails_failed?: number
+  detail?: string
+}
+
 export interface Jail {
   metadata: ObjectMeta
   spec: JailSpec
@@ -1085,12 +1185,6 @@ export interface JailAction {
   action: string
   timeout?: number
   force?: boolean
-}
-
-export interface JailCreate {
-  metadata: ObjectMeta
-  spec: JailSpec
-  volume_passphrase?: string
 }
 
 export interface JailDiskUsage {
@@ -1127,11 +1221,6 @@ export interface JailLogRead {
   truncated?: boolean
 }
 
-export interface JailPassphraseChange {
-  old_passphrase: string
-  new_passphrase: string
-}
-
 export interface JailRollback {
   scope?: RollbackScope
   snapshot?: string
@@ -1154,6 +1243,7 @@ export interface JailSnapshotStatus {
 }
 
 export interface JailSpec {
+  comment?: string
   image: string
   os?: OS
   storage?: string
@@ -1163,12 +1253,12 @@ export interface JailSpec {
   resources?: Resources
   network?: NetworkAttach[]
   firewall?: FirewallAttach
-  volumes?: VolumeMount[]
-  host_mounts?: HostMount[]
+  volumes?: VolumeAttach[]
   boot?: BootPolicy
   packages?: string[]
   env?: Record<string, string>
   shell?: string
+  prompt?: string
   provision?: Provision
   profiles?: string[]
   devfs?: DevfsDevice[]
@@ -1182,6 +1272,7 @@ export interface JailStatus {
   power: PowerState
   jid?: number
   generation?: string
+  freebsd_version?: string
   addresses?: string[]
   started_at?: string
   drift?: string[]
@@ -1189,11 +1280,6 @@ export interface JailStatus {
   provisioned_at?: string
   warnings?: string[]
   locked?: string[]
-}
-
-export interface JailUnlock {
-  passphrase: string
-  start?: boolean
 }
 
 export interface JailUpgrade {
@@ -1220,6 +1306,7 @@ export interface LifecycleEvent {
   source: string
   requestor?: string
   project?: string
+  detail?: string
 }
 
 export interface LogEntry {
@@ -1327,31 +1414,41 @@ export interface NetworkAttach {
   name?: string
   network: string
   mtu?: number
-  ingress?: string
   egress?: string
+  ingress?: string
   ipv4?: string
   ipv6?: string
   mac?: string
 }
 
+export interface NetworkDNS {
+  source: DNSSource
+  nameservers?: string[]
+  advice?: string
+  suffix?: string
+  forward?: string[]
+  recurse?: boolean
+  updated?: string[]
+  not_updated?: string[]
+}
+
 export interface NetworkSpec {
-  bridge?: string
+  comment?: string
   uplink?: string
   ipv4?: IPv4Net
   ipv6?: IPv6Net
   dns?: string[]
   mtu?: number
-  private?: boolean
 }
 
 export interface NetworkStatus {
-  bridge_up?: boolean
-  members?: string[]
+  links?: string[]
   allocated?: number
   free?: number
   orphans?: string[]
   conditions?: Condition[]
   warnings?: string[]
+  dns?: NetworkDNS
 }
 
 export interface OSUpdate {
@@ -1384,6 +1481,13 @@ export interface Operation {
   created_at: string
   updated_at: string
   progress?: number
+  steps?: OperationStep[]
+}
+
+export interface OperationStep {
+  name: string
+  duration_ms: number
+  failed?: boolean
 }
 
 export interface PackageUpdate {
@@ -1410,7 +1514,7 @@ export interface Profile {
 }
 
 export interface ProfileSpec {
-  description?: string
+  comment?: string
   config?: Record<string, string>
 }
 
@@ -1451,12 +1555,12 @@ export interface ProjectQuotas {
 }
 
 export interface ProjectSpec {
-  description?: string
+  comment?: string
   hosts?: string[]
   networks?: ProjectNetwork[]
   storage?: ProjectStorage[]
   quotas?: ProjectQuotas
-  firewall?: string
+  firewall_policies?: string[]
   images?: string[]
   new_network?: boolean
 }
@@ -1525,6 +1629,7 @@ export interface Remote {
 }
 
 export interface RemoteSpec {
+  comment?: string
   address: string
   fingerprint: string
   host_uuid?: string
@@ -1535,6 +1640,29 @@ export interface RemoteStatus {
   last_seen?: string
   version?: string
   extensions?: number
+}
+
+export interface Rename {
+  new_name: string
+  dry_run?: boolean
+}
+
+export interface RenameChange {
+  kind: string
+  object: string
+  detail?: string
+}
+
+export interface RenameResult {
+  kind: Kind
+  project?: string
+  from: string
+  to: string
+  dry_run?: boolean
+  changes: RenameChange[]
+  counts: Record<string, number>
+  steps?: string[]
+  warnings?: string[]
 }
 
 export interface RepositoryStatus {
@@ -1556,6 +1684,7 @@ export interface Resources {
   disk?: string
   pids?: number
   disk_reservation?: string
+  states?: number
 }
 
 export interface Response {
@@ -1578,6 +1707,7 @@ export interface RestoreBundle {
   policies?: FirewallPolicySpec[]
   address_sets?: AddressSetSpec[]
   volumes?: string[]
+  volume_ids?: Record<string, string>
   secret_refs?: string[]
 }
 
@@ -1597,6 +1727,8 @@ export interface RestoreRequest {
   network_map?: Record<string, string>
   keep_ip?: boolean
   dry_run?: boolean
+  no_volumes?: boolean
+  passphrase?: string
 }
 
 export interface RetentionPolicy {
@@ -1656,6 +1788,17 @@ export interface SetupToken {
   hint?: string
 }
 
+export interface ShellSetupRequest {
+}
+
+export interface ShellSetupResult {
+  jail: string
+  shell: string
+  prompt: string
+  ps1?: string
+  steps: string[]
+}
+
 export interface Storage {
   metadata: ObjectMeta
   spec: StorageSpec
@@ -1664,7 +1807,7 @@ export interface Storage {
 
 export interface StorageSpec {
   dataset: string
-  description?: string
+  comment?: string
   compression?: string
   encrypted?: boolean
 }
@@ -1686,6 +1829,7 @@ export interface Token {
 }
 
 export interface TokenSpec {
+  comment?: string
   permission: Permission
   expires_at?: string
   allow_from?: string[]
@@ -1782,6 +1926,7 @@ export interface UserCreated {
 }
 
 export interface UserSpec {
+  comment?: string
   permission: Permission
   projects?: string[]
   global?: boolean
@@ -1789,12 +1934,90 @@ export interface UserSpec {
   totp?: boolean
 }
 
-export interface VolumeMount {
-  name: string
+export interface Volume {
+  metadata: ObjectMeta
+  spec: VolumeSpec
+  status?: VolumeStatus
+}
+
+export interface VolumeAttach {
+  volume: string
   mount: string
-  quota?: string
   read_only?: boolean
+}
+
+export interface VolumeAttachRequest {
+  volume: string
+  mount: string
+  read_only?: boolean
+  copy_existing?: boolean
+}
+
+export interface VolumeCreate {
+  metadata: ObjectMeta
+  spec: VolumeSpec
+  passphrase?: string
+}
+
+export interface VolumePassphraseChange {
+  old_passphrase: string
+  new_passphrase: string
+}
+
+export interface VolumeRollback {
+  snapshot: string
+  confirm_data_loss?: boolean
+}
+
+export interface VolumeSnapshot {
+  metadata: ObjectMeta
+  spec: VolumeSnapshotSpec
+  status: VolumeSnapshotStatus
+}
+
+export interface VolumeSnapshotSpec {
+  volume: string
+  comment?: string
+}
+
+export interface VolumeSnapshotStatus {
+  written?: number
+}
+
+export interface VolumeSpec {
+  storage?: string
+  size?: string
+  uid: number
+  gid: number
+  mode?: string
   encrypted?: boolean
+  path?: string
+  watch?: boolean
+  probe?: string
+  on_loss?: string
+  comment?: string
+}
+
+export interface VolumeStatus {
+  dataset?: string
+  mountpoint?: string
+  used: number
+  locked?: boolean
+  state?: string
+  detail?: string
+  attached_to?: VolumeUse[]
+  warnings?: string[]
+}
+
+export interface VolumeUnlock {
+  passphrase: string
+  start?: boolean
+}
+
+export interface VolumeUse {
+  jail: string
+  mount: string
+  read_only?: boolean
 }
 
 export interface WireGuard {
@@ -1850,6 +2073,7 @@ export interface WireGuardPeerStatus {
 }
 
 export interface WireGuardSpec {
+  comment?: string
   mode: WireGuardMode
   interface?: string
   address: string[]
@@ -1905,6 +2129,15 @@ export const configKeys: readonly ConfigKey[] = [
     "path": "boot.priority"
   },
   {
+    "name": "boot.stop_timeout",
+    "type": "int",
+    "description": "Seconds the jail has to shut down by itself, after its stop command, before it is killed; 0 is the system's ten seconds. A database that needs a minute to close says 60. Written into the jail's configuration at its start.",
+    "example": "60",
+    "restart_required": true,
+    "profile": true,
+    "path": "boot.stop_timeout"
+  },
+  {
     "name": "devfs.\u003cname\u003e.device",
     "type": "enum",
     "values": [
@@ -1925,7 +2158,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "disk.\u003cdevice\u003e",
     "type": "device",
-    "description": "A data volume; set it to the mount path to add it, unset it to remove it.",
+    "description": "A volume of the project attached to the jail: \u003cdevice\u003e is the name of the volume; set it to the mount path to attach it, unset it to detach it.",
     "example": "disk.data=/var/db",
     "restart_required": true,
     "profile": true,
@@ -1934,25 +2167,16 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "disk.\u003cdevice\u003e.mount",
     "type": "string",
-    "description": "Mount path inside the jail.",
+    "description": "Where the volume is mounted inside the jail.",
     "example": "/var/db",
     "restart_required": true,
     "profile": true,
     "path": "volumes[\u003cdevice\u003e].mount"
   },
   {
-    "name": "disk.\u003cdevice\u003e.quota",
-    "type": "size",
-    "description": "ZFS quota of the volume.",
-    "example": "10G",
-    "restart_required": true,
-    "profile": true,
-    "path": "volumes[\u003cdevice\u003e].quota"
-  },
-  {
     "name": "disk.\u003cdevice\u003e.read_only",
     "type": "bool",
-    "description": "Mount the volume read-only.",
+    "description": "Attach the volume read-only.",
     "example": "true",
     "restart_required": true,
     "profile": true,
@@ -1968,13 +2192,13 @@ export const configKeys: readonly ConfigKey[] = [
     "path": "env.\u003cvar\u003e"
   },
   {
-    "name": "firewall.policy",
-    "type": "string",
-    "description": "Firewall policy of the jail's anchor.",
-    "example": "web",
+    "name": "firewall.policies",
+    "type": "list",
+    "description": "Firewall policies of the jail's anchor, in the order they are rendered after the project's.",
+    "example": "postgres,ssh-office",
     "restart_required": false,
     "profile": true,
-    "path": "firewall.policy"
+    "path": "firewall.policies"
   },
   {
     "name": "firewall.tags",
@@ -1998,7 +2222,7 @@ export const configKeys: readonly ConfigKey[] = [
     "name": "image",
     "type": "string",
     "description": "Image reference: name, name@alias or name#gN. The image name cannot change on a living jail.",
-    "example": "freebsd-15@stable",
+    "example": "freebsd-15-1",
     "restart_required": true,
     "profile": false,
     "path": "image"
@@ -2006,7 +2230,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "limits.cpu",
     "type": "int",
-    "description": "CPU cores the jail may use.",
+    "description": "CPU cores the jail may use: more is slowed down to that share (rctl pcpu); needs kern.racct.enable=1.",
     "example": "2",
     "restart_required": true,
     "profile": true,
@@ -2015,7 +2239,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "limits.disk",
     "type": "size",
-    "description": "ZFS quota of the jail's root.",
+    "description": "ZFS quota of the jail's container: its root, persistent datasets, volumes and snapshots together.",
     "example": "20G",
     "restart_required": false,
     "profile": true,
@@ -2024,7 +2248,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "limits.disk_reservation",
     "type": "size",
-    "description": "ZFS reservation of the jail's root.",
+    "description": "ZFS reservation of the jail's container.",
     "example": "5G",
     "restart_required": false,
     "profile": true,
@@ -2033,7 +2257,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "limits.memory",
     "type": "size",
-    "description": "Memory limit.",
+    "description": "Anonymous memory the jail may reserve in total (rctl swapuse): an allocation beyond it fails and nothing is killed; needs kern.racct.enable=1.",
     "example": "2G",
     "restart_required": true,
     "profile": true,
@@ -2042,11 +2266,20 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "limits.pids",
     "type": "int",
-    "description": "Process limit.",
+    "description": "Processes the jail may have (rctl maxproc): fork fails beyond it; needs kern.racct.enable=1.",
     "example": "500",
     "restart_required": true,
     "profile": true,
     "path": "resources.pids"
+  },
+  {
+    "name": "limits.states",
+    "type": "int",
+    "description": "Pf states each rule of the jail's firewall may create, so that one jail cannot fill the host's state table; 0 is the host's default.",
+    "example": "20000",
+    "restart_required": false,
+    "profile": true,
+    "path": "resources.states"
   },
   {
     "name": "nic.\u003cdevice\u003e",
@@ -2060,7 +2293,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "nic.\u003cdevice\u003e.egress",
     "type": "rate",
-    "description": "Rate limit of traffic out of the jail, bits per second. UNVERIFIED: not enforced yet; the jail reports a RateLimit condition.",
+    "description": "Rate limit of what the jail sends through the device, in bits per second: 10M is 10 Mbit/s. Enforced by a dummynet pipe of the host.",
     "example": "10M",
     "restart_required": false,
     "profile": true,
@@ -2069,7 +2302,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "nic.\u003cdevice\u003e.ingress",
     "type": "rate",
-    "description": "Rate limit of traffic into the jail, bits per second. UNVERIFIED: not enforced yet; the jail reports a RateLimit condition.",
+    "description": "Rate limit of what the jail receives through the device, in bits per second: 10M is 10 Mbit/s. Enforced by a dummynet pipe of the host.",
     "example": "10M",
     "restart_required": false,
     "profile": true,
@@ -2105,8 +2338,8 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "nic.\u003cdevice\u003e.mtu",
     "type": "int",
-    "description": "MTU of the interface; 0 keeps the network's.",
-    "example": "1400",
+    "description": "MTU of the interface; 0 takes the network's.",
+    "example": "1500",
     "restart_required": true,
     "profile": true,
     "path": "network[\u003cdevice\u003e].mtu"
@@ -2123,7 +2356,7 @@ export const configKeys: readonly ConfigKey[] = [
   {
     "name": "packages",
     "type": "list",
-    "description": "Not yet: creation is refused when set; use the provisioning packages step.",
+    "description": "Cannot be set when a jail is created yet: a create that sets it is refused. Install packages with the provisioning packages step.",
     "example": "nginx,curl",
     "restart_required": true,
     "profile": true,
@@ -2139,12 +2372,23 @@ export const configKeys: readonly ConfigKey[] = [
     "path": "profiles"
   },
   {
+    "name": "prompt",
+    "type": "string",
+    "description": "Bash prompt of a FreeBSD jail, for every user: default (user@jail in colour, then in grey [project/host], then the directory), short (the same without the grey tag), none (no prompt, the variables stay), or a PS1 text such as \\u@\\h [{project}/{host}]:\\w\\$ with bash's escapes (no ', ` or $ other than \\$: nothing in it runs; \\e or \\033 start a colour) and the words {jail}, {project} and {host}, which read the variables JAILOPS_JAIL, JAILOPS_PROJECT and JAILOPS_HOST that every interactive bash of the jail has. A user's own ~/.bashrc wins. Written into /usr/local/etc/profile.d/jailops-prompt.sh at once in a running jail, else at its next start.",
+    "example": "default",
+    "restart_required": false,
+    "profile": true,
+    "path": "prompt"
+  },
+  {
     "name": "proxy.\u003cname\u003e.jail_port",
     "type": "int",
     "description": "Port inside the jail.",
     "example": "80",
     "restart_required": false,
     "profile": true,
+    "admin": true,
+    "global": true,
     "path": "proxy[\u003cname\u003e].jail_port"
   },
   {
@@ -2154,6 +2398,8 @@ export const configKeys: readonly ConfigKey[] = [
     "example": ":8080",
     "restart_required": false,
     "profile": true,
+    "admin": true,
+    "global": true,
     "path": "proxy[\u003cname\u003e].listen"
   },
   {
@@ -2167,13 +2413,15 @@ export const configKeys: readonly ConfigKey[] = [
     "example": "tcp",
     "restart_required": false,
     "profile": true,
+    "admin": true,
+    "global": true,
     "path": "proxy[\u003cname\u003e].proto"
   },
   {
     "name": "shell",
     "type": "string",
-    "description": "Shell that `jailops shell` starts: a path inside the jail (/bin/sh when empty). A management setting; /etc/passwd is not touched.",
-    "example": "/usr/local/bin/bash",
+    "description": "Shell that `jailops shell` and the console start: bash, sh or a path inside the jail (/bin/sh when empty). New FreeBSD jails get bash. A management setting; /etc/passwd is not touched. `jailops jail shell-setup` installs bash when it is missing.",
+    "example": "bash",
     "restart_required": false,
     "profile": true,
     "path": "shell"
@@ -2281,9 +2529,18 @@ export const configKeys: readonly ConfigKey[] = [
     "restart_required": false,
     "profile": true,
     "path": "update.schedule"
+  },
+  {
+    "name": "zfs.delegation",
+    "type": "bool",
+    "description": "Global administrators only. Hands the jail a ZFS dataset of its own, \u003ccontainer\u003e/delegated: root in the jail can create datasets, snapshots and mounts below it, outside the rules JailOps applies to the jail's data. The host's priv.conf must allow it (admin-zfs-delegation).",
+    "example": "true",
+    "restart_required": true,
+    "profile": false,
+    "path": "zfs_delegation"
   }
 ]
 
 export const apiVersion = "1.0"
 /** Extensions of the API revision this UI was generated against. */
-export const knownExtensions: readonly string[] = ['operations', 'etag', 'events', 'jails', 'jail_snapshots', 'jail_rollback_scopes', 'images_pkgbase', 'image_generations', 'networks_vnet', 'network_ipam_range', 'firewall_anchors', 'backup_policies', 'backup_pull', 'backup_push', 'restore_preflight', 'audit_log', 'doctor', 'resources', 'jail_copy', 'projects', 'project_quotas', 'storage', 'trust_tokens', 'sessions', 'fleet_projects', 'config_keys', 'jail_config', 'profiles', 'jail_devices', 'jail_exec', 'jail_console', 'backup_key', 'backup_run', 'backup_verify', 'updates', 'jail_shell', 'provisioning', 'sealed_secrets', 'image_aliases', 'image_upgrade', 'jail_usage', 'apps', 'jail_logs', 'app_install', 'app_draft', 'host_identity', 'host_firewall', 'host_pending', 'wireguard', 'interface_descriptions', 'app_access', 'logs_unified', 'log_forward', 'volume_unlock', 'setup', 'host_certificate']
+export const knownExtensions: readonly string[] = ['operations', 'etag', 'events', 'jails', 'jail_snapshots', 'jail_rollback_scopes', 'images_pkgbase', 'image_generations', 'networks_vnet', 'network_ipam_range', 'firewall_anchors', 'backup_policies', 'backup_pull', 'backup_push', 'restore_preflight', 'audit_log', 'doctor', 'resources', 'jail_copy', 'projects', 'project_quotas', 'storage', 'trust_tokens', 'sessions', 'fleet_projects', 'config_keys', 'jail_config', 'profiles', 'jail_devices', 'jail_exec', 'jail_console', 'backup_key', 'backup_run', 'backup_verify', 'updates', 'jail_shell', 'provisioning', 'sealed_secrets', 'image_aliases', 'image_upgrade', 'jail_usage', 'apps', 'jail_logs', 'app_install', 'app_draft', 'host_identity', 'host_firewall', 'host_pending', 'wireguard', 'interface_descriptions', 'app_access', 'logs_unified', 'log_forward', 'volumes', 'setup', 'host_certificate', 'jail_shell_setup', 'rename', 'boot_plan', 'firewall_test']

@@ -4,19 +4,15 @@
 04 ifconfig joe49a245eed00a description jailops jail=web/nginx net=lan (host side)
 05 ifconfig joe49a245eed00a mtu 1500
 06 ifconfig joe49a245eed00b mtu 1500
-07 ifconfig jo0 addm joe49a245eed00a
-08 ifconfig jo0 static joe49a245eed00a ca:64:60:d0:bb:57
-09 ifconfig jo0 private joe49a245eed00a
-10 ifconfig joe49a245eed00a up
-11 route add -inet6 2001:db8:2::100/128 -interface jo0gb
+07 ifconfig joe49a245eed00a inet 10.20.0.1/32 alias
+08 ifconfig joe49a245eed00a inet6 fe80::1/64 alias
+09 ifconfig joe49a245eed00a up
+10 route add -inet 10.20.0.10/32 -interface joe49a245eed00a
+11 route add -inet6 2001:db8:2::100/128 -interface joe49a245eed00a
 12 ndproxy answer 2001:db8:2::100 on em0
-13 ifconfig jo0gb staticarp
-14 ndp -s 10.20.0.10 ca:64:60:d0:bb:57   (on jo0gb)
-15 ndp -s 2001:db8:2::100 ca:64:60:d0:bb:57   (on jo0gb)
-16 ndp -s fe80::c864:60ff:fed0:bb57 ca:64:60:d0:bb:57   (on jo0gb)
-17 [host, jail] ifconfig -j <jail> joe49a245eed00b description jailops jail=web/nginx net=lan (jail side)
-18 [host, jail] ifconfig -j <jail> joe49a245eed00b inet 10.20.0.10/24 up
-19 [host, jail] ifconfig -j <jail> joe49a245eed00b inet6 2001:db8:2::100 prefixlen 128 alias
-20 [host, jail] ifconfig -j <jail> joe49a245eed00b up
-21 [host, jail] route -j <jail> add default 10.20.0.1
-22 [host, jail] route -j <jail> add -inet6 default fe80::1%joe49a245eed00b
+13 [host, jail] ifconfig -j <jail> joe49a245eed00b description jailops jail=web/nginx net=lan (jail side)
+14 [host, jail] ifconfig -j <jail> joe49a245eed00b inet 10.20.0.10/24 up
+15 [host, jail] ifconfig -j <jail> joe49a245eed00b inet6 2001:db8:2::100 prefixlen 128 alias
+16 [host, jail] ifconfig -j <jail> joe49a245eed00b up
+17 [host, jail] route -j <jail> add default 10.20.0.1
+18 [host, jail] route -j <jail> add -inet6 default fe80::1%joe49a245eed00b

@@ -187,7 +187,7 @@ func (s *Service) usageOf(name, except string) usage {
 	s.mu.RLock()
 	for key, e := range s.jails {
 		if key != except && e.jail.Metadata.Project == name {
-			u.add(e.jail.Spec)
+			u.add(s.effective(e.jail))
 		}
 	}
 	s.mu.RUnlock()
@@ -319,6 +319,14 @@ func (s *Service) checkProjectInUse(name string, old, next api.ProjectSpec) erro
 				WithHint("delete the jail first")
 		}
 	}
+	if l, err := s.volKind.p(name).list(); err == nil {
+		for _, v := range l {
+			if !v.Spec.IsHostDir() && !specGrantsStorage(next, v.Spec.Storage) {
+				return api.Errorf(api.CodeBusy, "storage %q holds volume %q of the project", v.Spec.Storage, v.Meta.Name).
+					WithHint("delete the volume first")
+			}
+		}
+	}
 	u := s.usageOf(name, "")
 	q := next.Quotas
 	for _, c := range []struct {
@@ -385,8 +393,12 @@ func (s *Service) ensureProjectDatasets(ctx context.Context, project string, si 
 	cur, _ := z.Get(ctx, projDS, "quota")
 	have := cur["quota"].Value
 	switch {
-	case g.Quota != "" && have != g.Quota:
-		if err := z.Set(ctx, projDS, map[string]string{"quota": g.Quota}); err != nil {
+	case g.Quota != "" && quotaDiffers(have, g.Quota):
+		want, err := validate.CanonicalSize("quota", g.Quota)
+		if err != nil {
+			return err
+		}
+		if err := z.Set(ctx, projDS, map[string]string{"quota": want}); err != nil {
 			return internal(err)
 		}
 	case g.Quota == "" && have != "" && have != "-" && have != "none" && have != "0":
@@ -439,7 +451,7 @@ func (s *Service) newProjectNetwork(ctx context.Context, name string) (string, e
 	if err != nil {
 		return "", err
 	}
-	var used []netip.Prefix
+	used := s.hostPrefixes(ctx)
 	for _, o := range objs {
 		if o.Spec.IPv4 != nil {
 			if p, err := netip.ParsePrefix(o.Spec.IPv4.Subnet); err == nil {
@@ -486,7 +498,7 @@ func (s *Service) newProjectNetwork(ctx context.Context, name string) (string, e
 		return "", api.Errorf(api.CodeAlreadyExists, "a network named %q exists already", netName).
 			WithHint("create the project without new_network and grant that network")
 	}
-	n, err := s.CreateNetwork(ctx, api.Network{Metadata: api.ObjectMeta{Name: netName, Labels: map[string]string{"jailops.project": name}}, Spec: spec})
+	n, err := s.CreateNetwork(ctx, api.Network{Metadata: api.ObjectMeta{Name: netName, Labels: map[string]string{labelProject: name}}, Spec: spec})
 	if err != nil {
 		return "", err
 	}
@@ -521,6 +533,12 @@ func (s *Service) CreateProject(ctx context.Context, in api.Project) (api.Projec
 	if err := validate.ProjectSpec(name, spec); err != nil {
 		return api.Project{}, err
 	}
+	if err := validate.NameLength("project", "name", name, validate.MaxProjectName); err != nil {
+		return api.Project{}, err
+	}
+	if err := canonicalProjectSizes(&spec); err != nil {
+		return api.Project{}, err
+	}
 	unlock, err := s.locks.lockPatient(ctx, "create project "+name, projectLock(name))
 	if err != nil {
 		return api.Project{}, err
@@ -529,9 +547,9 @@ func (s *Service) CreateProject(ctx context.Context, in api.Project) (api.Projec
 	if err := s.projKind.notTaken(name); err != nil {
 		return api.Project{}, err
 	}
-	if spec.Firewall != "" {
-		return api.Project{}, api.Errorf(api.CodeNotFound, "firewall policy %q does not exist in the new project", spec.Firewall).
-			WithHint("create the project, create the policy in it, then set spec.firewall")
+	if len(spec.FirewallPolicies) > 0 {
+		return api.Project{}, api.Errorf(api.CodeNotFound, "firewall policy %q does not exist in the new project", spec.FirewallPolicies[0]).
+			WithHint("create the project, create the policy in it, then set spec.firewall_policies")
 	}
 	var madeNet string
 	if spec.NewNetwork {
@@ -572,12 +590,15 @@ func (s *Service) UpdateProject(ctx context.Context, name string, in api.Project
 		return api.Project{}, err
 	}
 	if in.Metadata.Name != "" && in.Metadata.Name != name {
-		return api.Project{}, invalid("renaming is not supported")
+		return api.Project{}, renameByAction("project", "projects")
 	}
 	if in.Spec.NewNetwork {
 		return api.Project{}, invalid("new_network applies when a project is created").WithHint("create a network and grant it")
 	}
 	if err := validate.ProjectSpec(name, in.Spec); err != nil {
+		return api.Project{}, err
+	}
+	if err := canonicalProjectSizes(&in.Spec); err != nil {
 		return api.Project{}, err
 	}
 	unlock, err := s.locks.lockPatient(ctx, "update project "+name, projectLock(name))
@@ -589,9 +610,19 @@ func (s *Service) UpdateProject(ctx context.Context, name string, in api.Project
 	if err != nil {
 		return api.Project{}, err
 	}
-	if in.Spec.Firewall != "" && in.Spec.Firewall != old.Spec.Firewall {
-		if !s.polKind.p(name).exists(in.Spec.Firewall) {
-			return api.Project{}, api.Errorf(api.CodeNotFound, "firewall policy %q does not exist in project %q", in.Spec.Firewall, name)
+	for _, pn := range in.Spec.FirewallPolicies {
+		if slices.Contains(old.Spec.FirewallPolicies, pn) {
+			continue
+		}
+		o, err := s.polKind.p(name).get(pn)
+		if err != nil {
+			if api.IsCode(err, api.CodeNotFound) {
+				return api.Project{}, api.Errorf(api.CodeNotFound, "firewall policy %q does not exist in project %q", pn, name)
+			}
+			return api.Project{}, err
+		}
+		if o.Meta.ManagedBy != "" {
+			return api.Project{}, invalid("firewall policy %q is managed by %s: it belongs to its own jail and cannot be a mandatory policy", pn, o.Meta.ManagedBy)
 		}
 	}
 	if err := s.checkProjectRefs(name, in.Spec, name); err != nil {
@@ -641,11 +672,60 @@ func (s *Service) projectObjects(name string) (map[string]int, int) {
 	if l, err := s.bpolKind.p(name).list(); err == nil {
 		held["backup policies"] = len(l)
 	}
+	if l, err := s.volKind.p(name).list(); err == nil {
+		held["volumes"] = len(l)
+	}
 	total := 0
 	for _, n := range held {
 		total += n
 	}
 	return held, total
+}
+
+// projectLeftovers names the datasets below the datasets of a project on any storage that are not the empty
+// containers JailOps keeps for it: what is there belongs to something that is not an object of the project any more.
+func (s *Service) projectLeftovers(ctx context.Context, name string) ([]string, error) {
+	z := s.d.ZClient
+	if z == nil {
+		return nil, nil
+	}
+	var out []string
+	for _, si := range s.storageList() {
+		pd := lifecycle.ProjectDS(si.lifecycle(), name)
+		if ok, _ := z.Exists(ctx, pd); !ok {
+			continue
+		}
+		if p, _ := z.Get(ctx, pd, "jailops:managed"); p["jailops:managed"].Value != "on" {
+			continue
+		}
+		list, err := z.List(ctx, zfs.ListOpts{Root: pd, Recursive: true})
+		if err != nil {
+			return nil, err
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+		keep := map[string]bool{
+			pd: true, lifecycle.ProjectJailsDS(si.lifecycle(), name): true, lifecycle.ProjectVolumesDS(si.lifecycle(), name): true,
+		}
+		var offenders []string
+		for _, d := range list {
+			if keep[d.Name] {
+				continue
+			}
+			covered := false
+			for _, o := range offenders {
+				if strings.HasPrefix(d.Name, o+"/") {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				offenders = append(offenders, d.Name)
+			}
+		}
+		sort.Strings(offenders)
+		out = append(out, offenders...)
+	}
+	return out, nil
 }
 
 // DeleteProject deletes an empty project and its datasets.
@@ -679,7 +759,16 @@ func (s *Service) DeleteProject(ctx context.Context, name string, expect int64) 
 			}
 		}
 		sort.Strings(parts)
-		return api.Errorf(api.CodeBusy, "project %q is not empty: %s", name, strings.Join(parts, ", ")).WithHint("delete them first")
+		return api.Errorf(api.CodeBusy, "project %q is not empty: %s", name, strings.Join(parts, ", ")).WithHint("delete them first (volumes with 'jailops volume delete', which asks before it destroys data)")
+	}
+	// What is left below the project's datasets is data that no object of the project accounts for (a volume dataset
+	// whose object is gone, a jail container parked by a replace-restore, a dataset an interrupted operation left):
+	// it is named, and nothing is destroyed until the operator has dealt with it.
+	if left, err := s.projectLeftovers(ctx, name); err != nil {
+		return err
+	} else if len(left) > 0 {
+		return api.Errorf(api.CodeBusy, "project %q still has datasets: %s", name, strings.Join(left, ", ")).
+			WithHint("look at them with 'zfs list -r', keep what you need and destroy the rest with 'zfs destroy -r' (jailops would delete them with the project)")
 	}
 	if err := s.projKind.delete(ctx, name, expect); err != nil {
 		return err
@@ -729,10 +818,6 @@ func (s *Service) admit(ctx context.Context, p project, key string, spec *api.Ja
 	if spec.Delegate && (old == nil || !old.Delegate) && !globalAdmin {
 		return nil, api.Errorf(api.CodeForbidden, "ZFS delegation is granted by a global administrator only")
 	}
-	if len(spec.HostMounts) > 0 && !globalAdmin && (old == nil || !slices.Equal(spec.HostMounts, old.HostMounts)) {
-		return nil, api.Errorf(api.CodeForbidden, "mounting host directories into a jail is granted by a global administrator only").
-			WithHint("the host operator also lists the allowed directories with admin-host-mount in priv.conf")
-	}
 	profs, err := s.resolveProfiles(p.Meta.Name, spec.Profiles)
 	if err != nil {
 		return nil, err
@@ -741,6 +826,10 @@ func (s *Service) admit(ctx context.Context, p project, key string, spec *api.Ja
 	eff, _ := api.ExpandedConfig(*spec, profs)
 	if err := s.checkSealedEnv(eff.Env); err != nil {
 		return nil, err
+	}
+	if spec.Delegate && eff.Resources.Disk == "" {
+		return nil, invalid("ZFS delegation needs a disk limit: the jail manages the dataset it is handed, and without a quota on its container it can fill the pool").
+			WithHint("set limits.disk, for example `jailops config set JAIL limits.disk 20G`")
 	}
 	if len(eff.Network) == 0 {
 		return nil, invalid("a jail needs a network: name one with --network NAME or use a profile that has one")
@@ -751,11 +840,28 @@ func (s *Service) admit(ctx context.Context, p project, key string, spec *api.Ja
 		}
 		if _, ok := specGrantsNetwork(p.Spec, eff.Network[i].Network); !ok {
 			return nil, api.Errorf(api.CodeForbidden, "network %q is not granted to project %q", eff.Network[i].Network, p.Meta.Name).
-				WithHint("an administrator grants networks with `jailops project set`")
+				WithHint(fmt.Sprintf("a global admin grants it: jailops network grant %s --project %s", eff.Network[i].Network, p.Meta.Name))
 		}
 	}
 	if len(eff.Devfs) > 0 && !a.Perm.Satisfies(api.PermAdmin) {
 		return nil, api.Errorf(api.CodeForbidden, "exposing device nodes needs the admin role")
+	}
+	if len(eff.Proxy) > 0 {
+		if old == nil || !slices.Equal(eff.Proxy, s.effective(api.Jail{Spec: *old}).Proxy) {
+			if err := requireGlobalForForward(ctx, "forwarding a host port into a jail"); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.checkProxyDevices(ctx, "jail "+key, eff.Proxy); err != nil {
+			return nil, err
+		}
+	}
+	var wasVolumes []api.VolumeAttach
+	if old != nil {
+		wasVolumes = s.effective(api.Jail{Spec: *old}).Volumes
+	}
+	if err := s.hostDirAdmission(ctx, p.Meta.Name, eff.Volumes, wasVolumes); err != nil {
+		return nil, err
 	}
 	if len(eff.Proxy) > 0 {
 		up := false
@@ -778,7 +884,8 @@ func (s *Service) admit(ctx context.Context, p project, key string, spec *api.Ja
 		return nil, invalid("a jail needs a storage: name one with --storage NAME or use a profile that has one")
 	}
 	if !specGrantsStorage(p.Spec, spec.Storage) {
-		return nil, api.Errorf(api.CodeForbidden, "storage %q is not granted to project %q", spec.Storage, p.Meta.Name)
+		return nil, api.Errorf(api.CodeForbidden, "storage %q is not granted to project %q", spec.Storage, p.Meta.Name).
+			WithHint(fmt.Sprintf("a global admin grants it: jailops storage grant %s --project %s", spec.Storage, p.Meta.Name))
 	}
 	if _, ok := s.storage(spec.Storage); !ok {
 		return nil, notFound("storage", spec.Storage)
@@ -792,6 +899,9 @@ func (s *Service) admit(ctx context.Context, p project, key string, spec *api.Ja
 	}
 	s.quotaMu.Lock()
 	defer s.quotaMu.Unlock()
+	if err := s.checkEncryptedSharing(p.Meta.Name, key, eff.Volumes); err != nil {
+		return nil, err
+	}
 	u := s.usageOfLocked(p.Meta.Name, key)
 	if err := s.checkQuota(p, eff, u, isNew); err != nil {
 		return nil, err
@@ -807,13 +917,34 @@ func (s *Service) admit(ctx context.Context, p project, key string, spec *api.Ja
 	}, nil
 }
 
+// usageWithoutLocked sums the jails of a project (those being created included) except the jails in skip, for a
+// caller that holds quotaMu and counts those jails itself with the specs they would have.
+func (s *Service) usageWithoutLocked(name string, skip map[string]api.JailSpec) usage {
+	var u usage
+	s.mu.RLock()
+	for key, e := range s.jails {
+		if _, skipped := skip[key]; !skipped && e.jail.Metadata.Project == name {
+			u.add(s.effective(e.jail))
+		}
+	}
+	for key, pj := range s.pending {
+		if _, registered := s.jails[key]; !registered && pj.project == name {
+			if _, skipped := skip[key]; !skipped {
+				u.add(pj.spec)
+			}
+		}
+	}
+	s.mu.RUnlock()
+	return u
+}
+
 // usageOfLocked is usageOf for a caller that holds quotaMu.
 func (s *Service) usageOfLocked(name, except string) usage {
 	var u usage
 	s.mu.RLock()
 	for key, e := range s.jails {
 		if key != except && e.jail.Metadata.Project == name {
-			u.add(e.jail.Spec)
+			u.add(s.effective(e.jail))
 		}
 	}
 	for key, pj := range s.pending {
@@ -840,7 +971,7 @@ func (s *Service) checkQuota(p project, spec api.JailSpec, u usage, isNew bool) 
 	}
 	if q.CPU > 0 {
 		if spec.Resources.CPU == 0 {
-			return invalid("project %q has a cpu quota: set resources.cpu on the jail", name)
+			return invalid("project %q has a CPU quota: give the jail a CPU limit (--cpu N, or limits.cpu)", name)
 		}
 		if u.cpu+spec.Resources.CPU > q.CPU {
 			return quotaErr("cpu", uint64(q.CPU), uint64(u.cpu), uint64(spec.Resources.CPU))
@@ -848,7 +979,7 @@ func (s *Service) checkQuota(p project, spec api.JailSpec, u usage, isNew bool) 
 	}
 	if q.PIDs > 0 {
 		if spec.Resources.PIDs == 0 {
-			return invalid("project %q has a pids quota: set resources.pids on the jail", name)
+			return invalid("project %q has a process quota: give the jail a process limit (--pids N, or limits.pids)", name)
 		}
 		if u.pids+spec.Resources.PIDs > q.PIDs {
 			return quotaErr("pids", uint64(q.PIDs), uint64(u.pids), uint64(spec.Resources.PIDs))
@@ -858,7 +989,7 @@ func (s *Service) checkQuota(p project, spec api.JailSpec, u usage, isNew bool) 
 		limit := memBytes(q.Memory)
 		want := memBytes(spec.Resources.Memory)
 		if want == 0 {
-			return invalid("project %q has a memory quota: set resources.memory on the jail", name)
+			return invalid("project %q has a memory quota: give the jail a memory limit (--memory SIZE, or limits.memory)", name)
 		}
 		if u.memory+want > limit {
 			return quotaErr("memory", limit, u.memory, want)

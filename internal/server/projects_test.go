@@ -287,14 +287,15 @@ func TestProjectDatasetQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := e.ZFS.Get(c, "tank/jailops/projects/alpha", "quota")
-	if err != nil || p["quota"].Value != "500G" {
+	// stored and written as bytes: ZFS reports bytes (zfs get -p) and the helper takes no other spelling
+	if err != nil || p["quota"].Value != "536870912000" {
 		t.Fatalf("%v %v", err, p)
 	}
 	if _, err := e.Admin.Projects().Patch(ctxT(t), "alpha", map[string]any{"spec": map[string]any{"storage": []map[string]any{{"storage": "default", "quota": "1T"}}}}, ""); err != nil {
 		t.Fatal(err)
 	}
 	p, _ = e.ZFS.Get(c, "tank/jailops/projects/alpha", "quota")
-	if p["quota"].Value != "1T" {
+	if p["quota"].Value != "1099511627776" {
 		t.Fatalf("%v", p)
 	}
 }
@@ -418,9 +419,9 @@ func TestMandatoryFirewallPolicyComesFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The mandatory policy must exist in the project.
-	_, err := e.Admin.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall": "missing"}}, "")
+	_, err := e.Admin.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall_policies": []string{"missing"}}}, "")
 	wantCode(t, err, api.CodeNotFound)
-	if _, err := e.Admin.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall": "corp"}}, ""); err != nil {
+	if _, err := e.Admin.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall_policies": []string{"corp"}}}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := alpha.Firewall().Policies().Create(c, pol("own", api.FirewallRule{Name: "own-allow-web", Action: "allow", Direction: "in", Proto: "tcp", Ports: []string{"80"}})); err != nil {
@@ -433,13 +434,13 @@ func TestMandatoryFirewallPolicyComesFirst(t *testing.T) {
 	_, err = alpha.Firewall().Policies().Patch(c, "corp", map[string]any{"spec": map[string]any{"default_in": "allow"}}, "")
 	wantCode(t, err, api.CodeForbidden)
 	wantCode(t, alpha.Firewall().Policies().Delete(c, "corp"), api.CodeForbidden)
-	_, err = alpha.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall": ""}}, "")
+	_, err = alpha.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall_policies": []string{}}}, "")
 	wantCode(t, err, api.CodeForbidden)
 	// Even the global admin cannot delete it while the project names it.
 	wantCode(t, admin.Firewall().Policies().Delete(c, "corp"), api.CodeBusy)
 
 	sp := webSpec()
-	sp.Firewall.Policy = "own"
+	sp.Firewall.Policies = []string{"own"}
 	op, err := alpha.Jails().Create(c, sdk.NewJail("web", sp))
 	if err != nil {
 		t.Fatal(err)
@@ -478,7 +479,88 @@ func TestMandatoryFirewallPolicyComesFirst(t *testing.T) {
 	}
 }
 
-// --new-network: a dedicated bridge and subnet from the configured pool.
+// A project and a jail can each have several policies. The anchor holds the project's in their order, then the jail's in
+// theirs, each under its own heading with its own rule numbers; the strictest default of them all applies, and a jail
+// without any policy is open.
+func TestSeveralPoliciesOfAJailAndAProject(t *testing.T) {
+	e, alpha, _ := twoProjects(t)
+	c := ctxT(t)
+	admin := e.Admin.Project("alpha")
+	pol := func(name, in, out string, rules ...api.FirewallRule) {
+		t.Helper()
+		if _, err := admin.Firewall().Policies().Create(c, api.FirewallPolicy{Metadata: api.ObjectMeta{Name: name}, Spec: api.FirewallPolicySpec{DefaultIn: in, DefaultOut: out, Rules: rules}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allow := func(name, port string) api.FirewallRule {
+		return api.FirewallRule{Name: name, Action: "allow", Direction: "in", Proto: "tcp", Ports: []string{port}}
+	}
+	pol("corp", "deny", "allow", allow("corp-ssh", "22"))
+	pol("mon", "deny", "allow", allow("mon-metrics", "9100"))
+	pol("pg", "allow", "allow", allow("pg-5432", "5432"), allow("pg-5433", "5433"))
+	pol("closed-out", "allow", "deny", allow("office-22", "22"))
+	if _, err := e.Admin.Projects().Patch(c, "alpha", map[string]any{"spec": map[string]any{"firewall_policies": []string{"corp", "mon"}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	sp := webSpec()
+	sp.Firewall.Policies = []string{"pg", "closed-out"}
+	op, err := alpha.Jails().Create(c, sdk.NewJail("web", sp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Wait(c); err != nil {
+		t.Fatal(err)
+	}
+	so, _ := alpha.Jails().Start(c, "web")
+	if _, err := so.Wait(c); err != nil {
+		t.Fatalf("%v\n%s", err, e.Log())
+	}
+	rs := e.File(e.Cfg.StateDir + "/rendered/pf/alpha_web.conf")
+	last := -1
+	for _, m := range []string{"# project policy corp", "# rule 1: corp-ssh", "# project policy mon", "# rule 1: mon-metrics",
+		"# policy pg", "# rule 1: pg-5432", "# rule 2: pg-5433", "# policy closed-out", "# rule 1: office-22", "# defaults"} {
+		i := strings.Index(rs, m)
+		if i < 0 || i < last {
+			t.Fatalf("%q is missing or out of order:\n%s", m, rs)
+		}
+		last = i
+	}
+	// strictest wins: deny inbound from corp, deny outbound from closed-out
+	for _, want := range []string{"block drop out quick on", "block drop in quick on"} {
+		found := false
+		for _, ln := range strings.Split(rs[strings.Index(rs, "# defaults"):], "\n") {
+			if strings.HasPrefix(ln, want) && strings.Contains(ln, " all") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("the defaults lack %q:\n%s", want, rs)
+		}
+	}
+	// a jail that names nothing gets the project's policies, and their defaults
+	createJail(t, alpha, "bare")
+	bo, _ := alpha.Jails().Start(c, "bare")
+	if _, err := bo.Wait(c); err != nil {
+		t.Fatal(err)
+	}
+	bare := e.File(e.Cfg.StateDir + "/rendered/pf/alpha_bare.conf")
+	if !strings.Contains(bare, "# project policy corp") || !strings.Contains(bare, "# project policy mon") || strings.Contains(bare, "# policy pg") {
+		t.Fatalf("a jail without policies of its own:\n%s", bare)
+	}
+	// the policies a list names are not deleted, and a list does not name one twice or one that is not there
+	wantCode(t, admin.Firewall().Policies().Delete(c, "pg"), api.CodeBusy)
+	wantCode(t, admin.Firewall().Policies().Delete(c, "mon"), api.CodeBusy)
+	dup := webSpec()
+	dup.Firewall.Policies = []string{"pg", "pg"}
+	_, err = alpha.Jails().Create(c, sdk.NewJail("dup", dup))
+	wantCode(t, err, api.CodeInvalid)
+	missing := webSpec()
+	missing.Firewall.Policies = []string{"ghost"}
+	_, err = alpha.Jails().Create(c, sdk.NewJail("ghost", missing))
+	wantCode(t, err, api.CodeNotFound)
+}
+
+// --new-network: a dedicated network and subnet from the configured pool.
 func TestNewNetworkCarvesASubnetFromThePool(t *testing.T) {
 	e := dtest.New(t, dtest.Options{Mutate: func(c *daemon.Config) {
 		c.Projects.NetworkPool, c.Projects.NetworkBits = "10.64.0.0/16", 24
@@ -501,7 +583,7 @@ func TestNewNetworkCarvesASubnetFromThePool(t *testing.T) {
 	}
 	na, _ := e.Global().Networks().Get(c, "web")
 	nb, _ := e.Global().Networks().Get(c, "db")
-	if na.Spec.IPv4.Subnet != "10.64.0.0/24" || nb.Spec.IPv4.Subnet != "10.64.1.0/24" || na.Spec.Bridge == nb.Spec.Bridge ||
+	if na.Spec.IPv4.Subnet != "10.64.0.0/24" || nb.Spec.IPv4.Subnet != "10.64.1.0/24" ||
 		na.Spec.IPv4.Gateway != "10.64.0.1" || !na.Spec.IPv4.NAT || na.Spec.Uplink != "em0" {
 		t.Fatalf("%+v\n%+v", na.Spec, nb.Spec)
 	}
@@ -556,6 +638,7 @@ func TestGrantRemovalAndDelegation(t *testing.T) {
 	// Delegation.
 	sp := webSpec()
 	sp.Delegate = true
+	sp.Resources.Disk = "10G"
 	_, err = alpha.Jails().Create(c, sdk.NewJail("deleg", sp))
 	wantCode(t, err, api.CodeForbidden)
 	gop, err := e.Admin.Project("alpha").Jails().Create(c, sdk.NewJail("deleg", sp))
@@ -573,9 +656,68 @@ func TestGrantRemovalAndDelegation(t *testing.T) {
 	if !strings.Contains(conf, "allow.mount.zfs") {
 		t.Fatalf("delegation is not rendered:\n%s", conf)
 	}
+	dds := "tank/jailops/projects/alpha/jails/deleg/delegated"
+	if !strings.Contains(conf, `zfs.dataset = "`+dds+`";`) {
+		t.Fatalf("the delegated dataset is not named for jail(8):\n%s", conf)
+	}
+	if p, err := e.ZFS.Get(c, dds, "jailed"); err != nil || p["jailed"].Value != "on" {
+		t.Fatalf("the delegated dataset is not jailed: %v %v", p, err)
+	}
+	// doctor: a jail that asks for the dataset and a dataset that is jailed
+	delegCheck := func() api.DoctorCheck {
+		rep, err := e.Admin.Doctor(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range rep.Checks {
+			if ch.Name == "jail.delegation" {
+				return ch
+			}
+		}
+		t.Fatalf("no jail.delegation check: %+v", rep.Checks)
+		return api.DoctorCheck{}
+	}
+	if ch := delegCheck(); ch.Status != api.DoctorOK {
+		t.Fatalf("%+v", ch)
+	}
+	// a jail does not start without the property: the dataset would be mounted on the host too
+	st, _ := e.Admin.Project("alpha").Jails().Stop(c, "deleg")
+	if _, err := st.Wait(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ZFS.Set(c, dds, map[string]string{"jailed": "off"}); err != nil {
+		t.Fatal(err)
+	}
+	if ch := delegCheck(); ch.Status != api.DoctorFail || !strings.Contains(ch.Message, "deleg") {
+		t.Fatalf("a delegated dataset without jailed: %+v", ch)
+	}
+	if so, err := e.Admin.Project("alpha").Jails().Start(c, "deleg"); err == nil {
+		if _, err = so.Wait(c); err == nil {
+			t.Fatal("the jail started although its delegated dataset is not jailed")
+		}
+	}
+	// turning it off and on again hands the dataset over again
+	dj, tag, _ := e.Admin.Project("alpha").Jails().GetETag(c, "deleg")
+	dj.Spec.Delegate = false
+	if _, err := e.Admin.Project("alpha").Jails().Update(c, "deleg", dj, tag); err != nil {
+		t.Fatal(err)
+	}
+	dj, tag, _ = e.Admin.Project("alpha").Jails().GetETag(c, "deleg")
+	dj.Spec.Delegate = true
+	dj.Spec.Resources.Disk = "10G"
+	if _, err := e.Admin.Project("alpha").Jails().Update(c, "deleg", dj, tag); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := e.ZFS.Get(c, dds, "jailed"); p["jailed"].Value != "on" {
+		t.Fatalf("turning delegation on did not hand the dataset over: %v", p)
+	}
+	if ch := delegCheck(); ch.Status != api.DoctorOK {
+		t.Fatalf("after turning it on again: %+v", ch)
+	}
 	// The project user cannot switch it on for another jail by update.
 	j, etag, _ := alpha.Jails().GetETag(c, "web")
 	j.Spec.Delegate = true
+	j.Spec.Resources.Disk = "10G"
 	_, err = alpha.Jails().Update(c, "web", j, etag)
 	wantCode(t, err, api.CodeForbidden)
 }
@@ -642,7 +784,10 @@ func TestTagsDoNotCrossProjects(t *testing.T) {
 	}
 	mk := func(cl *sdk.Client, name, policy string, tags ...string) api.Jail {
 		sp := webSpecIn(cl.ProjectName())
-		sp.Firewall = api.FirewallAttach{Policy: policy, Tags: tags}
+		sp.Firewall = api.FirewallAttach{Tags: tags}
+		if policy != "" {
+			sp.Firewall.Policies = []string{policy}
+		}
 		op, err := cl.Jails().Create(c, sdk.NewJail(name, sp))
 		if err != nil {
 			t.Fatal(err)
@@ -669,7 +814,7 @@ func TestTagsDoNotCrossProjects(t *testing.T) {
 	}
 	_ = app
 	// An address set of one project is not visible from another.
-	if _, err := alpha.Firewall().AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "office"}, Spec: api.AddressSetSpec{Addresses: []string{"203.0.113.0/24"}}}); err != nil {
+	if _, err := alpha.Firewall().AddressSets().Create(c, api.AddressSet{Metadata: api.ObjectMeta{Name: "office"}, Spec: api.AddressSetSpec{Addresses: api.Entries("203.0.113.0/24")}}); err != nil {
 		t.Fatal(err)
 	}
 	_, err := beta.Firewall().AddressSets().Get(c, "office")
@@ -683,53 +828,9 @@ func TestTagsDoNotCrossProjects(t *testing.T) {
 	}
 }
 
-// An existing directory of the host (a dataset of a pool JailOps does not manage) can be mounted into a jail by a
-// global admin only, read-only if asked, and an operator of the project cannot add it later either.
-func TestHostMountsAreAGlobalAdminsDecision(t *testing.T) {
-	e, alpha, _ := twoProjects(t)
-	c := ctxT(t)
-	sp := webSpec()
-	sp.HostMounts = []api.HostMount{{Source: "/tank/media", Target: "/mnt/media", ReadOnly: true}, {Source: "/tank/archive", Target: "/mnt/archive"}}
-	_, err := alpha.Jails().Create(c, sdk.NewJail("media", sp))
-	wantCode(t, err, api.CodeForbidden)
-	op, err := e.Admin.Project("alpha").Jails().Create(c, sdk.NewJail("media", sp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := op.Wait(c); err != nil {
-		t.Fatal(err)
-	}
-	so, _ := e.Admin.Project("alpha").Jails().Start(c, "media")
-	if _, err := so.Wait(c); err != nil {
-		t.Fatal(err)
-	}
-	var fstab string
-	for _, k := range e.Files.Paths() {
-		if strings.Contains(k, "alpha_media") && strings.HasSuffix(k, "fstab") {
-			fstab = e.File(k)
-		}
-	}
-	for _, want := range []string{"/tank/media ", "/mnt/media nullfs ro 0 0", "/tank/archive ", "/mnt/archive nullfs rw 0 0"} {
-		if !strings.Contains(fstab, want) {
-			t.Errorf("the fstab lacks %q:\n%s", want, fstab)
-		}
-	}
-	// the project's operator cannot add one to another jail, but keeps working on the jail that has them
-	createJail(t, alpha, "plain")
-	j, etag, _ := alpha.Jails().GetETag(c, "plain")
-	j.Spec.HostMounts = []api.HostMount{{Source: "/tank/media", Target: "/mnt/media"}}
-	_, err = alpha.Jails().Update(c, "plain", j, etag)
-	wantCode(t, err, api.CodeForbidden)
-	m, etag, _ := alpha.Jails().GetETag(c, "media")
-	m.Spec.Env = map[string]string{"A": "1"}
-	if _, err := alpha.Jails().Update(c, "media", m, etag); err != nil {
-		t.Fatalf("an operator changing something else on a jail that has host mounts: %v", err)
-	}
-}
-
 // A global identity that is only an operator is not an administrator: it can set neither host mounts nor delegation,
 // which would otherwise start at the next boot under the daemon's own assertion.
-func TestAGlobalOperatorCannotSetHostMountsOrDelegation(t *testing.T) {
+func TestAGlobalOperatorCannotSetDelegation(t *testing.T) {
 	e, _, _ := twoProjects(t)
 	c := ctxT(t)
 	op, err := sdk.Connect(c, sdk.Remote(e.HTTP.URL, sdk.WithToken(e.IdentityToken(api.PermOperator, true)), sdk.WithProject(dtest.SeedProject), sdk.WithRetries(0)))
@@ -738,42 +839,8 @@ func TestAGlobalOperatorCannotSetHostMountsOrDelegation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = op.Close() })
 	sp := webSpec()
-	sp.HostMounts = []api.HostMount{{Source: "/tank/media", Target: "/mnt/media"}}
-	_, err = op.Jails().Create(c, sdk.NewJail("m1", sp))
-	wantCode(t, err, api.CodeForbidden)
-	sp = webSpec()
 	sp.Delegate = true
+	sp.Resources.Disk = "10G"
 	_, err = op.Jails().Create(c, sdk.NewJail("d1", sp))
 	wantCode(t, err, api.CodeForbidden)
-}
-
-// The operator of a project can start, stop and restart a jail whose host mounts an administrator admitted.
-func TestAnOperatorRunsAJailWithAdminHostMounts(t *testing.T) {
-	e, _, _ := twoProjects(t)
-	c := ctxT(t)
-	sp := webSpec()
-	sp.HostMounts = []api.HostMount{{Source: "/tank/media", Target: "/mnt/media", ReadOnly: true}}
-	cop, err := e.Admin.Project("alpha").Jails().Create(c, sdk.NewJail("media2", sp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cop.Wait(c); err != nil {
-		t.Fatal(err)
-	}
-	oper := e.Scoped(api.PermOperator, "alpha")
-	waitOp := func(wait func() error, err error) {
-		t.Helper()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := wait(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	so, err := oper.Jails().Start(c, "media2")
-	waitOp(func() error { _, e := so.Wait(c); return e }, err)
-	ro, err := oper.Jails().Restart(c, "media2")
-	waitOp(func() error { _, e := ro.Wait(c); return e }, err)
-	to, err := oper.Jails().Stop(c, "media2")
-	waitOp(func() error { _, e := to.Wait(c); return e }, err)
 }

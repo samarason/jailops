@@ -6,5 +6,5 @@ spec:
   default_in: deny
   default_out: allow
   rules:
-    - {name: wiki, action: allow, direction: in, proto: tcp, ports: ["3000"], from: ["@admins"]}
-    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["@admins"]}
+    - {name: wiki, action: allow, direction: in, proto: tcp, ports: ["3000"], from: ["set:admins"]}
+    - {name: ssh-admins, action: allow, direction: in, proto: tcp, ports: ["22"], from: ["set:admins"]}

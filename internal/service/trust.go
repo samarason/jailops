@@ -98,7 +98,7 @@ func (s *Service) CreateTrustToken(ctx context.Context, req api.TrustTokenReques
 // is the same unauthorized answer, failures are counted per source and
 // locked out, and the token is consumed atomically, so it works once.
 func (s *Service) RedeemTrustToken(ctx context.Context, req api.TrustClientRequest, remote string) (api.Certificate, error) {
-	key := trustLimitKey + remote
+	key := trustLimitKey + auth.SourceKey(remote)
 	if err := s.trustLim.Check(key); err != nil {
 		return api.Certificate{}, err
 	}
@@ -177,6 +177,9 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
+// isGlobalAdmin reports a global identity with the admin role: only it may see and end other users' sessions.
+func isGlobalAdmin(a Actor) bool { return a.Global && a.Perm.Satisfies(api.PermAdmin) }
+
 // ListSessions lists the caller's sessions; a global admin sees every session.
 func (s *Service) ListSessions(ctx context.Context) ([]api.Session, error) {
 	a := ActorFrom(ctx)
@@ -186,7 +189,7 @@ func (s *Service) ListSessions(ctx context.Context) ([]api.Session, error) {
 	}
 	out := []api.Session{}
 	for _, si := range l {
-		if a.Global || (a.Kind == "user" && si.UserName == a.Name) {
+		if isGlobalAdmin(a) || (a.Kind == "user" && si.UserName == a.Name) {
 			out = append(out, sessionToAPI(si, a.SessionRef))
 		}
 	}
@@ -205,7 +208,7 @@ func (s *Service) RevokeSession(ctx context.Context, id string) error {
 		if si.Ref != id {
 			continue
 		}
-		if !a.Global && !(a.Kind == "user" && si.UserName == a.Name) {
+		if !isGlobalAdmin(a) && !(a.Kind == "user" && si.UserName == a.Name) {
 			break
 		}
 		if _, err := s.d.DB.Sessions.DeleteByRef(ctx, id); err != nil {

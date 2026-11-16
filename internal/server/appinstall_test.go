@@ -175,13 +175,14 @@ func TestAppInstall(t *testing.T) {
 	if l := j.Metadata.Labels; l[api.LabelApp] != "web" || l[api.LabelAppHash] != res.Hash || l[api.LabelAppVersion] != "15.0p1" {
 		t.Fatalf("labels %v", l)
 	}
-	if r := j.Spec.Resources; r.Memory != "512M" || r.Disk != "4G" || r.CPU != 2 {
+	if r := j.Spec.Resources; r.Memory != "512M" || r.Disk != "4294967296" || r.CPU != 2 {
 		t.Fatalf("limits %+v", r)
 	}
-	if len(j.Spec.Volumes) != 2 || j.Spec.Volumes[0].Name != "var-db-web" || j.Spec.Volumes[0].Mount != "/var/db/web" || j.Spec.Volumes[1].Name != "usr-local-www-web" {
+	if len(j.Spec.Volumes) != 2 || j.Spec.Volumes[0].Name != "web-var-db-web" || j.Spec.Volumes[0].Mount != "/var/db/web" || j.Spec.Volumes[1].Name != "web-usr-local-www-web" {
 		t.Fatalf("volumes %+v", j.Spec.Volumes)
 	}
-	for _, ds := range []string{"tank/jailops/projects/alpha/jails/web/data/var-db-web", "tank/jailops/projects/alpha/jails/web/data/usr-local-www-web", "tank/jailops/projects/alpha/jails/web@app-installed", "tank/jailops/projects/alpha/jails/web/data/var-db-web@app-installed"} {
+	// the data are volumes of the project, made before the jail; the jail's own snapshot does not hold them
+	for _, ds := range []string{"tank/jailops/projects/alpha/volumes/web-var-db-web", "tank/jailops/projects/alpha/volumes/web-usr-local-www-web", "tank/jailops/projects/alpha/jails/web@app-installed"} {
 		if ok, _ := e.ZFS.Exists(c, ds); !ok {
 			t.Errorf("%s does not exist", ds)
 		}
@@ -192,7 +193,7 @@ func TestAppInstall(t *testing.T) {
 	if len(res.Data) != 2 || len(res.Config) != 1 || len(res.Logs) != 1 || !strings.Contains(res.Notes, "/usr/local/www/web") {
 		t.Fatalf("%+v", res)
 	}
-	wantSteps := []string{"create-jail", "start-jail", "install-packages-ports", "install-packages-jailops", "refresh-library-cache", "record-version", "write-rc-conf", "setup-1", "setup-2", "start-service-web", "health-check", "close-firewall", "snapshot"}
+	wantSteps := []string{"create-volume-web-var-db-web", "create-volume-web-usr-local-www-web", "create-jail", "mount-jail", "bind-volumes", "install-packages-ports", "install-packages-jailops", "seed-jailops-repo", "install-bash", "record-version", "unbind-volumes", "start-jail", "set-up-shell", "refresh-library-cache", "write-rc-conf", "setup-1", "setup-2", "start-service-web", "health-check", "close-firewall", "snapshot", "enable-autostart"}
 	var steps []string
 	for _, s := range res.Steps {
 		_, rest, _ := strings.Cut(s, " ")
@@ -202,30 +203,45 @@ func TestAppInstall(t *testing.T) {
 	if !slices.Equal(steps, wantSteps) {
 		t.Fatalf("steps %v", res.Steps)
 	}
-	// The packages went in from the host with pkg -r, the FreeBSD ones and the jailops ones apart.
+	// The packages went in from the host with pkg -r while the jail had never run, the FreeBSD ones and the jailops
+	// ones apart, and bash with them.
 	root := "/jailops/projects/alpha/jails/web/root"
-	if !slices.Equal(e.Installed, []string{root + " web-server", root + " web-tool"}) {
+	// bash, the jail's shell, came in after the app's packages (docs/shell.md)
+	if !slices.Equal(e.Installed, []string{root + " web-server", root + " web-tool", root + " bash"}) {
 		t.Fatalf("installed %v", e.Installed)
 	}
 	// The fake pkg accepts any argv with -r: the calls must be exactly what the argv builders make, the
 	// vectors internal/priv checks against the helper's allow-list.
 	var pkgCalls []string
 	for _, call := range e.Run.Calls() {
-		if call.Cmd.Name == "pkg" && strings.Contains(strings.Join(call.Cmd.Args, " "), root) {
+		if a := strings.Join(call.Cmd.Args, " "); call.Cmd.Name == "pkg" && (strings.Contains(a, root) || strings.Contains(a, "-j alpha_web")) {
 			pkgCalls = append(pkgCalls, strings.Join(append([]string{call.Cmd.Name}, call.Cmd.Args...), " "))
 		}
 	}
-	want := []string{strings.Join(apps.PkgInstallArgv(root, "ports", []string{"web-server"}), " "),
-		strings.Join(apps.PkgInstallArgv(root, apps.JailopsRepo, []string{"web-tool"}), " "),
+	const cache = "/jailops/cache/pkg" // the download cache the host shares between installs
+	want := []string{strings.Join(apps.PkgInstallCachedArgv(root, "ports", cache, []string{"web-server"}), " "),
+		strings.Join(apps.PkgInstallCachedArgv(root, apps.JailopsRepo, cache, []string{"web-tool"}), " "),
+		strings.Join(apps.PkgInstallCachedArgv(root, "ports", cache, []string{api.BashPackage}), " "),
 		strings.Join(apps.PkgVersionArgv(root, "web-server"), " ")}
-	if !slices.Equal(pkgCalls, want) || want[0] != "pkg -r "+root+" install -y web-server" {
+	if !slices.Equal(pkgCalls, want) || want[0] != "pkg -r "+root+" -o PKG_CACHEDIR="+cache+" install -y web-server" {
 		t.Fatalf("pkg calls %q, want %q", pkgCalls, want)
 	}
-	// The volume datasets are mounted by the start of the jail, after its root, never by zfs mount -a.
-	for _, v := range []string{"var-db-web", "usr-local-www-web"} {
-		if p, err := e.ZFS.Get(c, "tank/jailops/projects/alpha/jails/web/data/"+v, "canmount"); err != nil || p["canmount"].Value != "noauto" {
+	// The jail's bash prompt, sourced by both start-up files of bash.
+	if !strings.Contains(e.File(root+api.PromptFile), `PS1='\[\e[38;5;39m\]\u@\h\[\e[0m\]${_jailops_where:+ \[\e[38;5;245m\][${_jailops_where}]\[\e[0m\]}:\w\$ '`) || !strings.Contains(e.File(root+api.BashrcPath), api.PromptFile) || !strings.Contains(e.File(root+api.ProfilePath), api.PromptFile) {
+		t.Fatalf("prompt files: %v", e.Files.Paths())
+	}
+	// A volume is mounted on the host at its own place (zfs mount -a at boot, devices off) and reaches the jail
+	// through the nullfs line of its fstab.
+	for _, v := range []string{"web-var-db-web", "web-usr-local-www-web"} {
+		p, err := e.ZFS.Get(c, "tank/jailops/projects/alpha/volumes/"+v, "canmount", "devices", "mountpoint")
+		if err != nil || p["canmount"].Value != "on" || p["devices"].Value != "off" || p["mountpoint"].Value != "/jailops/projects/alpha/volumes/"+v {
 			t.Fatalf("%s: %v %+v", v, err, p)
 		}
+	}
+	fstab := e.File("/etc/jailops/jails/alpha_web/fstab")
+	if !strings.Contains(fstab, "/jailops/projects/alpha/volumes/web-var-db-web "+root+"/var/db/web nullfs rw 0 0\n") ||
+		!strings.Contains(fstab, "/jailops/projects/alpha/volumes/web-usr-local-www-web "+root+"/usr/local/www/web nullfs rw 0 0\n") {
+		t.Fatalf("fstab:\n%s", fstab)
 	}
 	// rc.conf holds <name>_enable and the knobs, escaped; rc.conf.local of the network is untouched.
 	rc := e.File(root + "/etc/rc.conf")
@@ -248,7 +264,7 @@ func TestAppInstall(t *testing.T) {
 	// rc goes to its console log.
 	conf := e.File("/etc/jailops/jails/alpha_web/jail.conf")
 	if !j.Spec.SysVIPC || !strings.Contains(conf, "\tsysvshm = new;\n") || !strings.Contains(conf, "\tsysvsem = new;\n") || !strings.Contains(conf, "\tsysvmsg = new;\n") ||
-		!strings.Contains(conf, "\texec.consolelog = \"/var/log/jail_${name}_console.log\";\n") {
+		!strings.Contains(conf, "\texec.consolelog = \"/var/log/jailops/jail_${name}_console.log\";\n") {
 		t.Fatalf("sysvipc %v, jail.conf:\n%s", j.Spec.SysVIPC, conf)
 	}
 	// The http check went to the jail's first address from the host.
@@ -320,10 +336,10 @@ func TestAppInstallDryRunAndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := op.Wait(c)
-	if err != nil || !res.DryRun || len(res.Steps) != 8 || res.Snapshot != "" || res.Jail.Metadata.Name != "" {
+	if err != nil || !res.DryRun || len(res.Steps) != 12 || res.Snapshot != "" || res.Jail.Metadata.Name != "" {
 		t.Fatalf("%v %+v", err, res)
 	}
-	if !strings.Contains(res.Steps[0], "fb151@stable") || !strings.Contains(res.Steps[5], "/usr/local/bin/tool --ping") {
+	if !strings.Contains(res.Steps[0], "fb151@stable") || !strings.Contains(res.Steps[6], "install -y bash") || !strings.Contains(res.Steps[8], "/usr/local/bin/tool --ping") {
 		t.Fatalf("%v", res.Steps)
 	}
 	if _, err := e.Admin.Jails().Get(c, "tool"); !api.IsCode(err, api.CodeNotFound) {
@@ -356,34 +372,32 @@ func TestAppInstallDryRunAndDefaults(t *testing.T) {
 	}
 }
 
-// Without an image the installation takes the only FreeBSD image with the
-// alias stable, whatever it is called.
+// Without an image the installation takes the FreeBSD image of the highest release the host runs, by its bare
+// name, the first by name on a tie; an image of a newer release than the host's is passed over.
 func TestAppInstallDefaultImage(t *testing.T) {
 	e, c := appEnv(t, map[string]string{"tool": appExecCheck})
-	if _, err := e.Admin.Images().DeleteAlias(c, "fb", "stable"); err != nil {
+	from := func(want string) {
+		t.Helper()
+		op, err := e.Admin.Apps().Install(c, "tool", api.AppInstall{DryRun: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := op.Wait(c)
+		if err != nil || !res.DryRun || !strings.Contains(res.Steps[0], "from "+want+" ") && !strings.HasSuffix(res.Steps[0], "from "+want) {
+			t.Fatalf("want from %s: %v %+v", want, err, res)
+		}
+	}
+	from("fb") // fb and fb151 are both 15.1-RELEASE
+	if _, err := e.Admin.Images().Create(c, api.Image{Metadata: api.ObjectMeta{Name: "fa"}, Spec: api.ImageSpec{
+		OS: api.OSFreeBSD, Release: "15.2-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}}}); err != nil {
 		t.Fatal(err)
 	}
-	op, err := e.Admin.Apps().Install(c, "tool", api.AppInstall{DryRun: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := op.Wait(c)
-	if err != nil || !res.DryRun || !strings.Contains(res.Steps[0], "from fb151@stable") {
-		t.Fatalf("%v %+v", err, res)
-	}
-	if _, err := e.Admin.Images().DeleteAlias(c, "fb151", "stable"); err != nil {
-		t.Fatal(err)
-	}
-	_, err = e.Admin.Apps().Install(c, "tool", api.AppInstall{DryRun: true})
-	wantCode(t, err, api.CodeInvalid)
-	if !strings.Contains(err.Error(), "no FreeBSD image has the alias stable") || !strings.Contains(err.Error(), "your images: fb, fb151") {
-		t.Fatalf("%v", err)
-	}
+	from("fb") // the host runs 15.1
 }
 
 // What is refused before the operation starts.
 func TestAppInstallRefusals(t *testing.T) {
-	e, c := appEnv(t, map[string]string{"web": appWeb, "broken": "version: 1\nname: broken\n"})
+	e, c := appEnv(t, map[string]string{"web": appWeb, "newer": strings.ReplaceAll(strings.Replace(appWeb, "name: web\n", "name: newer\n", 1), `release_min: "15.1"`, `release_min: "15.2"`), "broken": "version: 1\nname: broken\n"})
 	req := api.AppInstall{Image: "fb151@stable", Network: "lan", Storage: "default"}
 	_, err := e.Admin.Apps().Install(c, "nothing", req)
 	wantCode(t, err, api.CodeNotFound)
@@ -391,16 +405,10 @@ func TestAppInstallRefusals(t *testing.T) {
 	wantCode(t, err, api.CodeInvalid)
 	_, err = e.Admin.Apps().Install(c, "../web", req)
 	wantCode(t, err, api.CodeNotFound)
-	// the seeded image is 15.0, the definition wants 15.1
-	_, err = e.Admin.Apps().Install(c, "web", api.AppInstall{Image: "fb@stable", Network: "lan", Storage: "default"})
+	// the seeded image is 15.1, the definition wants 15.2
+	_, err = e.Admin.Apps().Install(c, "newer", api.AppInstall{Image: "fb@stable", Network: "lan", Storage: "default"})
 	wantCode(t, err, api.CodeInvalid)
-	if !strings.Contains(err.Error(), "15.0-RELEASE") || !strings.Contains(err.Error(), "15.1") {
-		t.Fatalf("%v", err)
-	}
-	// no default image: two FreeBSD images have the alias stable here
-	_, err = e.Admin.Apps().Install(c, "web", api.AppInstall{Network: "lan", Storage: "default"})
-	wantCode(t, err, api.CodeInvalid)
-	if !strings.Contains(err.Error(), "(fb, fb151)") || !strings.Contains(err.Error(), "name an image with --image, for example fb@stable; your images: fb, fb151") {
+	if !strings.Contains(err.Error(), "15.1-RELEASE") || !strings.Contains(err.Error(), "15.2") {
 		t.Fatalf("%v", err)
 	}
 	bad := req
@@ -453,7 +461,7 @@ func TestAppInstallFailures(t *testing.T) {
 			}
 		}
 	}
-	// 1. the jail does not start: nothing is left behind
+	// 1. the jail does not start: the packages are in, so the jail is kept, stopped, to look at
 	e.Jails.FailCreate = errors.New("jail: cannot start")
 	op, err := e.Admin.Apps().Install(c, "web", req)
 	if err != nil {
@@ -461,17 +469,19 @@ func TestAppInstallFailures(t *testing.T) {
 	}
 	_, err = op.Wait(c)
 	var ae *api.Error
-	if !errors.As(err, &ae) || ae.Detail["step"] != "start-jail" || ae.Detail["jail_kept"] != "" || !strings.Contains(ae.Hint, "nothing was left behind") {
+	if !errors.As(err, &ae) || ae.Detail["step"] != "start-jail" || ae.Detail["jail_kept"] != "true" || !strings.Contains(ae.Hint, "left stopped") {
 		t.Fatalf("%v", err)
 	}
 	failed()
-	if _, err := e.Admin.Jails().Get(c, "web"); !api.IsCode(err, api.CodeNotFound) {
-		t.Fatalf("the jail was kept: %v", err)
+	if j, err := e.Admin.Jails().Get(c, "web"); err != nil || j.Status.Power != api.PowerStopped {
+		t.Fatalf("the jail was not kept stopped: %v", err)
 	}
+	e.Jails.FailCreate = nil
+	deleteWithVolumes(t, e, c, "web")
+	// deleting the jail takes its datasets with it
 	if ok, _ := e.ZFS.Exists(c, "tank/jailops/projects/alpha/jails/web"); ok {
 		t.Fatal("datasets were left behind")
 	}
-	e.Jails.FailCreate = nil
 	// 2. the packages do not install: the jail is kept, stopped, with the labels of the app
 	e.SetPkgInstallErr(errors.New("pkg: no package web-server"))
 	op, err = e.Admin.Apps().Install(c, "web", req)
@@ -495,13 +505,7 @@ func TestAppInstallFailures(t *testing.T) {
 	}
 	// the operator looks, then deletes it and tries again
 	e.SetPkgInstallErr(nil)
-	dop, err := e.Admin.Jails().Delete(c, "web")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := dop.Wait(c); err != nil {
-		t.Fatal(err)
-	}
+	deleteWithVolumes(t, e, c, "web")
 	// 3. the health check never passes: the services ran, the jail is kept stopped, no snapshot was taken
 	e.SetDial(func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("connection refused") })
 	op, err = e.Admin.Apps().Install(c, "web", req)
@@ -524,8 +528,7 @@ func TestAppInstallFailures(t *testing.T) {
 		t.Fatal("the service was not started")
 	}
 	// a wrong status is a failure too
-	dop, _ = e.Admin.Jails().Delete(c, "web")
-	dop.Wait(c)
+	deleteWithVolumes(t, e, c, "web")
 	e.SetDial(httpAnswer(500, nil))
 	op, _ = e.Admin.Apps().Install(c, "web", req)
 	_, err = op.Wait(c)
@@ -534,8 +537,7 @@ func TestAppInstallFailures(t *testing.T) {
 	}
 	// 4. the service does not start: the error names the service command, not the wrapper's script, with what
 	// the rc script printed
-	dop, _ = e.Admin.Jails().Delete(c, "web")
-	dop.Wait(c)
+	deleteWithVolumes(t, e, c, "web")
 	e.Jails.SetExecFn(func(_ string, o jailos.ExecOpts) (run.Result, error) {
 		if o.Argv[0] == "/bin/sh" && o.Argv[len(o.Argv)-1] == "web" {
 			return run.Result{ExitCode: 1, Stdout: []byte("web does not start: Permission denied\n")}, errors.New("exit 1")
@@ -581,6 +583,9 @@ func TestAppInstallRecovery(t *testing.T) {
 	if err != nil || j.Status.Power != api.PowerStopped || j.Metadata.Labels[api.LabelApp] != "tool" {
 		t.Fatalf("%v %+v\n%s", err, j, e2.Log())
 	}
+	if j.Spec.Boot.Autostart {
+		t.Fatal("a jail kept for inspection starts with the host")
+	}
 	if _, ok, _ := e2.Jails.Get(c, "alpha_tool"); ok {
 		t.Fatal("the jail still runs")
 	}
@@ -615,7 +620,7 @@ func TestAppInstallRecovery(t *testing.T) {
 	}
 	e3.Stop()
 	leave(2)
-	start := plan.Record{ID: "start/alpha_tool", Plan: "start-jail alpha_tool", Steps: []string{"mount", "render", "jail-start", "ready"}, Begun: 3, Done: 2, State: plan.StateRunning}
+	start := plan.Record{ID: "start/alpha_tool", Plan: "start-jail alpha_tool", Steps: []string{"mount", "heal-mounts", "render", "jail-start", "ready"}, Begun: 4, Done: 3, State: plan.StateRunning}
 	b, _ := json.Marshal(start)
 	if err := os.WriteFile(filepath.Join(journal, "start~alpha_tool.json"), b, 0o600); err != nil {
 		t.Fatal(err)
@@ -670,7 +675,7 @@ func TestAppInstallRefusesExec(t *testing.T) {
 		t.Fatalf("%v\n%s", err, e.Log())
 	}
 	var ae *api.Error
-	if !errors.As(during, &ae) || ae.Code != api.CodeBusy || !strings.Contains(ae.Message, "the app is being installed") || ae.Hint == "" {
+	if !errors.As(during, &ae) || ae.Code != api.CodeBusy || !strings.Contains(ae.Message, "packages are being installed or updated") || ae.Hint == "" {
 		t.Fatalf("exec during the installation: %v", during)
 	}
 	if other != nil || otherOut != "y\n" {
@@ -749,9 +754,29 @@ func TestAppInstallRefusesPersistentPaths(t *testing.T) {
 	}
 }
 
-// The doctor warns about volume datasets made before volumes were created
-// with canmount=noauto, and gives the command that fixes each.
-func TestDoctorLegacyVolumes(t *testing.T) {
+// An installed app starts when the host boots: the installation is the declaration that it should run.
+func TestAppInstallAutostarts(t *testing.T) {
+	e, c := appEnv(t, map[string]string{"web": appWeb})
+	e.SetDial(httpAnswer(204, nil))
+	op, err := e.Admin.Apps().Install(c, "web", api.AppInstall{Image: "fb151@stable", Network: "lan", Storage: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Wait(c); err != nil {
+		t.Fatalf("%v\n%s", err, e.Log())
+	}
+	j, err := e.Admin.Jails().Get(c, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !j.Spec.Boot.Autostart {
+		t.Fatalf("an installed app does not start at boot: %+v", j.Spec.Boot)
+	}
+}
+
+// The doctor warns about volume datasets that are not canmount=noauto, and
+// gives the command that fixes each.
+func TestDoctorVolumeCanmount(t *testing.T) {
 	e, c := appEnv(t, map[string]string{"web": appWeb})
 	e.SetDial(httpAnswer(204, nil))
 	op, err := e.Admin.Apps().Install(c, "web", api.AppInstall{Image: "fb151@stable", Network: "lan", Storage: "default"})
@@ -778,11 +803,12 @@ func TestDoctorLegacyVolumes(t *testing.T) {
 	if ch := check(); ch.Status != api.DoctorOK {
 		t.Fatalf("%+v", ch)
 	}
-	ds := "tank/jailops/projects/alpha/jails/web/data/var-db-web"
-	if err := e.ZFS.Set(c, ds, map[string]string{"canmount": "on"}); err != nil {
+	// a volume whose dataset is gone, and a jail that attaches a volume that does not exist
+	ds := "tank/jailops/projects/alpha/volumes/web-var-db-web"
+	if err := e.ZFS.Destroy(c, ds, zfs.DestroyOpts{Recursive: true}); err != nil {
 		t.Fatal(err)
 	}
-	if ch := check(); ch.Status != api.DoctorWarn || ch.Hint != "zfs set canmount=noauto "+ds || !strings.Contains(ch.Message, "1 volume dataset") {
+	if ch := check(); ch.Status != api.DoctorFail || !strings.Contains(ch.Message, "has no dataset "+ds) {
 		t.Fatalf("%+v", ch)
 	}
 }
@@ -842,17 +868,35 @@ func TestAppInstallReferenceCatalog(t *testing.T) {
 		}
 		repos := []string{"install-packages-ports"}
 		if c2.app == "isms" { // openssh-portable from the FreeBSD packages, then isms from the JailOps repository
-			repos = append(repos, "install-packages-jailops")
+			repos = append(repos, "install-packages-jailops", "seed-jailops-repo")
 		}
-		want := append([]string{"create-jail", "start-jail"}, repos...)
-		want = append(want, "refresh-library-cache", "record-version", "write-rc-conf")
+		var want []string
+		for range def.Data {
+			want = append(want, "create-volume")
+		}
+		want = append(want, "create-jail", "mount-jail")
+		if len(def.Data) > 0 {
+			want = append(want, "bind-volumes")
+		}
+		want = append(want, repos...)
+		want = append(want, "install-bash", "record-version")
+		if len(def.Data) > 0 {
+			want = append(want, "unbind-volumes")
+		}
+		want = append(want, "start-jail", "set-up-shell", "refresh-library-cache", "write-rc-conf")
 		want = append(want, setup(len(def.Setup))...)
 		want = append(want, c2.services...)
 		if c2.health {
 			want = append(want, "health-check")
 		}
-		want = append(want, "close-firewall", "snapshot")
-		if got := names(res.Steps); !slices.Equal(got, want) {
+		want = append(want, "close-firewall", "snapshot", "enable-autostart")
+		got := names(res.Steps)
+		for i, g := range got {
+			if strings.HasPrefix(g, "create-volume-") {
+				got[i] = "create-volume"
+			}
+		}
+		if !slices.Equal(got, want) {
 			t.Errorf("%s: steps %v, want %v", c2.app, res.Steps, want)
 		}
 	}
@@ -875,7 +919,7 @@ func TestAppInstallReferenceCatalog(t *testing.T) {
 			pkgCalls = append(pkgCalls, strings.Join(call.Cmd.Args, " "))
 		}
 	}
-	if !slices.Contains(pkgCalls, "-r "+root+" install -y -r jailops isms") {
+	if !slices.Contains(pkgCalls, "-r "+root+" -o PKG_CACHEDIR=/jailops/cache/pkg install -y -r jailops isms") {
 		t.Fatalf("pkg calls %q", pkgCalls)
 	}
 	// enabled in rc.conf, never started: the setup ran, no service start
@@ -889,5 +933,30 @@ func TestAppInstallReferenceCatalog(t *testing.T) {
 	}
 	if res.Snapshot != "app-installed" || len(res.Ports) != 1 || res.Ports[0].Port != 8080 {
 		t.Fatalf("%+v", res)
+	}
+}
+
+// deleteWithVolumes deletes a jail and every volume of the project: an app's data are volumes, and they outlive the
+// jail.
+func deleteWithVolumes(t *testing.T, e *dtest.Env, c context.Context, jail string) {
+	t.Helper()
+	dop, err := e.Admin.Jails().Delete(c, jail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dop.Wait(c); err != nil {
+		t.Fatal(err)
+	}
+	for v, err := range e.Admin.Volumes().List(c) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		op, err := e.Admin.Volumes().Delete(c, v.Metadata.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := op.Wait(c); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

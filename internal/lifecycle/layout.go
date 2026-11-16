@@ -24,8 +24,8 @@ type JailDataset struct {
 	// Props are the user and native properties set locally and restored with
 	// the dataset (jailops:path, jailops:class, quota, readonly, ...).
 	Props map[string]string
-	// Encrypted marks an encrypted volume; Locked one whose key is not loaded (its files cannot be read).
-	Encrypted, Locked bool
+	// Delegated marks the dataset handed to the jail: it is not mounted on the host, so a backup leaves it out.
+	Delegated bool
 }
 
 // JailLayout is what the datasets say about a jail, in the shape backup
@@ -76,19 +76,8 @@ func (s *Service) Layout(ctx context.Context, key string) (JailLayout, error) {
 	for _, d := range st.Persist {
 		out.Datasets = append(out.Datasets, JailDataset{Name: d.DS, Kind: KindPersistent, Mountpoint: d.MP, Props: s.layoutProps(ctx, d.DS)})
 	}
-	if len(st.Volumes) > 0 {
-		out.Datasets = append(out.Datasets, JailDataset{Name: p.volumesDS(), Kind: KindVolumes, Mountpoint: "", Props: map[string]string{}})
-	}
-	locked, err := s.lockedVolumes(ctx, st)
-	if err != nil {
-		return JailLayout{}, err
-	}
-	for _, d := range st.Volumes {
-		jd := JailDataset{Name: d.DS, Kind: KindVolume, Mountpoint: d.MP, Props: s.layoutProps(ctx, d.DS), Encrypted: d.Encrypted}
-		for _, l := range locked {
-			jd.Locked = jd.Locked || l.DS == d.DS
-		}
-		out.Datasets = append(out.Datasets, jd)
+	if st.Delegated != "" {
+		out.Datasets = append(out.Datasets, JailDataset{Name: st.Delegated, Kind: KindDelegated, Props: map[string]string{}, Delegated: true})
 	}
 	return out, nil
 }

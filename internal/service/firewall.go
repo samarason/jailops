@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"slices"
+	"strconv"
 	"strings"
 
-	"jailops.net/jailops/internal/ipam"
 	"jailops.net/jailops/internal/render"
 	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/sdk/api"
@@ -43,9 +44,15 @@ func bodyProject(p, body string) error {
 }
 
 // checkPolicy validates a policy, renders it against placeholder values and,
-// when a PF client exists, has pfctl -n check the result. A raw fragment needs
-// the admin role.
-func (s *Service) checkPolicy(ctx context.Context, name string, spec api.FirewallPolicySpec, sets map[string]api.AddressSetSpec) error {
+// when a PF client exists, has pfctl -n check the result. A raw fragment needs the admin role and a port
+// forward a global administrator (checkRedirectRules).
+func (s *Service) checkPolicy(ctx context.Context, name string, spec api.FirewallPolicySpec, refs fwRefs) error {
+	return s.checkPolicyWas(ctx, name, spec, refs, nil)
+}
+
+// checkPolicyWas is checkPolicy for an update: the forwards the stored policy already has stay as they are for an
+// administrator of the project, who may edit the other rules (was is nil for a new policy).
+func (s *Service) checkPolicyWas(ctx context.Context, name string, spec api.FirewallPolicySpec, refs fwRefs, was *api.FirewallPolicySpec) error {
 	if err := validate.Name("name", name); err != nil {
 		return err
 	}
@@ -56,8 +63,15 @@ func (s *Service) checkPolicy(ctx context.Context, name string, spec api.Firewal
 	if rep.RequiresAdmin && !ActorFrom(ctx).Perm.Satisfies(api.PermAdmin) {
 		return api.Errorf(api.CodeForbidden, "a raw PF fragment needs the admin role")
 	}
+	if err := s.checkRedirectRules(ctx, spec, was); err != nil {
+		return err
+	}
+	if err := s.checkPolicyForwardClash(ctx, name, spec); err != nil {
+		return err
+	}
 	in := render.PFInput{Jail: "check_policy", Interfaces: []string{"jo000000000a"}, Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
-		Policy: spec, Sets: sets, Uplink: "jo0", AllowRaw: true, TagMembers: map[string][]netip.Addr{}}
+		DefaultIn: spec.DefaultIn, DefaultOut: spec.DefaultOut, Policies: []render.PFPolicy{{Name: "check", Policy: spec}},
+		Sets: refs.sets, Jails: refs.jails, Uplink: "jo0", AllowRaw: true, TagMembers: map[string][]netip.Addr{}}
 	for _, r := range spec.Rules {
 		for _, e := range append(append([]string{}, r.From...), r.To...) {
 			if k, v, err := validate.ParseEndpoint(e); err == nil && k == validate.EndpointTag {
@@ -119,7 +133,10 @@ func (s *Service) CreatePolicy(ctx context.Context, in api.FirewallPolicy) (api.
 	if err := ks.notTaken(in.Metadata.Name); err != nil {
 		return api.FirewallPolicy{}, err
 	}
-	sets, err := s.allSets(p.Meta.Name)
+	if have, err := ks.list(); err == nil && len(have) >= api.MaxPoliciesPerProject {
+		return api.FirewallPolicy{}, api.Errorf(api.CodeQuotaExceeded, "a project has at most %d firewall policies", api.MaxPoliciesPerProject)
+	}
+	sets, err := s.allRefs(p.Meta.Name)
 	if err != nil {
 		return api.FirewallPolicy{}, err
 	}
@@ -141,8 +158,8 @@ func (s *Service) protectedPolicy(ctx context.Context, p project, name string) e
 		return api.Errorf(api.CodeForbidden, "firewall policy %q is managed by app access", name).
 			WithHint("jailops app allow and jailops app deny change it; jailops app access shows its grants")
 	}
-	if p.Spec.Firewall == name && !ActorFrom(ctx).Global {
-		return api.Errorf(api.CodeForbidden, "firewall policy %q is the mandatory policy of project %q; a global administrator manages it", name, p.Meta.Name)
+	if slices.Contains(p.Spec.FirewallPolicies, name) && !ActorFrom(ctx).Global {
+		return api.Errorf(api.CodeForbidden, "firewall policy %q is a mandatory policy of project %q; a global administrator manages it", name, p.Meta.Name)
 	}
 	return nil
 }
@@ -154,7 +171,7 @@ func (s *Service) UpdatePolicy(ctx context.Context, name string, in api.Firewall
 		return api.FirewallPolicy{}, err
 	}
 	if in.Metadata.Name != "" && in.Metadata.Name != name {
-		return api.FirewallPolicy{}, invalid("renaming is not supported")
+		return api.FirewallPolicy{}, renameByAction("firewall policy", "firewall/policies")
 	}
 	if err := bodyProject(p.Meta.Name, in.Metadata.Project); err != nil {
 		return api.FirewallPolicy{}, err
@@ -166,11 +183,15 @@ func (s *Service) UpdatePolicy(ctx context.Context, name string, in api.Firewall
 	if err := s.protectedPolicy(ctx, p, name); err != nil {
 		return api.FirewallPolicy{}, err
 	}
-	sets, err := s.allSets(p.Meta.Name)
+	sets, err := s.allRefs(p.Meta.Name)
 	if err != nil {
 		return api.FirewallPolicy{}, err
 	}
-	if err := s.checkPolicy(ctx, name, in.Spec, sets); err != nil {
+	var was *api.FirewallPolicySpec
+	if cur, err := ks.get(name); err == nil {
+		was = &cur.Spec
+	}
+	if err := s.checkPolicyWas(ctx, name, in.Spec, sets, was); err != nil {
 		return api.FirewallPolicy{}, err
 	}
 	o, err := ks.update(ctx, name, expect, in.Metadata.Labels, &in.Metadata.ManagedBy, in.Spec)
@@ -210,16 +231,54 @@ func (s *Service) DeletePolicy(ctx context.Context, name string, expect int64) e
 	if err := s.protectedPolicy(ctx, p, name); err != nil {
 		return err
 	}
-	if p.Spec.Firewall == name {
-		return api.Errorf(api.CodeBusy, "firewall policy %q is the mandatory policy of project %q", name, p.Meta.Name).
-			WithHint("unset spec.firewall on the project first")
+	if slices.Contains(p.Spec.FirewallPolicies, name) {
+		return api.Errorf(api.CodeBusy, "firewall policy %q is a mandatory policy of project %q", name, p.Meta.Name).
+			WithHint("take it out of spec.firewall_policies of the project first")
 	}
 	for _, j := range s.projectJails(p.Meta.Name) {
-		if j.Spec.Firewall.Policy == name {
+		if slices.Contains(j.Spec.Firewall.Policies, name) {
 			return api.Errorf(api.CodeBusy, "firewall policy %q is used by jail %q", name, j.Metadata.Name)
 		}
 	}
 	return ks.delete(ctx, name, expect)
+}
+
+// fwRefs is what a reference in a rule or in an address set resolves against: the address sets of the project
+// (set:NAME) and the addresses of its jails (jail:NAME). They are separate namespaces: a jail and an address set may
+// have the same name.
+type fwRefs struct {
+	sets  map[string]api.AddressSetSpec
+	jails map[string][]string
+}
+
+// allRefs reads the address sets and the jail addresses of one project. The addresses of a jail are read at every
+// render, so a rule follows a jail whose address changes; a jail without an address has an empty entry.
+func (s *Service) allRefs(project string) (fwRefs, error) {
+	sets, err := s.allSets(project)
+	if err != nil {
+		return fwRefs{}, err
+	}
+	return fwRefs{sets: sets, jails: s.projectJailAddrs(project)}, nil
+}
+
+// projectJailAddrs maps every jail of the project to its addresses (with what its profiles give it, as app access
+// reads them).
+func (s *Service) projectJailAddrs(project string) map[string][]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m := map[string][]string{}
+	for _, n := range sortedKeys(s.jails) {
+		j := s.jails[n].jail
+		if j.Metadata.Project != project {
+			continue
+		}
+		var addrs []string
+		for _, a := range jailAddrs(s.effective(j)) {
+			addrs = append(addrs, a.String())
+		}
+		m[j.Metadata.Name] = addrs
+	}
+	return m
 }
 
 // ListAddressSets lists the address sets of the request's project.
@@ -258,12 +317,23 @@ func (s *Service) checkSet(project, name string, spec api.AddressSetSpec) error 
 	if err := validate.AddressSetSpec(spec); err != nil {
 		return err
 	}
-	sets, err := s.allSets(project)
+	refs, err := s.allRefs(project)
 	if err != nil {
 		return err
 	}
-	sets[name] = spec
-	if _, err := validate.FlattenSet(name, sets); err != nil {
+	refs.sets[name] = spec
+	if len(refs.sets) > api.MaxAddressSetsPerProject {
+		return api.Errorf(api.CodeQuotaExceeded, "a project has at most %d address sets", api.MaxAddressSetsPerProject)
+	}
+	members := 0
+	for _, sp := range refs.sets {
+		members += len(sp.Addresses)
+	}
+	if members > api.MaxSetMembersPerProject {
+		return api.Errorf(api.CodeQuotaExceeded, "the address sets of a project have at most %d members together, not %d", api.MaxSetMembersPerProject, members).
+			WithHint("use prefixes (a CIDR covers many addresses) instead of single addresses")
+	}
+	if _, err := validate.FlattenSet(name, refs.sets, refs.jails); err != nil {
 		return err
 	}
 	return nil
@@ -299,7 +369,7 @@ func (s *Service) UpdateAddressSet(ctx context.Context, name string, in api.Addr
 		return api.AddressSet{}, err
 	}
 	if in.Metadata.Name != "" && in.Metadata.Name != name {
-		return api.AddressSet{}, invalid("renaming is not supported")
+		return api.AddressSet{}, renameByAction("firewall address-set", "firewall/address-sets")
 	}
 	if err := bodyProject(p.Meta.Name, in.Metadata.Project); err != nil {
 		return api.AddressSet{}, err
@@ -345,25 +415,48 @@ func (s *Service) DeleteAddressSet(ctx context.Context, name string, expect int6
 	if !ks.exists(name) {
 		return notFound("address-set", name)
 	}
+	// Every user is named, so one refusal tells what to change.
+	var users []string
 	pols, _ := s.polKind.p(p.Meta.Name).list()
 	for _, pol := range pols {
 		for _, r := range pol.Spec.Rules {
-			for _, e := range append(append([]string{}, r.From...), r.To...) {
-				if e == "@"+name {
-					return api.Errorf(api.CodeBusy, "address set %q is used by firewall policy %q", name, pol.Meta.Name)
-				}
+			if slices.Contains(r.From, "set:"+name) || slices.Contains(r.To, "set:"+name) {
+				users = append(users, pol.Meta.Name)
+				break
 			}
 		}
 	}
+	if len(users) > 0 {
+		what := "firewall policy"
+		if len(users) > 1 {
+			what = "firewall policies"
+		}
+		return api.Errorf(api.CodeBusy, "address set %q is used by %s %s", name, what, quoteAll(users)).
+			WithHint(fmt.Sprintf("remove set:%s from the rules of %s first", name, strings.Join(users, ", "))).
+			WithDetail("policies", strings.Join(users, ","))
+	}
+	var parents []string
 	sets, _ := ks.list()
 	for _, o := range sets {
-		for _, inc := range o.Spec.Includes {
-			if inc == name {
-				return api.Errorf(api.CodeBusy, "address set %q is included by %q", name, o.Meta.Name)
-			}
+		if slices.Contains(o.Spec.Members(), "set:"+name) {
+			parents = append(parents, o.Meta.Name)
 		}
 	}
+	if len(parents) > 0 {
+		return api.Errorf(api.CodeBusy, "address set %q is a member of %s", name, quoteAll(parents)).
+			WithHint(fmt.Sprintf("remove set:%s from the members of %s first", name, strings.Join(parents, ", "))).
+			WithDetail("sets", strings.Join(parents, ","))
+	}
 	return ks.delete(ctx, name, expect)
+}
+
+// quoteAll quotes names and joins them with commas.
+func quoteAll(names []string) string {
+	q := make([]string, len(names))
+	for i, n := range names {
+		q[i] = strconv.Quote(n)
+	}
+	return strings.Join(q, ", ")
 }
 
 // jailAddresses returns the addresses a jail's firewall rules apply to.
@@ -400,7 +493,7 @@ func (s *Service) tagMembers(project string, policy api.FirewallPolicySpec) map[
 		if s.jails[n].jail.Metadata.Project != project {
 			continue
 		}
-		sp := s.jails[n].jail.Spec
+		sp := s.effective(s.jails[n].jail)
 		for _, t := range sp.Firewall.Tags {
 			if want[t] {
 				out[t] = append(out[t], jailAddrs(sp)...)
@@ -409,9 +502,6 @@ func (s *Service) tagMembers(project string, policy api.FirewallPolicySpec) map[
 	}
 	return out
 }
-
-var _ = ipam.BridgeName
-var _ = fmt.Sprint
 
 // stricterDefault returns the stricter of two defaults. An unset inbound default is deny and an unset outbound
 // default is allow (what the renderer does with an empty value).
@@ -453,4 +543,16 @@ func (s *Service) foreignPrefixes(project string) []netip.Prefix {
 		}
 	}
 	return out
+}
+
+// policyDefaults says which default a stored policy lacks: a policy always says default_in and default_out, and a
+// policy that was stored without one is neither rendered nor given a default of ours.
+func policyDefaults(name string, p api.FirewallPolicySpec) error {
+	for _, d := range []struct{ field, v string }{{"default_in", p.DefaultIn}, {"default_out", p.DefaultOut}} {
+		if d.v != "allow" && d.v != "deny" {
+			return invalid("firewall policy %q has no %s: a policy says allow or deny for each direction", name, d.field).
+				WithHint("jailops firewall policy edit " + name + " and set " + d.field)
+		}
+	}
+	return nil
 }

@@ -1,0 +1,28 @@
+$ jailops network edit lan -y
+network/lan renamed to office (1 reference changed)
+network/office updated
+
+$ jailops network show office -o json
+{
+  "metadata": {
+    "name": "office",
+    "uuid": "<uuid>",
+    "scope": "fleet",
+    "generation": 3,
+    "created_at": "2026-03-01T09:00:00Z",
+    "updated_at": "2026-03-01T09:00:00Z"
+  },
+  "spec": {
+    "uplink": "em1",
+    "ipv4": {
+      "subnet": "10.20.0.0/24",
+      "gateway": "10.20.0.1",
+      "range": "10.20.0.10-10.20.0.20",
+      "nat": true
+    }
+  },
+  "status": {
+    "free": 11
+  }
+}
+

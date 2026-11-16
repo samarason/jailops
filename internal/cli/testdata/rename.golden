@@ -1,0 +1,105 @@
+$ jailops jail create web --image freebsd-15@stable --network lan --storage default --firewall-policy web
+jail/web created
+
+$ jailops jail create db --image freebsd-15@stable --network lan --storage default --depends web
+jail/db created
+
+$ jailops network rename lan office --dry-run
+dry-run: would rename network lan to office
+  object     network lan: renamed to office
+  reference  project main: spec.networks: lan -> office
+  reference  jail db (project main): spec.network[0].network: lan -> office
+  reference  jail web (project main): spec.network[0].network: lan -> office
+steps:
+  01 network lan: renamed to office
+  02 project main: spec.networks: lan -> office
+  03 jail db (project main): spec.network[0].network: lan -> office
+  04 jail web (project main): spec.network[0].network: lan -> office
+
+$ jailops network rename lan office
+! Renaming network lan to office changes:
+!   object     network lan: renamed to office
+!   reference  project main: spec.networks: lan -> office
+!   reference  jail db (project main): spec.network[0].network: lan -> office
+!   reference  jail web (project main): spec.network[0].network: lan -> office
+! Rename network "lan" to "office"? [y/N]: 
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: answer y on standard input, or pass -y to confirm without a question
+[exit 2]
+
+$ jailops network rename lan office
+network/lan renamed to office (3 references changed)
+! Renaming network lan to office changes:
+!   object     network lan: renamed to office
+!   reference  project main: spec.networks: lan -> office
+!   reference  jail db (project main): spec.network[0].network: lan -> office
+!   reference  jail web (project main): spec.network[0].network: lan -> office
+! Rename network "lan" to "office"? [y/N]: 
+
+$ jailops network rename office Bad_Name -y
+! invalid: invalid name "Bad_Name"
+! hint: the name rule of the kind's create applies
+[exit 2]
+
+$ jailops firewall address-set rename office hq -y
+address set/office renamed to hq (1 reference changed)
+
+$ jailops firewall policy rename web public -y
+firewall policy/web renamed to public (1 reference changed)
+
+$ jailops start web
+jail/web started
+
+$ jailops rename web www -y
+! busy: jail "web" is running
+! hint: stop it first (jailops stop web); a jail is renamed while it is stopped
+[exit 5]
+
+$ jailops stop web
+jail/web stopped
+
+$ jailops rename web www -y
+jail/web renamed to www (1 reference, 1 dataset changed)
+
+$ jailops jail rename www web -y -o json
+{
+  "kind": "Jail",
+  "project": "main",
+  "from": "www",
+  "to": "web",
+  "changes": [
+    {
+      "kind": "object",
+      "object": "jail www",
+      "detail": "renamed to web"
+    },
+    {
+      "kind": "dataset",
+      "object": "dataset tank/jailops/projects/main/jails/www",
+      "detail": "renamed to tank/jailops/projects/main/jails/web"
+    },
+    {
+      "kind": "reference",
+      "object": "jail db (project main)",
+      "detail": "spec.boot.depends: www -> web"
+    }
+  ],
+  "counts": {
+    "dataset": 1,
+    "object": 1,
+    "reference": 1
+  },
+  "steps": [
+    "01 jail www: renamed to web",
+    "02 dataset tank/jailops/projects/main/jails/www: renamed to tank/jailops/projects/main/jails/web",
+    "03 jail db (project main): spec.boot.depends: www -> web"
+  ]
+}
+
+$ jailops image rename freebsd-15 freebsd-15-0 -y
+image/freebsd-15 renamed to freebsd-15-0 (2 references, 1 dataset changed)
+
+$ jailops project rename main primary -y
+project/main renamed to primary (4 references, 1 dataset changed)
+remote t now uses project primary
+

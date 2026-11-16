@@ -63,12 +63,18 @@ import plug from 'lucide-static/icons/plug.svg'
 import eye from 'lucide-static/icons/eye.svg'
 import eyeOff from 'lucide-static/icons/eye-off.svg'
 import lockOpen from 'lucide-static/icons/lock-open.svg'
+import tag from 'lucide-static/icons/tag.svg'
+import history from 'lucide-static/icons/history.svg'
+import arrowRight from 'lucide-static/icons/arrow-right.svg'
+import arrowLeftRight from 'lucide-static/icons/arrow-left-right.svg'
+import circleX from 'lucide-static/icons/circle-x.svg'
+import circleHelp from 'lucide-static/icons/circle-help.svg'
 
 export const icons = {
   play, square, rotateCw, layoutDashboard, box, layers, network, shield, archive, server, listChecks, radio,
   scrollText, keyRound, sun, moon, monitor, menu, x, alertTriangle, alertCircle, checkCircle, circle, info, copy, check,
   camera, undo, hardDrive, database, wrench, shieldCheck, broom, searchCheck, clock, activity, users, arrowUp, arrowDown, plus, trash, lock, logOut, chevronLeft, terminal, link, pause,
   pkg, search, download, externalLink, fileText, store, cpu, memoryStick, heartPulse, folder, fileCog, wrapText, arrowDownToLine, plug,
-  eye, eyeOff, lockOpen,
+  eye, eyeOff, lockOpen, tag, history, arrowRight, arrowLeftRight, circleX, circleHelp,
 } as const
 export type IconName = keyof typeof icons

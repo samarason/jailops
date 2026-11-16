@@ -1,10 +1,10 @@
 $ jailops jail list
-NAME     STATE     IMAGE        GEN   ADDRESSES   AGE
-on-hub   stopped   freebsd-15   g1    -           3h
+NAME     STATE     IMAGE        GEN   ADDRESSES   AUTOSTART   AGE
+on-hub   stopped   freebsd-15   g1    -           -           3h
 
 $ jailops --host host-b jail list
-NAME   STATE     IMAGE        GEN   ADDRESSES   AGE
-on-b   stopped   freebsd-15   g1    -           0s
+NAME   STATE     IMAGE        GEN   ADDRESSES   AUTOSTART   AGE
+on-b   stopped   freebsd-15   g1    -           -           0s
 
 $ jailops --host host-b jail start on-b
 jail/on-b started

@@ -10,6 +10,6 @@ spec:
   storage: default
   network:
     - {name: eth0, network: shop, ipv4: auto, ipv6: auto}
-  firewall: {policy: app-private}
+  firewall: {policies: [app-private]}
   resources: {cpu: 2, memory: 2G}
   boot: {autostart: true, priority: 20, depends: [web]}

@@ -15,7 +15,7 @@ func TestEscrowBindsTheKeyDomainOnFirstUse(t *testing.T) {
 	e := nodetest.NewEnv(t, nodetest.Options{})
 	a, b := e.Host(t, "a"), e.Host(t, "b")
 	const x, y = "5e62dd65bc023787", "0123456789abcdef"
-	blob := []byte("age-encryption.org/v1 blob")
+	blob := []byte("age-encryption.org/v1\n-> X25519 stanza\nblob")
 	if err := e.Node.PutEscrow(ctx, a, x, bytes.NewReader(blob), int64(len(blob))); err != nil {
 		t.Fatal(err)
 	}

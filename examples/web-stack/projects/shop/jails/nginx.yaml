@@ -10,7 +10,7 @@ spec:
   storage: default
   network:
     - {name: eth0, network: shop, ipv4: "10.60.0.10"}
-  firewall: {policy: nginx}
+  firewall: {policies: [nginx]}
   resources: {cpu: 1, memory: 512M}
   boot: {autostart: true, priority: 30, depends: [app]}
   proxy:

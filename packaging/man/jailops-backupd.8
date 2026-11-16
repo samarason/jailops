@@ -96,6 +96,14 @@ Request the deletion of a snapshot, cancel the request, or execute it once the
 delay (default from the configuration) has passed.
 .It Cm quarantine list
 List the chunks verification moved aside.
+.It Cm quarantine add Ar chunk
+Move a chunk aside although it passes the keyless check, because a host found
+that it does not decrypt.
+The next backup that holds the chunk uploads it again.
+.It Cm escrow list , Cm escrow delete Ar domain
+List the key domains with an escrow blob, or delete an escrow blob that does
+not open with the recovery identity; a host then stores a new one with
+.Nm jailops Cm backup key escrow .
 .It Cm reconcile
 Rebuild the snapshot index from the repository.
 .It Cm jobs Op Ar id
@@ -198,7 +206,7 @@ The admin socket, mode 0600, root only
 .Pq Sy admin_socket ;
 the sample puts it at
 .Pa /var/run/jailops-backupd/admin.sock .
-.It Pa /var/run/jailops-backupd/backupd.pid
+.It Pa /var/run/jailops-backupd.pid
 The pid of the daemon under rc.d.
 .It Pa /usr/local/etc/jailops/backupd.crt
 .It Pa /usr/local/etc/jailops/backupd.key

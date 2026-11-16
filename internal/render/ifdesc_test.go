@@ -1,6 +1,7 @@
 package render
 
 import (
+	"jailops.net/jailops/internal/sys/ifconfig"
 	"net/netip"
 	"strings"
 	"testing"
@@ -10,13 +11,9 @@ func TestIfaceDescriptions(t *testing.T) {
 	long := strings.Repeat("a", 63)
 	var b strings.Builder
 	for _, c := range []struct{ what, got string }{
-		{"bridge", NetBridgeDesc("lan")},
-		{"gateway bridge side", NetGatewayDesc("lan", false)},
-		{"gateway host side", NetGatewayDesc("lan", true)},
 		{"jail host side", JailIfaceDesc("web", "nginx", "lan", true)},
 		{"jail jail side", JailIfaceDesc("web", "nginx", "lan", false)},
 		{"wireguard", WireGuardDesc("office")},
-		{"long bridge", NetBridgeDesc(long)},
 		{"long jail", JailIfaceDesc(long[:31], long[:31], long, true)},
 		{"long jail side", JailIfaceDesc("p", long[:61], "net-1", false)},
 		{"long wireguard", WireGuardDesc(long)},
@@ -35,23 +32,23 @@ func TestIfaceDescriptions(t *testing.T) {
 }
 
 func TestIfaceDescOwnership(t *testing.T) {
-	want := NetBridgeDesc("lan")
+	want := JailIfaceDesc("web", "nginx", "lan", true)
 	for _, c := range []struct {
 		desc string
 		own  bool
 	}{
 		{want, true},
-		{"jailops:n-1", true},        // the marker of earlier releases, same object
-		{"jailops:n-2", false},       // another object
+		{ifconfig.Marker, true},      // the bare marker of an interface just made
+		{"jailops:n-1", false},       // another form is not JailOps's
 		{"", false},                  // may be anybody's
 		{"uplink to the lab", false}, // the administrator's own text
-		{NetBridgeDesc("dmz"), false},
+		{JailIfaceDesc("web", "nginx", "dmz", true), false},
 	} {
-		if got := OwnsIface(c.desc, "n-1", want); got != c.own {
+		if got := OwnsIface(c.desc, want); got != c.own {
 			t.Errorf("OwnsIface(%q) = %v", c.desc, got)
 		}
 	}
-	for _, d := range []string{"jailops net=lan bridge", "", "jailops:0b0e7f3e-5c4b-4f6e-9d3e-111111111111"} {
+	for _, d := range []string{"jailops jail=web/nginx net=lan (host side)", ""} {
 		if !ValidIfaceDesc(d) {
 			t.Errorf("%q refused", d)
 		}

@@ -3,9 +3,9 @@ kind: AppAccess
 metadata:
   name: db
 # Who may reach the app installed as jail db: an installed app is closed to everything else.
-# The grant from @web makes the role and the database shop in PostgreSQL; the connection
+# The grant from jail:web makes the role and the database shop in PostgreSQL; the connection
 # string with its password is printed once by `sync --apply` and written nowhere.
 hosts: [db1]
 spec:
   grants:
-    - {source: "@web", database: shop}
+    - {source: "jail:web", database: shop}

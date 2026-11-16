@@ -15,9 +15,15 @@ export function loadEntry(name: string): AppEntry & { repo: string } {
   return { ...reg[name], repo }
 }
 
+/** JAILOPS_DEMO_BUILD=1 builds the demo: it honours ?demo and goes to <app>/.demo-dist, never into a binary. */
+export function isDemoBuild(): boolean {
+  return process.env.JAILOPS_DEMO_BUILD === '1'
+}
+
 export function appConfig(name: string, appDir: string) {
   const e = loadEntry(name)
-  const outDir = join(e.repo, e.dist)
+  const demo = isDemoBuild()
+  const outDir = demo ? join(appDir, '.demo-dist') : join(e.repo, e.dist)
   const target = process.env[e.proxy.env] || e.proxy.default
   // emptyOutDir removes the tracked placeholder that keeps go:embed compiling before the first build.
   const keepPlaceholder = () => ({
@@ -29,7 +35,9 @@ export function appConfig(name: string, appDir: string) {
   })
   return defineConfig({
     root: appDir,
-    plugins: [vue(), keepPlaceholder()],
+    plugins: demo ? [vue()] : [vue(), keepPlaceholder()],
+    // the console a daemon embeds has no demo: ?demo cannot switch a production console to canned data
+    define: { 'import.meta.env.VITE_JAILOPS_DEMO': JSON.stringify(demo ? '1' : '') },
     resolve: {
       alias: {
         '@jailops/shared': join(appDir, '..', 'shared', 'src'),
@@ -55,10 +63,13 @@ export function appConfig(name: string, appDir: string) {
     },
     preview: { port: e.previewPort, strictPort: true },
     build: { outDir, emptyOutDir: true, target: 'es2022', assetsInlineLimit: 0, chunkSizeWarningLimit: 400 },
-    test: { name, environment: 'jsdom', include: ['src/**/*.test.ts'] },
+    // a loaded CI machine runs the demo server slowly: a test may take up to 30 s (the tests wait for a condition, not a fixed time)
+    test: { name, environment: 'jsdom', include: ['src/**/*.test.ts'], testTimeout: 30000 },
   })
 }
 
+/** The end-to-end tests run against a demo build of the app, made and served by Playwright's web server. */
 export function e2eConfig(name: string) {
-  return { port: loadEntry(name).previewPort }
+  const port = loadEntry(name).previewPort
+  return { port, command: `JAILOPS_DEMO_BUILD=1 npx vite build --logLevel warn && JAILOPS_DEMO_BUILD=1 npx vite preview --host 127.0.0.1` }
 }

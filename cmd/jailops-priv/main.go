@@ -17,12 +17,14 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -49,16 +51,22 @@ func main() {
 }
 
 // list is a repeatable, comma separated flag.
-// ndpList collects the ndp-proxy lines. Its value contains commas (the prefixes), so it is not split.
-type ndpList []priv.NDPUplink
 
-func (l *ndpList) String() string { return fmt.Sprint(len(*l), " uplink(s)") }
-func (l *ndpList) Set(v string) error {
-	u, err := priv.ParseNDPProxy(v)
-	if err != nil {
-		return err
+// prefixList is a list of networks (wireguard-routes), each without host bits.
+type prefixList []netip.Prefix
+
+func (l *prefixList) String() string { return fmt.Sprint(len(*l), " network(s)") }
+func (l *prefixList) Set(v string) error {
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(s)
+		if err != nil || p != p.Masked() || p.Addr().Zone() != "" {
+			return fmt.Errorf("%q is not a network without host bits", s)
+		}
+		*l = append(*l, p)
 	}
-	*l = append(*l, u)
 	return nil
 }
 
@@ -93,15 +101,18 @@ type options struct {
 	workDir     string
 	helperPath  string
 	wgDir       string
-	ifPrefix    list
+	pkgKeysDir  string
+	keyringDir  string
+	unboundConf string
+	dnsSuffix   string
 	allowUser   list
 	allowGroup  list
-	ndpProxy    ndpList
 	sysctl      list
 	fetchHost   list
 	mirror      list
 	hostManage  list
 	hostDir     string
+	allowNoPF   bool
 	// appliance is what rc.conf turns on (jailops_appliance, passed by the rc script); never read from priv.conf.
 	appliance list
 
@@ -111,7 +122,9 @@ type options struct {
 	adminMounts   list
 	adminZFSProp  list
 	adminRoutes   bool
+	wgRoutes      prefixList
 	adminRawPF    bool
+	adminZFSDeleg bool
 	adminResume   bool
 }
 
@@ -140,14 +153,17 @@ func newFlags(o *options, errw io.Writer) *flag.FlagSet {
 	fs.StringVar(&o.stateDir, "state-dir", "", "state directory (default <mount-base>/state)")
 	fs.StringVar(&o.helperPath, "helper-path", priv.DefaultHelperPath, "path jail.conf hooks call")
 	fs.StringVar(&o.wgDir, "wireguard-dir", priv.DefaultWireGuardDir, "directory of the WireGuard keys (root only, mode 0700; outside the daemon's directories)")
-	fs.Var(&o.ifPrefix, "if-prefix", "interface name prefix owned by JailOps (default jo)")
+	fs.StringVar(&o.pkgKeysDir, "pkg-keys-dir", priv.DefaultPkgKeysDir, "directory of the key directories (fingerprints) a package repository of an image build may use besides /usr/share/keys (root only, not writable by others; outside the daemon's directories)")
+	fs.StringVar(&o.keyringDir, "keyring-dir", priv.DefaultKeyringDir, "directory of the keyrings debootstrap may check a release with (root only, not writable by others; outside the daemon's directories)")
+	fs.StringVar(&o.dnsSuffix, "dns-suffix", priv.DefaultDNSSuffix, "zone under which the names of the jails live: NAME.PROJECT.<suffix>; DNS labels, not local; a suffix of your own (corp.example) is the clean choice (docs/dns.md)")
+	fs.StringVar(&o.unboundConf, "unbound-conf", priv.DefaultUnboundConf, "file the helper writes the names of the running jails into for the host's resolver (name.project.internal; docs/dns.md); the default is the conf.d of the base system's local-unbound, which is used only when it is set up; empty: off")
 	fs.Var(&o.allowUser, "allow-user", "user allowed to connect (jailopsd's user)")
 	fs.Var(&o.allowGroup, "allow-group", "group allowed to connect")
-	fs.Var(&o.ndpProxy, "ndp-proxy", "an uplink the IPv6 proxy may use and the prefixes it may answer for: <uplink>=<prefix>[,<prefix>...] (repeatable)")
 	fs.Var(&o.sysctl, "sysctl", "extra sysctl name readable through the helper")
-	fs.Var(&o.fetchHost, "fetch-host", "host fetch may download from over https (default dl-cdn.alpinelinux.org and pkg.freebsd.org)")
+	fs.Var(&o.fetchHost, "fetch-host", "host fetch, package repositories and debootstrap mirrors may use over https (http://<host> allows plain http for a package repository on that host); default dl-cdn.alpinelinux.org, pkg.freebsd.org, pkg.jailops.net, deb.debian.org, archive.ubuntu.com, ports.ubuntu.com")
 	fs.Var(&o.mirror, "image-mirror", "directory fs.read_file may read (a local mirror of image archives)")
 	fs.Var(&o.hostManage, "host-manage", "host management module the helper may change (identity, firewall); empty: the host is only read (docs/appliance.md)")
+	fs.BoolVar(&o.allowNoPF, "allow-start-without-pf", false, "start a jail that has a network link while pf is disabled (by default the start is refused: the jail would run without the firewall of its anchor)")
 	fs.StringVar(&o.hostDir, "host-dir", priv.DefaultHostDir, "root-owned directory of the host snapshots and the applied record")
 	fs.Var(&o.appliance, applianceFlag, "modules rc.conf turns on (jailops_appliance; the rc script passes it): added to host-manage; \"all\" is every module. Not a key of the configuration file")
 	fs.Var(&o.adminRawParam, "admin-raw-param", "jail.conf parameter an admin may set")
@@ -156,7 +172,9 @@ func newFlags(o *options, errw io.Writer) *flag.FlagSet {
 	fs.Var(&o.adminMounts, "admin-host-mount", "host directory an admin may mount into a jail")
 	fs.Var(&o.adminZFSProp, "admin-zfs-prop", "native zfs property an admin may set")
 	fs.BoolVar(&o.adminRoutes, "admin-routes", false, "admin may add routes through a gateway")
+	fs.Var(&o.wgRoutes, "wireguard-routes", "network a WireGuard tunnel may route into itself although it is wider than a /8 (/16 for IPv6) or covers the host's addresses, gateway or resolvers (repeatable)")
 	fs.BoolVar(&o.adminRawPF, "admin-raw-pf", false, "admin may load raw pf rulesets")
+	fs.BoolVar(&o.adminZFSDeleg, "admin-zfs-delegation", false, "admin may hand a jail a dataset of its own (zfs_delegation)")
 	fs.BoolVar(&o.adminResume, "admin-resume-send", false, "admin may resume a zfs send from a token")
 	return fs
 }
@@ -198,13 +216,14 @@ func loadConfigFile(fs *flag.FlagSet, path string, required bool) error {
 func (o *options) privConfig() priv.Config {
 	c := priv.Config{
 		StorageRoots: append([]string(nil), o.storage...), StorageFile: o.storageFile, AllowPoolRoot: o.poolRoot,
-		IfPrefixes: o.ifPrefix, MountBase: o.mountBase,
-		ConfDir: o.confDir, StateDir: o.stateDir, WorkDir: o.workDir, HelperPath: o.helperPath, WireGuardDir: o.wgDir,
-		NDPProxy: o.ndpProxy, Sysctls: o.sysctl, FetchHosts: o.fetchHost, ImageMirrors: o.mirror,
-		HostManage: unionModules(o.hostManage, o.applianceModules()), HostDir: o.hostDir,
+		MountBase: o.mountBase,
+		ConfDir:   o.confDir, StateDir: o.stateDir, WorkDir: o.workDir, HelperPath: o.helperPath, WireGuardDir: o.wgDir, PkgKeysDir: o.pkgKeysDir, UnboundConf: o.unboundConf, DNSSuffix: o.dnsSuffix, KeyringDir: o.keyringDir,
+		WireGuardRoutes: o.wgRoutes,
+		Sysctls:         o.sysctl, FetchHosts: o.fetchHost, ImageMirrors: o.mirror,
+		HostManage: unionModules(o.hostManage, o.applianceModules()), HostDir: o.hostDir, AllowStartWithoutPF: o.allowNoPF,
 		Admin: priv.AdminPolicy{
 			RawJailParams: o.adminRawParam, AllowFlags: o.adminAllow, HostMountRoots: o.adminMounts,
-			ZFSProps: o.adminZFSProp, Routes: o.adminRoutes, RawPF: o.adminRawPF, ResumeSend: o.adminResume,
+			ZFSProps: o.adminZFSProp, Routes: o.adminRoutes, RawPF: o.adminRawPF, ResumeSend: o.adminResume, ZFSDelegation: o.adminZFSDeleg,
 		},
 	}
 	for _, d := range o.adminDevfs {
@@ -411,10 +430,24 @@ func resolvePeers(o *options) (priv.PeerPolicy, error) {
 	return p, nil
 }
 
+// writePidfile writes the pid without following a symlink at the file's own name: root must not truncate a file
+// someone else linked there.
+func writePidfile(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(strconv.Itoa(os.Getpid()) + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // listen creates the socket with mode and group set before anyone can connect.
 func listen(path, group string, mode os.FileMode, dev bool) (net.Listener, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o751); err != nil {
+	if err := os.MkdirAll(dir, 0o710); err != nil {
 		return nil, err
 	}
 	gid := -1
@@ -427,11 +460,25 @@ func listen(path, group string, mode os.FileMode, dev bool) (net.Listener, error
 		}
 	}
 	if gid >= 0 {
-		// The directory also holds the daemon's own socket (jailopsd runs as a member of the group and makes it
-		// here), so: group may create (the sticky bit keeps it from touching the helper's files), everybody may
-		// pass through (the sockets decide who may connect; this one is group only).
-		_ = os.Chown(dir, -1, gid)
-		_ = os.Chmod(dir, os.ModeSticky|0o771)
+		// The directory is the helper's alone: root writes it, the group may only pass through to the socket. In a
+		// directory the daemon's user could write, it could put a file or a socket of its own at this name before
+		// the helper starts.
+		if err := os.Chown(dir, 0, gid); err != nil && !dev {
+			return nil, err
+		}
+		if err := os.Chmod(dir, 0o710); err != nil {
+			return nil, err
+		}
+	}
+	if !dev {
+		st, err := os.Lstat(dir)
+		if err != nil {
+			return nil, err
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !st.IsDir() || !ok || sys.Uid != 0 || st.Mode().Perm()&0o022 != 0 {
+			return nil, fmt.Errorf("%s must be a directory of root that only root can write (mode 0710, group %s)", dir, group)
+		}
 	}
 	if st, err := os.Lstat(path); err == nil {
 		if st.Mode()&os.ModeSocket == 0 {
@@ -499,7 +546,7 @@ func serve(o *options, cfg priv.Config, stderr io.Writer) int {
 		return 1
 	}
 	if o.pidfile != "" {
-		if err := os.WriteFile(o.pidfile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+		if err := writePidfile(o.pidfile); err != nil {
 			fmt.Fprintf(stderr, "jailops-priv: pidfile: %v\n", err)
 			ln.Close()
 			return 1
@@ -612,14 +659,7 @@ func checkConfig(o *options, cfg priv.Config, stdout, stderr io.Writer) int {
 	w("conf dir:       %s\n", c.ConfDir)
 	w("state dir:      %s\n", c.StateDir)
 	w("helper path:    %s\n", c.HelperPath)
-	w("interfaces:     %s\n", strings.Join(c.IfPrefixes, ", "))
-	for _, u := range c.NDPProxy {
-		var ps []string
-		for _, p := range u.Prefixes {
-			ps = append(ps, p.String())
-		}
-		w("ipv6 proxy:     %s answers for %s\n", u.Uplink, strings.Join(ps, ", "))
-	}
+	w("interfaces:     the epairs that carry the JailOps description\n")
 	w("storage roots:\n")
 	warn := 0
 	if st := l.RootStatuses(); len(st) == 0 {
@@ -638,12 +678,14 @@ func checkConfig(o *options, cfg priv.Config, stdout, stderr io.Writer) int {
 	w("  devfs rulesets:  %v\n", c.Admin.DevfsRulesets)
 	w("  host mounts:     %s\n", strings.Join(c.Admin.HostMountRoots, ", "))
 	w("  zfs properties:  %s\n", strings.Join(c.Admin.ZFSProps, ", "))
-	w("  routes: %v  raw pf: %v  resume send: %v\n", c.Admin.Routes, c.Admin.RawPF, c.Admin.ResumeSend)
+	w("  routes: %v  raw pf: %v  resume send: %v  zfs delegation: %v\n", c.Admin.Routes, c.Admin.RawPF, c.Admin.ResumeSend, c.Admin.ZFSDelegation)
 	w("commands (fixed binaries):\n")
 	for _, r := range priv.CommandRules {
 		w("  %-15s %-26s %s\n", r.Name, r.Binary, r.Reason)
 	}
 	w("fetch hosts:    %s\n", strings.Join(c.EffectiveFetchHosts(), ", "))
+	w("package keys:   %s (and /usr/share/keys)\n", cmp.Or(c.PkgKeysDir, priv.DefaultPkgKeysDir))
+	w("keyrings:       %s\n", cmp.Or(c.KeyringDir, priv.DefaultKeyringDir))
 	w("image mirrors:  %s\n", strings.Join(c.ImageMirrors, ", "))
 	w("readable files: %s\n", strings.Join(priv.ReadOnlyFiles, ", "))
 	if len(c.HostManage) == 0 {

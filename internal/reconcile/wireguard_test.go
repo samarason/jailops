@@ -9,9 +9,9 @@ import (
 
 	"jailops.net/jailops/internal/reconcile"
 	"jailops.net/jailops/internal/render"
+	"jailops.net/jailops/internal/sys/ifconfig"
 	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/internal/wireguard"
-	"jailops.net/jailops/sdk/api"
 )
 
 func wgWorld(t *testing.T) (*world, *wireguard.Fake) {
@@ -147,10 +147,16 @@ func TestOrphansByName(t *testing.T) {
 	_ = w.Jails.Create(bg, "/etc/jailops/jails/p_web/jail.conf", "p_web")
 	mk := func(id string, desc string) string {
 		h, _ := epairOf(id, 0)
+		if !ifconfig.HasMarker(desc) { // someone else's: made by hand, the helper would not write it
+			w.Net.AddIface(ifconfig.Iface{Name: h, Groups: []string{"epair"}, Description: desc})
+			return h
+		}
 		if _, _, err := w.Net.EpairCreate(bg, h[:len(h)-1]); err != nil {
 			t.Fatal(err)
 		}
-		_ = w.Net.SetDescription(bg, h, desc)
+		if err := w.Net.SetDescription(bg, h, desc); err != nil {
+			t.Fatal(err)
+		}
 		return h
 	}
 	mine := mk(jailID, render.JailIfaceDesc("p", "web", "lan", true))
@@ -166,30 +172,4 @@ func TestOrphansByName(t *testing.T) {
 			t.Errorf("%s was removed", n)
 		}
 	}
-}
-
-// A network's interfaces carrying the marker of an earlier release are taken as the network's and given the
-// readable text; a bridge without any description is not taken.
-func TestLegacyMarkerIsReplaced(t *testing.T) {
-	w := newWorld(t, reconcile.Config{})
-	if err := w.Net.BridgeCreate(bg, "jo0"); err != nil {
-		t.Fatal(err)
-	}
-	_ = w.Net.SetDescription(bg, "jo0", "jailops:"+netID)
-	w.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{lan()}}
-	rep := w.R.Pass(bg)
-	if len(rep.Failures) != 0 {
-		t.Fatalf("%+v", rep.Failures)
-	}
-	ifs, _ := w.Net.List(bg)
-	if br, _ := find(ifs, "jo0"); br.Description != "jailops net=lan bridge" {
-		t.Fatalf("%+v", br)
-	}
-	w2 := newWorld(t, reconcile.Config{})
-	_ = w2.Net.BridgeCreate(bg, "jo0")
-	w2.des = reconcile.Desired{Networks: []reconcile.NetworkDesired{lan()}}
-	if rep := w2.R.Pass(bg); !strings.Contains(rep.Failures["network/lan"], "not managed by JailOps") {
-		t.Fatalf("%+v", rep.Failures)
-	}
-	_ = api.ConditionTrue
 }

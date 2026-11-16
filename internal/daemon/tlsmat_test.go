@@ -53,3 +53,27 @@ func TestConfiguredCertificateIsNeverGenerated(t *testing.T) {
 		t.Fatal("garbage accepted")
 	}
 }
+
+// The generated key is a new file of mode 0600 renamed into place: a dangling symlink at its name is replaced, and
+// its target is never created.
+func TestGeneratedKeyIsWrittenAtomically(t *testing.T) {
+	dir := t.TempDir()
+	crt, key := filepath.Join(dir, "tls", "server.crt"), filepath.Join(dir, "tls", "server.key")
+	if err := os.MkdirAll(filepath.Dir(key), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "elsewhere.key")
+	if err := os.Symlink(target, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateCert(crt, key, false, "h", nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(target); err == nil {
+		t.Fatal("the key was written through the symlink")
+	}
+	fi, err := os.Lstat(key)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("%v %v", fi, err)
+	}
+}

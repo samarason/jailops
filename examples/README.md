@@ -12,7 +12,7 @@ beside it. An example that stops working fails the build.
 | [`ipv6-switched-cloud`](ipv6-switched-cloud) | a cloud server with a **shared /64** (NDP proxy mode): one `/80` per project, two segmented projects, a firewall per jail, a public web jail | 1 |
 | [`ipv6-routed-hetzner`](ipv6-routed-hetzner) | a **routed /64**: one `/80` per project, no proxy involved | 1 |
 | [`web-stack`](web-stack) | nginx, an app and PostgreSQL, a backup schedule and encrypted backups to a keyless backup node | 1 |
-| [`big-pool-tank`](big-pool-tank) | a 16 TB HDD pool used as a storage, volumes, and an existing archive host-mounted read-only | 1 |
+| [`big-pool-tank`](big-pool-tank) | a 16 TB HDD pool used as a storage, volumes, and an existing archive attached read-only as host-directory volumes | 1 |
 | [`multi-host-fleet`](multi-host-fleet) | two hosts, one project across both, age and SOPS secrets, groups, a rollout | 2 |
 | [`provisioning`](provisioning) | a fresh FreeBSD VM to a running fleet: install, `jailops-priv init`, services, `jailops-sync` from git | 1 |
 | [`app-access-fleet`](app-access-fleet) | PostgreSQL and nginx from the application catalog (`App`), and who may reach them (`AppAccess`): a database role for the web jail, port 80 for a network | 1 |

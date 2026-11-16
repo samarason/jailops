@@ -121,13 +121,13 @@ func (f *Fleet) Check() error {
 	for _, o := range f.Objects {
 		// The daemon's name rules are narrower than the repository's file-name rule: a name it refuses fails at apply time.
 		switch o.Kind {
-		case api.KindJail, api.KindNetwork, api.KindFirewallPolicy, api.KindWireGuard, model.KindApp, api.KindAppAccess:
-			if !daemonNameRE.MatchString(o.Name) {
-				add(o, "%s name %q must match %s (lowercase letters, digits and '-', starting with a letter)", o.Kind, o.Name, daemonNameRE)
+		case api.KindJail, api.KindVolume, api.KindNetwork, api.KindFirewallPolicy, api.KindWireGuard, model.KindApp, api.KindAppAccess:
+			if !api.IsName(o.Name, api.MaxName) {
+				add(o, "%s name %q must follow %s (lowercase letters, digits and '-', starting with a letter, not ending in '-')", o.Kind, o.Name, api.NamePattern)
 			}
 		case api.KindAddressSet:
-			if !setNameRE.MatchString(o.Name) {
-				add(o, "address set name %q must match %s (lowercase letters, digits and '_', starting with a letter: it becomes a PF table)", o.Name, setNameRE)
+			if !api.IsName(o.Name, 29) {
+				add(o, "address set name %q must follow %s (29 characters at most)", o.Name, api.NamePattern)
 			}
 		}
 		for _, s := range o.SecretRefs {
@@ -152,6 +152,34 @@ func (f *Fleet) Check() error {
 			}
 			reported[key] = true
 			add(o, "%s refers to unknown %s %q (not declared for host %s)", what, kind, name, h)
+		}
+		// set:NAME in a rule or as a member of a set is an address set of the project, declared for the host; jail:NAME
+		// is a jail of the project, which may be made later (a reference to a jail that does not exist matches nobody)
+		missingRef := func(h, project, ref string, o *Object, what string) {
+			switch {
+			case strings.HasPrefix(ref, "set:"):
+				name := strings.TrimPrefix(ref, "set:")
+				if _, ok := tables[h][Key{api.KindAddressSet, project, name}]; ok {
+					return
+				}
+				key := fmt.Sprintf("%s/%s", what, ref)
+				if reported[key] {
+					return
+				}
+				reported[key] = true
+				add(o, "%s refers to %s, which is not an address set declared for host %s", what, ref, h)
+			case strings.HasPrefix(ref, "jail:"):
+				name := strings.TrimPrefix(ref, "jail:")
+				if _, ok := tables[h][Key{api.KindJail, project, name}]; ok {
+					return
+				}
+				key := fmt.Sprintf("%s/%s", what, ref)
+				if reported[key] {
+					return
+				}
+				reported[key] = true
+				warn(o, "%s refers to %s, which is not a jail declared for host %s: until it exists the reference matches nobody", what, ref, h)
+			}
 		}
 		switch s := o.Spec.(type) {
 		case api.JailSpec:
@@ -188,11 +216,49 @@ func (f *Fleet) Check() error {
 						add(o, "image %q is not in project %s's image allow-list", ImageName(s.Image), o.Project)
 					}
 				}
-				if s.Firewall.Policy != "" {
-					missing(h, api.KindFirewallPolicy, o.Project, s.Firewall.Policy, o, "firewall policy")
+				for _, pn := range s.Firewall.Policies {
+					missing(h, api.KindFirewallPolicy, o.Project, pn, o, "firewall policy")
+					if pdef != nil && slices.Contains(pdef.Spec.FirewallPolicies, pn) {
+						add(o, "firewall policy %q is a mandatory policy of project %s: it is rendered for every jail already; name policies of the jail's own", pn, o.Project)
+					}
+				}
+				if seen := map[string]bool{}; len(s.Firewall.Policies) > 1 {
+					for _, pn := range s.Firewall.Policies {
+						if seen[pn] {
+							add(o, "firewall policy %q is listed twice", pn)
+						}
+						seen[pn] = true
+					}
 				}
 				for _, d := range s.Boot.Depends {
 					missing(h, api.KindJail, o.Project, d, o, "boot.depends")
+				}
+				// a volume may have been made by hand: a jail that names one that is not declared is a warning
+				for _, v := range s.Volumes {
+					if _, ok := tables[h][Key{api.KindVolume, o.Project, v.Name}]; !ok {
+						warn(o, "volumes refers to volume %q, which is not declared for host %s: it must exist there before the jail starts", v.Name, h)
+					}
+				}
+			}
+		case api.VolumeSpec:
+			pdef := f.Projects[o.Project]
+			if s.Encrypted {
+				add(o, "an encrypted volume needs a passphrase you type: create it with 'jailops volume create --encrypted' instead of declaring it")
+			}
+			if s.IsHostDir() || s.Watch || s.Probe != "" || s.OnLoss != "" {
+				if _, err := api.CheckHostDirVolume(s); err != nil && !s.Encrypted {
+					add(o, "%v", err)
+				}
+				if s.IsHostDir() {
+					note(o, "a volume of a host directory is made and attached by a global administrator, and the directory must be on a mount below an admin-host-mount directory of each host's priv.conf")
+				}
+			}
+			for _, h := range o.Hosts {
+				if s.Storage != "" && s.Storage != "default" {
+					missing(h, api.KindStorage, "", s.Storage, o, "storage")
+				}
+				if pdef != nil && s.Storage != "" && !grantsStorage(pdef.Spec, s.Storage) {
+					add(o, "storage %q is not granted to project %s", s.Storage, o.Project)
 				}
 			}
 		case model.AppSpec:
@@ -223,21 +289,18 @@ func (f *Fleet) Check() error {
 					note(o, "no App %q is declared for host %s: the grants apply only if it was installed there", o.Name, h)
 				}
 				for _, g := range s.Grants {
-					c, _ := model.CanonicalSource(o.Project, g.Source)
-					name, ok := strings.CutPrefix(c, "@")
-					if !ok {
-						continue
-					}
-					proj := o.Project
-					if pp, j, cross := strings.Cut(name, "/"); cross {
-						proj, name = pp, j
-					}
+					c, _ := model.CanonicalSource(g.Source)
 					t := tables[h]
-					_, jail := t[Key{api.KindJail, proj, name}]
-					_, app := t[Key{model.KindApp, proj, name}]
-					_, set := t[Key{api.KindAddressSet, proj, name}]
-					if !jail && !app && !set {
-						note(o, "source %s is neither a jail, an app nor an address set declared for host %s: it must exist there", c, h)
+					if name, ok := strings.CutPrefix(c, "jail:"); ok {
+						_, jail := t[Key{api.KindJail, o.Project, name}]
+						_, app := t[Key{model.KindApp, o.Project, name}]
+						if !jail && !app {
+							note(o, "source %s is neither a jail nor an app declared for host %s: it must exist there", c, h)
+						}
+					} else if name, ok := strings.CutPrefix(c, "set:"); ok {
+						if _, set := t[Key{api.KindAddressSet, o.Project, name}]; !set {
+							note(o, "source %s is not an address set declared for host %s: it must exist there", c, h)
+						}
 					}
 				}
 			}
@@ -246,17 +309,15 @@ func (f *Fleet) Check() error {
 			for _, h := range o.Hosts {
 				for _, r := range s.Rules {
 					for _, ref := range append(slices.Clone(r.From), r.To...) {
-						if n, ok := strings.CutPrefix(ref, "@"); ok {
-							missing(h, api.KindAddressSet, o.Project, n, o, "rule")
-						}
+						missingRef(h, o.Project, ref, o, "rule")
 					}
 				}
 			}
 		case api.AddressSetSpec:
 			checkAddressSet(o, s, add, warn)
 			for _, h := range o.Hosts {
-				for _, inc := range s.Includes {
-					missing(h, api.KindAddressSet, o.Project, inc, o, "includes")
+				for _, e := range s.Addresses {
+					missingRef(h, o.Project, e.Address, o, "member")
 				}
 			}
 			for _, h := range o.Hosts {
@@ -267,7 +328,7 @@ func (f *Fleet) Check() error {
 					}
 				}
 				if cyc := setCycle(sets, o.Name, nil); cyc != "" {
-					add(o, "address set include cycle: %s", cyc)
+					add(o, "address set cycle: %s", cyc)
 					break
 				}
 			}
@@ -398,11 +459,6 @@ func (f *Fleet) Check() error {
 	return errors.Join(errs...)
 }
 
-var (
-	daemonNameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	setNameRE    = regexp.MustCompile(`^[a-z][a-z0-9_]{0,23}$`)
-)
-
 func grantsNetwork(p api.ProjectSpec, n string) bool {
 	for _, g := range p.Networks {
 		if g.Network == n {
@@ -447,12 +503,13 @@ func (f *Fleet) checkProject(o *Object, s api.ProjectSpec, tables map[string]map
 	if s.Quotas.Jails < 0 || s.Quotas.CPU < 0 || s.Quotas.PIDs < 0 || s.Quotas.Addresses < 0 {
 		add(o, "quotas must not be negative")
 	}
-	if s.Firewall == "" {
+	if len(s.FirewallPolicies) == 0 {
 		warn(o, "project %s has no mandatory firewall policy", o.Name)
-	} else {
+	}
+	for _, pn := range s.FirewallPolicies {
 		for _, h := range o.Hosts {
-			if _, ok := tables[h][Key{api.KindFirewallPolicy, o.Name, s.Firewall}]; !ok {
-				add(o, "mandatory firewall policy %q is not declared in project %s for host %s", s.Firewall, o.Name, h)
+			if _, ok := tables[h][Key{api.KindFirewallPolicy, o.Name, pn}]; !ok {
+				add(o, "mandatory firewall policy %q is not declared in project %s for host %s", pn, o.Name, h)
 				break
 			}
 		}
@@ -483,7 +540,7 @@ func (f *Fleet) checkJail(o *Object, s api.JailSpec, add func(*Object, string, .
 			}
 		}
 	}
-	if s.Firewall.Policy == "" {
+	if len(s.Firewall.Policies) == 0 {
 		warn(o, "jail %s has no firewall policy", o.Name)
 	}
 	if s.Encrypted {
@@ -492,29 +549,8 @@ func (f *Fleet) checkJail(o *Object, s api.JailSpec, add func(*Object, string, .
 	if len(s.Packages) > 0 {
 		add(o, "spec.packages is reserved and the daemon refuses it: install packages with spec.provision.packages")
 	}
-	for _, v := range s.Volumes {
-		if v.Encrypted {
-			warn(o, "volume %s is encrypted: its passphrase is typed by a person, so jailops-sync cannot create this jail; create it with 'jailops jail create' and sync manages it from then on", v.Name)
-		}
-	}
-	targets := map[string]bool{}
-	for i, m := range s.HostMounts {
-		if !strings.HasPrefix(m.Source, "/") || !strings.HasPrefix(m.Target, "/") || m.Target == "/" {
-			add(o, "host_mounts[%d]: source and target must be absolute paths and the target must not be /", i)
-		}
-		if targets[m.Target] {
-			add(o, "host_mounts[%d]: duplicate mount point %q", i, m.Target)
-		}
-		targets[m.Target] = true
-		if !m.ReadOnly {
-			warn(o, "host_mounts[%d] %s is read-write: the jail can change or delete the host's data (use read_only: true where you can)", i, m.Source)
-		}
-	}
-	if len(s.HostMounts) > 0 {
-		warn(o, "host_mounts need a global-admin identity and a source below an admin-host-mount directory of the host's priv.conf; the helper refuses the jail's start otherwise")
-	}
 	if s.Delegate {
-		warn(o, "zfs_delegation needs a global admin; the daemon accepts it but the helper does not hand the dataset over yet")
+		warn(o, "zfs_delegation needs a global admin, and the host's priv.conf must allow it (admin-zfs-delegation): root in the jail then manages the dataset <container>/delegated outside JailOps' rules")
 	}
 }
 
@@ -536,7 +572,11 @@ var secretSegment = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 func checkPolicy(o *Object, s api.FirewallPolicySpec, add func(*Object, string, ...any), warn func(*Object, string, ...any)) {
 	for _, d := range []struct{ n, v string }{{"default_in", s.DefaultIn}, {"default_out", s.DefaultOut}} {
-		if d.v != "" && d.v != "allow" && d.v != "deny" {
+		switch d.v {
+		case "allow", "deny":
+		case "":
+			add(o, "%s is required: allow or deny", d.n)
+		default:
 			add(o, "%s must be allow or deny, got %q", d.n, d.v)
 		}
 	}
@@ -597,10 +637,14 @@ func validPorts(p string) bool {
 }
 
 func checkAddressSet(o *Object, s api.AddressSetSpec, add func(*Object, string, ...any), warn func(*Object, string, ...any)) {
-	if len(s.Addresses) == 0 && len(s.Includes) == 0 {
+	if len(s.Addresses) == 0 {
 		warn(o, "address set %s is empty: rules that reference it match nothing", o.Name)
 	}
-	for _, a := range s.Addresses {
+	for _, e := range s.Addresses {
+		a := e.Address
+		if strings.HasPrefix(a, "jail:") || strings.HasPrefix(a, "set:") { // a jail or another set of the project: checked where the objects are known
+			continue
+		}
 		if _, err := netip.ParsePrefix(a); err == nil {
 			continue
 		}
@@ -610,7 +654,7 @@ func checkAddressSet(o *Object, s api.AddressSetSpec, add func(*Object, string, 
 	}
 }
 
-// setCycle returns the include path of a cycle reachable from name, or "".
+// setCycle returns the path of a cycle of set:NAME members reachable from name, or "".
 func setCycle(sets map[string]*Object, name string, stack []string) string {
 	if i := slices.Index(stack, name); i >= 0 {
 		return strings.Join(append(slices.Clone(stack[i:]), name), " -> ")
@@ -621,7 +665,13 @@ func setCycle(sets map[string]*Object, name string, stack []string) string {
 	}
 	s, _ := o.Spec.(api.AddressSetSpec)
 	stack = append(slices.Clone(stack), name)
-	for _, inc := range s.Includes {
+	var next []string
+	for _, e := range s.Addresses { // a member set:NAME is followed (a jail has no members)
+		if n, ok := strings.CutPrefix(e.Address, "set:"); ok {
+			next = append(next, n)
+		}
+	}
+	for _, inc := range next {
 		if c := setCycle(sets, inc, stack); c != "" {
 			return c
 		}
@@ -632,12 +682,6 @@ func setCycle(sets map[string]*Object, name string, stack []string) string {
 func checkNetwork(o *Object, s api.NetworkSpec, add func(*Object, string, ...any), warn func(*Object, string, ...any)) {
 	if s.IPv4 == nil && (s.IPv6 == nil || s.IPv6.Mode == api.IPv6None) {
 		add(o, "a network needs ipv4 or ipv6")
-	}
-	if s.Private && s.Uplink == "" {
-		add(o, "private blocks all traffic between the jails of the network and is for networks routed through the host: set an uplink")
-	}
-	if s.Uplink != "" && s.Uplink == s.Bridge {
-		add(o, "uplink must not be the bridge itself")
 	}
 	if v := s.IPv4; v != nil {
 		sub, err := netip.ParsePrefix(v.Subnet)
@@ -670,25 +714,15 @@ func checkNetwork(o *Object, s api.NetworkSpec, add func(*Object, string, ...any
 		if sub != sub.Masked() {
 			add(o, "ipv6.subnet %q has host bits set (want %s)", v.Subnet, sub.Masked())
 		}
-		lo := 32 // routed: a /32 to a /126
+		lo, hi := 32, 126 // routed: a /32 to a /126
 		if v.Mode == api.IPv6Proxy {
-			lo = 48 // proxy: inside a prefix the host operator approved with ndp-proxy (/48 to /120)
+			lo, hi = 48, 120 // proxy: the helper accepts /48 to /120
 		}
-		if sub.Bits() < lo || sub.Bits() > 126 {
-			add(o, "ipv6.subnet %s: in %s mode the prefix length must be between /%d and /126", sub, v.Mode, lo)
+		if sub.Bits() < lo || sub.Bits() > hi {
+			add(o, "ipv6.subnet %s: in %s mode the prefix length must be between /%d and /%d", sub, v.Mode, lo, hi)
 		}
 		checkRange(o, "ipv6.range", v.Range, sub, add)
-		gw, gerr := netip.ParseAddr(v.Gateway)
-		switch {
-		case gerr != nil || !gw.Is6():
-			add(o, "ipv6.gateway %q is not an IPv6 address", v.Gateway)
-		case !gw.IsLinkLocalUnicast() && !sub.Contains(gw):
-			add(o, "ipv6.gateway %s is outside %s (only a link-local gateway may be)", gw, sub)
-		}
 		if v.Mode == api.IPv6Proxy {
-			if gerr == nil && !gw.IsLinkLocalUnicast() {
-				add(o, "in proxy mode the gateway must be the bridge's link-local address (for example fe80::1): the bridge must not hold an on-link copy of the upstream prefix")
-			}
 			if s.Uplink == "" {
 				add(o, "ipv6 proxy mode needs an uplink to answer neighbor solicitations on")
 			}
@@ -766,7 +800,7 @@ func checkWireGuard(o *Object, s api.WireGuardSpec, add func(*Object, string, ..
 	switch s.Mode {
 	case api.WireGuardServer:
 	case api.WireGuardClient:
-		add(o, "a WireGuard client cannot be declared: its private key comes from a join token on its own host (jailops wireguard join TOKEN); declare the server and enroll the client with jailops wireguard peer add")
+		add(o, "a WireGuard client cannot be declared: its private key comes from a join token on its own host (jailops wireguard join NAME --token-file TOKEN-FILE); declare the server and enroll the client with jailops wireguard peer add")
 		return
 	default:
 		add(o, "spec.mode must be server (clients are made with jailops wireguard join)")
@@ -815,8 +849,8 @@ func checkWireGuard(o *Object, s api.WireGuardSpec, add func(*Object, string, ..
 	var used []netip.Prefix
 	for i, p := range s.Peers {
 		f := fmt.Sprintf("spec.peers[%d]", i)
-		if !daemonNameRE.MatchString(p.Name) {
-			add(o, "%s.name %q must match %s", f, p.Name, daemonNameRE)
+		if !api.IsName(p.Name, api.MaxName) {
+			add(o, "%s.name %q must follow %s", f, p.Name, api.NamePattern)
 		}
 		if names[p.Name] {
 			add(o, "%s: peer %q is listed twice", f, p.Name)

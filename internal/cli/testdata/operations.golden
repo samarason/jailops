@@ -48,7 +48,7 @@ progress: 100
 
 $ jailops op show nonexistent
 ! not_found: operation "nonexistent" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops op list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops jail create w2 --image freebsd-15@stable --network lan --storage default --no-wait

@@ -8,12 +8,13 @@ import (
 	"fmt"
 	"io"
 	"jailops.net/jailops/internal/priv"
+	"jailops.net/jailops/internal/supervise"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,9 @@ type Options struct {
 	BackupMounter hostbackup.Mounter
 	// LogForwardTune adjusts the log forwarder (tests: poll interval, file check).
 	LogForwardTune func(*logfwd.Env)
+	// KeepAlive and ReadTimeout replace the keepalive interval of long requests (15s) and the read timeout of the
+	// listeners (2m) (tests).
+	KeepAlive, ReadTimeout time.Duration
 	// ACMEHTTPClient talks to the ACME CA (tests: a CA of their own); TLSRoots decide whether a certificate comes
 	// from a public CA (nil: the host's roots); ListenChallenge opens the http-01 listener (tests: a free port).
 	ACMEHTTPClient  *http.Client
@@ -270,11 +274,17 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 	case opts.Dev:
 		deps.Execer = service.LocalExecer{Prefix: []string{"jexec", "-l"}}
 	}
-	deps.NetSysctl = cfg.Network.Sysctl
 	for _, p := range cfg.Lifecycle.Persistent {
 		deps.Persistent = append(deps.Persistent, lifecycle.PersistentPath{Dataset: p.Dataset, Path: p.Path, Class: lifecycle.Class(p.Class), Merge: p.Merge, NoSeed: p.NoSeed})
 	}
 	deps.UpdateTick, deps.ProjectFilesDir = cfg.Updates.Tick.Std(), cfg.Updates.ProjectFilesDir
+	deps.JailShell, deps.JailPrompt = cfg.Jails.Shell, cfg.Jails.Prompt
+	if cfg.Jails.PromptColor != nil {
+		deps.JailPromptColor = *cfg.Jails.PromptColor
+	}
+	if cfg.Jails.MaxStates != nil {
+		deps.JailMaxStates = *cfg.Jails.MaxStates
+	}
 	deps.AppsDir = cfg.Apps.CatalogDir
 	deps.Host, deps.HostModules = clients.HostSystem, cfg.Host.Manage.Modules
 	deps.ConsolePort = consolePort(cfg.Listen.HTTPS.Address)
@@ -283,8 +293,14 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		return consoleURLs(firstNonEmpty(d.HTTPSAddr(), cfg.Listen.HTTPS.Address), hostname, net.InterfaceAddrs)
 	}
 	deps.AppsLocalDir = cfg.Apps.LocalDir
-	deps.LogForward, deps.LogForwardTune = cfg.Logging.Forward, opts.LogForwardTune
+	deps.LogForward, deps.LogForwardTune, deps.LogSecretsDir = cfg.Logging.Forward, opts.LogForwardTune, cfg.Logging.SecretsDir
+	deps.LogOwnPorts = func() []int {
+		// the console's listener (the port it got when it was 0) and the ACME challenge listener
+		ports := []int{consolePort(firstNonEmpty(d.HTTPSAddr(), cfg.Listen.HTTPS.Address)), consolePort(firstNonEmpty(cfg.Listen.HTTPS.ACME.ChallengeAddress, DefaultChallengeAddress))}
+		return slices.DeleteFunc(ports, func(p int) bool { return p == 0 })
+	}
 	deps.DialJail = clients.Dial
+	deps.HostFile = clients.HostFile
 	deps.ExecLimits = service.ExecLimits{PerJail: cfg.Limits.ExecSessionsPerJail, Idle: cfg.Limits.ExecIdle.Std(), Max: cfg.Limits.ExecMax.Std()}
 	if opts.Registrar != nil {
 		deps.Registrar = opts.Registrar
@@ -301,7 +317,11 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		if !opts.Dev && clients.Host != nil {
 			agents = privAgents{clients.Host} // not root: files are read and written by agents of the helper
 		}
-		hb, err := buildHostBackups(cfg, hostUUID, clients.ZFS, log, opts, agents)
+		var mounts hostbackup.DatasetMounter
+		if m, ok := any(clients.Host).(hostbackup.DatasetMounter); ok && clients.Host != nil {
+			mounts = m // a stopped jail's datasets are mounted by the helper for the time of the backup
+		}
+		hb, err := buildHostBackups(cfg, hostUUID, clients.ZFS, log, opts, agents, mounts)
 		if err != nil {
 			return nil, err
 		}
@@ -321,18 +341,19 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 	}
 	// 5. Reconciler.
 	autostart := cfg.Reconcile.Autostart != nil && *cfg.Reconcile.Autostart
-	rcfg := reconcile.Config{Interval: cfg.Reconcile.Interval.Std(), Autostart: autostart, NDP: d.ndpFactory()}
+	rcfg := reconcile.Config{Interval: cfg.Reconcile.Interval.Std(), Autostart: autostart, NDP: d.ndpFactory(),
+		BootStateFile: filepath.Join(cfg.StateDir, "boot-id")}
 	trigger := make(chan struct{}, 1)
 	d.rec = reconcile.New(rcfg, reconcile.Env{Source: svc, Sink: svc, Actions: svc, Net: clients.Net, PF: clients.PF, Jails: clients.Jails,
-		Run: clients.Runner, Sysctl: clients.Sysctl, HostRoutes: func(context.Context) (map[netip.Addr]string, error) { return priv.ReadHostRoutes() },
-		HostNeighbors: func(context.Context) ([]ifconfig.Neighbor, error) { return priv.ReadStaticNeighbors() },
-		Log:           log, Trigger: trigger, WG: clients.WG})
+		Run: clients.Runner, Sysctl: clients.Sysctl, Routes: func(context.Context) ([]ifconfig.RouteEntry, error) { return priv.ReadRoutes() },
+		Log: log, Trigger: trigger, WG: clients.WG, AfterPass: func(ctx context.Context) { svc.SyncDNS(ctx) }})
 	svc.SetReconciler(d.rec)
 	// 6. Routes are verified against the permission table here.
 	srv, err := server.New(server.Config{
 		Svc: svc, Log: log, ClientCert: &d.cert, NoUI: !cfg.UI(),
-		MaxBody: cfg.Limits.MaxBodyBytes, RequestTimeout: cfg.Limits.RequestTimeout.Std(),
+		MaxBody: cfg.Limits.MaxBodyBytes, RequestTimeout: cfg.Limits.RequestTimeout.Std(), KeepAlive: opts.KeepAlive,
 		Lockout: auth.LockoutConfig{Threshold: cfg.Limits.AuthFailureThreshold, Now: opts.Now},
+		HSTS:    d.certMgr.HSTS,
 	})
 	if err != nil {
 		return nil, err
@@ -350,17 +371,22 @@ func Start(ctx context.Context, opts Options) (*Daemon, error) {
 		}
 	}
 	// 8. Background work.
-	d.go_(func() { _ = d.rec.Run(priv.WithAdmin(bg, systemActor)) })
-	d.go_(func() { d.bridgeStateEvents(bg, trigger) })
-	d.go_(func() { d.housekeeping(bg) })
+	admin := priv.WithAdmin(bg, systemActor)
+	d.loop(bg, "reconcile", func(context.Context) { _ = d.rec.Run(admin) })
+	d.loop(bg, "state-events", func(ctx context.Context) { d.stateEvents(ctx, trigger) })
+	d.loop(bg, "housekeeping", d.housekeeping)
+	if cfg.Devd.On() {
+		d.loop(bg, "devd", func(ctx context.Context) { svc.RunDevd(ctx, cfg.Devd.Pipe) })
+	}
 	if d.backups != nil {
-		d.go_(func() { d.backupLoop(priv.WithAdmin(bg, systemActor)) })
+		d.loop(bg, "backup", func(context.Context) { d.backupLoop(admin) })
 	}
 	if cfg.Hub {
-		d.go_(func() { d.probeLoop(bg) })
-		d.go_(func() { d.fleetLoop(bg) })
+		d.loop(bg, "hub-probe", d.probeLoop)
+		d.loop(bg, "hub-fleet", d.fleetLoop)
 	}
 	ok = true
+	svc.MarkStarted() // GET /readyz answers from here on
 	if st, err := svc.SetupStatus(ctx); err == nil && st.Required {
 		log.Info("no administrator yet: the console asks for the setup token, which `jailops-priv setup-token` (as root) prints")
 	}
@@ -396,6 +422,13 @@ func (h *hostBackups) admin() backupAdmin { return backupAdmin{h.svc} }
 func (d *Daemon) go_(f func()) {
 	d.wg.Add(1)
 	go func() { defer d.wg.Done(); f() }()
+}
+
+// loop runs a background loop of the daemon under the supervisor: a panic in it is logged and counted and the loop
+// starts again after a delay; it does not end the daemon.
+func (d *Daemon) loop(ctx context.Context, name string, f func(context.Context)) {
+	d.wg.Add(1)
+	go func() { defer d.wg.Done(); supervise.Run(ctx, d.log, name, f) }()
 }
 
 // Handler returns the full HTTP handler (for tests that do not listen).
@@ -439,6 +472,9 @@ func (d *Daemon) Shutdown(ctx context.Context) error {
 	var err error
 	d.once.Do(func() {
 		d.log.Info("jailopsd stopping")
+		if d.svc != nil {
+			d.svc.MarkStopping()
+		}
 		for _, s := range d.servers {
 			if e := s.Shutdown(ctx); e != nil {
 				_ = s.Close()
@@ -506,7 +542,7 @@ func (d *Daemon) snapshotState(kind api.Kind, name string) error {
 	return nil
 }
 
-func (d *Daemon) bridgeStateEvents(ctx context.Context, trigger chan<- struct{}) {
+func (d *Daemon) stateEvents(ctx context.Context, trigger chan<- struct{}) {
 	ch, cancel := d.state.Watch(64)
 	defer cancel()
 	for {
@@ -558,10 +594,19 @@ func (d *Daemon) probeLoop(ctx context.Context) {
 // copies the database with VACUUM INTO daily (users, tokens and the audit log
 // are the only rows that cannot be rebuilt).
 func (d *Daemon) housekeeping(ctx context.Context) {
+	var audited time.Time
 	run := func() {
 		_, _ = d.db.Sessions.PurgeExpired(ctx)
 		_, _ = d.db.Tokens.DeleteExpired(ctx)
 		_, _ = d.db.Operations.Prune(ctx, d.opts.Now().Add(-30*24*time.Hour))
+		if now := d.opts.Now(); now.Sub(audited) >= 24*time.Hour {
+			audited = now
+			if n, err := d.PruneAudit(ctx); err != nil {
+				d.log.Warn("audit log: pruning failed", "err", err)
+			} else if n > 0 {
+				d.log.Info("audit log: old entries deleted", "entries", n, "retention", d.cfg.Audit.Retention.Std().String(), "max_entries", d.cfg.Audit.MaxEntries)
+			}
+		}
 		d.backupDB(ctx)
 		d.svc.Housekeeping(ctx)
 	}
@@ -576,6 +621,19 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 			run()
 		}
 	}
+}
+
+// PruneAudit deletes the audit entries that audit.retention and audit.max_entries no longer keep (never one of the
+// newest 1000) and returns how many it deleted. The daemon runs it once a day.
+func (d *Daemon) PruneAudit(ctx context.Context) (int64, error) {
+	keep, rows := d.cfg.Audit.Retention.Std(), d.cfg.Audit.MaxEntries
+	if keep <= 0 {
+		keep = 90 * 24 * time.Hour
+	}
+	if rows <= 0 {
+		rows = 1000000
+	}
+	return d.db.Audit.Prune(ctx, d.opts.Now().Add(-keep), rows)
 }
 
 func (d *Daemon) backupDB(ctx context.Context) {
@@ -599,8 +657,8 @@ func (d *Daemon) backupDB(ctx context.Context) {
 }
 
 // ndpFactory builds the neighbor discovery proxy. In production it works through the root helper: the
-// helper hands over a locked, read-only capture of the uplink and sends the advertisements itself, for the prefixes the
-// operator approved in priv.conf (ndp-proxy). With --dev it runs in process as root.
+// helper hands over a locked, read-only capture of the uplink and sends the advertisements itself, for the subnets of the
+// networks in proxy mode. With --dev it runs in process as root.
 func (d *Daemon) ndpFactory() reconcile.NDPFactory {
 	return func(uplink string) (reconcile.NDP, error) {
 		if !d.opts.Dev {

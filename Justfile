@@ -79,9 +79,13 @@ fmt:
     cd sdk && go vet ./...
 
 # Unit tests of both modules, with fakes. Runs anywhere.
-test:
+test: test-setup
     go test ./... -count=1
     cd sdk && go test ./... -count=1
+
+# packaging/jailops-setup against fake sysrc, pfctl, zpool, service and friends (POSIX sh, runs anywhere).
+test-setup:
+    sh scripts/jailops-setup-test.sh
 
 # Race detector.
 test-race:
@@ -100,6 +104,7 @@ snapshot: web-all share
 # Short fuzz run over the parsers.
 fuzz seconds="20":
     for f in $(go test ./internal/sys/zfs -list '^Fuzz' | grep '^Fuzz'); do go test ./internal/sys/zfs -run '^$' -fuzz "^$f\$" -fuzztime {{seconds}}s; done
+    go test ./internal/render -run '^$' -fuzz '^FuzzPromptFile$' -fuzztime {{seconds}}s
 
 # Regenerate / verify the TypeScript wire types from sdk/api.
 gen-ts:
@@ -108,7 +113,11 @@ gen-ts:
 check-ts:
     go run ./scripts/gen-ts -check
 
-check: fmt check-ts test
+# The end-to-end scripts wait for conditions, not for seconds (scripts/lint-e2e.sh).
+lint-e2e:
+    sh scripts/lint-e2e.sh
+
+check: fmt check-ts lint-e2e test
 
 # Everything CI runs.
 ci: fmt test build-freebsd

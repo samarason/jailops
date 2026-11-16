@@ -6,6 +6,8 @@ export interface RestoreForm {
   host: string
   replace: boolean
   keepIp: boolean
+  noVolumes: boolean
+  passphrase: string
   networkMap: Record<string, string>
 }
 
@@ -20,12 +22,15 @@ export function buildRequest(f: RestoreForm, dryRun: boolean): RestoreRequest {
     ...(f.replace ? { replace: true } : {}),
     ...(Object.keys(map).length ? { network_map: map } : {}),
     ...(f.keepIp ? { keep_ip: true } : {}),
+    ...(f.noVolumes ? { no_volumes: true } : {}),
+    ...(f.passphrase ? { passphrase: f.passphrase } : {}),
     ...(dryRun ? { dry_run: true } : {}),
   }
 }
 
 /** Two requests are the same decision when they differ only in dry_run. */
 export function requestKey(f: RestoreForm): string {
-  const r = buildRequest(f, false)
+  // the passphrase is typed, not decided: changing it does not change what the preflight said
+  const r = buildRequest({ ...f, passphrase: f.passphrase ? 'set' : '' }, false)
   return JSON.stringify(r, Object.keys(r).sort())
 }

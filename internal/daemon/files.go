@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 
+	"jailops.net/jailops/internal/hostdir"
+	"jailops.net/jailops/internal/mounts"
 	"jailops.net/jailops/internal/priv"
 	"jailops.net/jailops/sdk/api"
 )
@@ -60,6 +62,35 @@ func (f privFiles) MkdirAll(ctx context.Context, path string) error {
 		return osFiles{}.MkdirAll(ctx, path)
 	}
 	return f.h.MkdirAll(ctx, priv.MkdirReq{Path: path, Mode: 0o755})
+}
+func (f privFiles) SetOwner(ctx context.Context, path string, uid, gid int, mode uint32) error {
+	return f.h.SetVolumeOwner(ctx, priv.VolumeOwnerReq{Path: path, UID: uint32(uid), GID: uint32(gid), Mode: mode})
+}
+func (f privFiles) ProbeSource(ctx context.Context, path string, write bool) (hostdir.Probe, error) {
+	r, err := f.h.ProbeSource(ctx, priv.SourceProbeReq{Path: path, Write: write})
+	return hostdir.Probe{Mounted: r.Mounted, Writable: r.Writable, Detail: r.Detail}, err
+}
+func (f privFiles) StaleMounts(ctx context.Context) ([]mounts.Stale, error) {
+	ms, err := f.h.StaleMounts(ctx)
+	out := make([]mounts.Stale, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, mounts.Stale{Jail: m.Jail, Path: m.Path, Type: m.Type})
+	}
+	return out, err
+}
+func (f privFiles) HealJail(ctx context.Context, jail string) (mounts.Healed, error) {
+	r, err := f.h.HealJail(ctx, jail)
+	return mounts.Healed{Unmounted: r.Unmounted, Left: r.Left, Errors: r.Errors}, err
+}
+func (f privFiles) HealNetwork(ctx context.Context) (mounts.NetHealed, error) {
+	r, err := f.h.HealNetwork(ctx)
+	return mounts.NetHealed{Destroyed: r.Destroyed, Skipped: r.Skipped}, err
+}
+func (f privFiles) DNSUnbound(ctx context.Context, apply bool) (mounts.UnboundState, error) {
+	r, err := f.h.DNSUnbound(ctx, apply)
+	return mounts.UnboundState{Enabled: r.Enabled, Base: r.Base, Reason: r.Reason, Current: r.Current, Changed: r.Changed, Reloaded: r.Reloaded, Path: r.Path,
+		Control: r.Control, Sample: r.Sample, Names: r.Names, Gateways: r.Gateways,
+		Suffix: r.Suffix, Jails: r.Jails, Projects: r.Projects, Forward: r.Forward, Recurse: r.Recurse}, err
 }
 func (f privFiles) RemoveAll(ctx context.Context, path string) error {
 	if f.mine(path) {
@@ -136,7 +167,50 @@ func (osFiles) Exists(_ context.Context, path string) (bool, error) {
 	}
 	return err == nil, err
 }
-func (osFiles) MkdirAll(_ context.Context, path string) error  { return os.MkdirAll(path, 0o755) }
+func (osFiles) MkdirAll(_ context.Context, path string) error { return os.MkdirAll(path, 0o755) }
+func (osFiles) SetOwner(_ context.Context, path string, uid, gid int, mode uint32) error {
+	if err := os.Chmod(path, os.FileMode(mode)); err != nil {
+		return err
+	}
+	return os.Chown(path, uid, gid)
+}
+
+// StaleMounts, HealJail and HealNetwork of a daemon without the helper: there is no table of mounts to read and nothing to take off.
+func (osFiles) StaleMounts(context.Context) ([]mounts.Stale, error)     { return nil, nil }
+func (osFiles) HealJail(context.Context, string) (mounts.Healed, error) { return mounts.Healed{}, nil }
+func (osFiles) HealNetwork(context.Context) (mounts.NetHealed, error)   { return mounts.NetHealed{}, nil }
+func (osFiles) DNSUnbound(context.Context, bool) (mounts.UnboundState, error) {
+	return mounts.UnboundState{}, nil
+}
+
+// ProbeSource of a daemon without the helper: the directory is on a mount when its device is not its parent's.
+func (osFiles) ProbeSource(_ context.Context, path string, write bool) (hostdir.Probe, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return hostdir.Probe{Detail: "the directory does not exist"}, nil
+	}
+	up, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		return hostdir.Probe{}, err
+	}
+	a, ok1 := fi.Sys().(*syscall.Stat_t)
+	b, ok2 := up.Sys().(*syscall.Stat_t)
+	if !ok1 || !ok2 || uint64(a.Dev) == uint64(b.Dev) { //nolint:unconvert // the width of Dev differs by system
+		return hostdir.Probe{Detail: "the directory is not on a mount"}, nil
+	}
+	out := hostdir.Probe{Mounted: true}
+	if write {
+		f, err := os.CreateTemp(path, ".jailops-probe-")
+		if err != nil {
+			out.Detail = "no file can be created in the directory"
+			return out, nil
+		}
+		f.Close()
+		os.Remove(f.Name())
+		out.Writable = true
+	}
+	return out, nil
+}
 func (osFiles) RemoveAll(_ context.Context, path string) error { return os.RemoveAll(path) }
 func (osFiles) SHA256(_ context.Context, path string) (string, error) {
 	f, err := os.Open(path)

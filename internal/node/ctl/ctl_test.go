@@ -48,6 +48,8 @@ func TestMigrateTwiceAndRefuseNewer(t *testing.T) {
 func TestOneOpenSessionPerGroup(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
+	now := time.Now() // the leases run on a clock the test moves by hand
+	db.SetClock(func() time.Time { return now })
 	h, err := db.EnrollHost(ctx, "h1", fp, []string{"backup-push"}, "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +78,7 @@ func TestOneOpenSessionPerGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	// an expired lease is taken over, and cannot be renewed
-	time.Sleep(120 * time.Millisecond)
+	now = now.Add(120 * time.Millisecond)
 	if _, err := db.RenewSession(ctx, s2.ID, time.Minute, 0, 0); !errors.Is(err, ctl.ErrNotFound) {
 		t.Fatalf("renewing an expired lease: %v", err)
 	}

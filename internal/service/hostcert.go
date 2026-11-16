@@ -74,9 +74,9 @@ func (s *Service) decorateCertificate(ctx context.Context, st *api.HostCertifica
 			host = st.ACME.Spec.Domains[0]
 		}
 		name, _, _ := strings.Cut(host, ".")
-		cmd := fmt.Sprintf("jailops remote add %s https://%s:%d --token-stdin", name, host, port)
+		cmd := fmt.Sprintf("jailops remote add %s https://%s:%d --token-file -", name, host, port)
 		if !st.Current.PublicCA {
-			cmd = fmt.Sprintf("jailops remote add %s https://%s:%d --fingerprint %s --token-stdin", name, host, port, st.Current.Fingerprint)
+			cmd = fmt.Sprintf("jailops remote add %s https://%s:%d --fingerprint %s --token-file -", name, host, port, st.Current.Fingerprint)
 		}
 		st.RemoteAdd = cmd
 	}

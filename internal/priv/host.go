@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -68,6 +69,17 @@ var HostRCVars = map[string]*regexp.Regexp{
 	"pf_rules":  regexp.MustCompile(`^/[A-Za-z0-9._/-]{1,250}$`),
 }
 
+// hostModuleRCVars are the rc.conf variables each module owns. A snapshot records only these (not a copy of
+// rc.conf), and a restore sets or removes only these: whatever else root changed in rc.conf since stays.
+var hostModuleRCVars = map[string][]string{
+	api.HostModuleIdentity: {"hostname", "ntpd_enable", "ntpd_sync_on_start"},
+	api.HostModuleFirewall: {"pf_enable", "pf_rules"},
+}
+
+// reRCRestore is what a value put back from a snapshot may hold: the values host management writes and the plain
+// values a host has for these variables; anything else is refused and left to the administrator.
+var reRCRestore = regexp.MustCompile(`^[A-Za-z0-9._/:+-]{0,253}$`)
+
 // hostIdentityFiles are the files of /etc the identity module touches, by name below the etc directory.
 var hostIdentityFiles = []string{"resolv.conf", "ntp.conf", "rc.conf"}
 
@@ -111,6 +123,10 @@ type hostManifest struct {
 	// Firewall is the record of the firewall module when the snapshot was taken, PFEnabled whether pf ran.
 	Firewall  *hostFirewallRecord `json:"firewall,omitempty"`
 	PFEnabled *bool               `json:"pf_enabled,omitempty"`
+	// RC holds the module's rc.conf variables as they were (null: not set) when rc.conf is among the files; no copy
+	// of rc.conf is kept. A snapshot of an earlier version has a copy instead, and only these variables are read
+	// from it.
+	RC map[string]*string `json:"rc,omitempty"`
 }
 
 // hostModuleFiles are the files of /etc each module touches; a manifest naming another file is refused.
@@ -220,8 +236,7 @@ func (l *Local) writeAtomic(dir, name string, data []byte, mode os.FileMode, uid
 	if st, err := root.Lstat(name); err == nil && !st.Mode().IsRegular() {
 		return forbidden("%s is not a regular file", filepath.Join(dir, name))
 	}
-	tmp := "." + name + ".jotmp"
-	_ = root.Remove(tmp)
+	tmp := tmpName(name)
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return mapFSErr(err)
@@ -268,11 +283,9 @@ func (l *Local) hostDir() (*os.Root, error) {
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return nil, forbidden("%s is not a plain directory", dir)
 	}
-	if !l.noChown {
-		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok || st.Uid != 0 || fi.Mode().Perm()&0o077 != 0 {
-			return nil, forbidden("%s must belong to root with mode 0700", dir)
-		}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != l.hostDirUID || fi.Mode().Perm()&0o077 != 0 {
+		return nil, forbidden("%s must belong to root with mode 0700", dir)
 	}
 	return os.OpenRoot(dir)
 }
@@ -281,6 +294,23 @@ func (l *Local) hostDir() (*os.Root, error) {
 func (l *Local) hostRun(ctx context.Context, name string, args ...string) (string, error) {
 	res, err := l.d.Runner.Run(ctx, run.Cmd{Name: name, Args: args, Timeout: 60 * time.Second, MaxOutput: 64 << 10})
 	return string(res.Stdout), err
+}
+
+// sysrcRestore puts back a variable of the module's own as a snapshot recorded it: set to its value, or removed
+// (sysrc -x) when it was not set.
+func (l *Local) sysrcRestore(ctx context.Context, name string, value *string) error {
+	if HostRCVars[name] == nil {
+		return forbidden("rc.conf variable %q is not one host management sets", name)
+	}
+	if value == nil {
+		_, err := l.hostRun(ctx, sysrcBin, "-f", l.etcPath("rc.conf"), "-x", name)
+		return err
+	}
+	if !reRCRestore.MatchString(*value) {
+		return invalid("the snapshot's value of rc.conf %s is not one the helper writes back; set it by hand", name)
+	}
+	_, err := l.hostRun(ctx, sysrcBin, "-f", l.etcPath("rc.conf"), name+"="+*value)
+	return err
 }
 
 // sysrcSet sets one allow-listed rc.conf variable through sysrc(8).
@@ -572,16 +602,24 @@ type fileChange struct {
 
 // hostPlan is what an apply or a restore does, in order: files, rc.conf variables, the host name, ntpd.
 type hostPlan struct {
-	files    []fileChange
-	rc       [][2]string // name, value
-	hostname string      // set the running host name; "" leaves it
-	ntpd     string      // "restart", "onestop" or ""
+	files []fileChange
+	rc    [][2]string // name, value
+	// rcBack are the variables a restore puts back (nil: remove), in order; checked by sysrcRestore
+	rcBack   []rcValue
+	hostname string // set the running host name; "" leaves it
+	ntpd     string // "restart", "onestop" or ""
 	diff     strings.Builder
 	actions  []string
 }
 
+// rcValue is an rc.conf variable and its value; nil is not set.
+type rcValue struct {
+	name  string
+	value *string
+}
+
 func (p *hostPlan) changed() bool {
-	return len(p.files) > 0 || len(p.rc) > 0 || p.hostname != "" || p.ntpd != ""
+	return len(p.files) > 0 || len(p.rc) > 0 || len(p.rcBack) > 0 || p.hostname != "" || p.ntpd != ""
 }
 
 func (p *hostPlan) touched() []string {
@@ -589,7 +627,7 @@ func (p *hostPlan) touched() []string {
 	for _, f := range p.files {
 		out = append(out, f.cur.name)
 	}
-	if len(p.rc) > 0 && !slices.Contains(out, "rc.conf") {
+	if len(p.rc)+len(p.rcBack) > 0 && !slices.Contains(out, "rc.conf") {
 		out = append(out, "rc.conf")
 	}
 	return out
@@ -697,6 +735,11 @@ func (l *Local) execute(ctx context.Context, p *hostPlan) error {
 	}
 	for _, kv := range p.rc {
 		if err := l.sysrcSet(ctx, kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	for _, v := range p.rcBack {
+		if err := l.sysrcRestore(ctx, v.name, v.value); err != nil {
 			return err
 		}
 	}
@@ -867,6 +910,20 @@ func (l *Local) keepSnapshot(m hostManifest, files map[string]hostFile, names []
 	for _, n := range names {
 		hf := files[n]
 		sf := hostSnapFile{Name: n, Exists: hf.exists}
+		if n == "rc.conf" {
+			// the module's variables only: rc.conf is root's file, the rest of it is not the module's to put back
+			m.RC = map[string]*string{}
+			cur := parseRC(hf.data)
+			for _, v := range hostModuleRCVars[m.Module] {
+				if val, ok := cur[v]; ok {
+					m.RC[v] = &val
+				} else {
+					m.RC[v] = nil
+				}
+			}
+			m.Files = append(m.Files, sf)
+			continue
+		}
 		if hf.exists {
 			sf.Mode, sf.UID, sf.GID = uint32(hf.mode), hf.uid, hf.gid
 			if err := l.writeAtomic(dir, n, []byte(hf.data), 0o600, 0, 0); err != nil {
@@ -1066,16 +1123,41 @@ func (l *Local) restoreSnapshot(ctx context.Context, name string, dryRun, keep, 
 		return api.HostChange{}, err
 	}
 	p := &hostPlan{}
+	rcAfter := parseRC(f.files["rc.conf"].data)
 	for _, sf := range m.Files {
-		data := ""
-		if sf.Exists {
-			b, err := root.ReadFile(snapFilePath(name, sf.Name))
-			if err != nil {
-				return api.HostChange{}, mapFSErr(err)
-			}
-			data = string(b)
-		}
 		cur := f.files[sf.Name]
+		switch sf.Name {
+		case "rc.conf":
+			if rcAfter, err = l.planRestoreRC(p, root, name, m, sf, cur); err != nil {
+				return api.HostChange{}, err
+			}
+			continue
+		case "ntp.conf":
+			// only the jailops block goes back; every other line stays as it is now
+			snapData, err := readSnapCopy(root, name, sf)
+			if err != nil {
+				return api.HostChange{}, err
+			}
+			data, err := spliceNTPBlock(cur.data, snapData)
+			if err != nil {
+				return api.HostChange{}, err
+			}
+			keep := cur.exists || data != ""
+			if !sf.Exists && data == "" {
+				keep = false
+			}
+			before := len(p.files)
+			l.planFile(p, cur, data, keep, " (the jailops block)")
+			if len(p.files) > before && !cur.exists {
+				last := &p.files[len(p.files)-1]
+				last.cur.mode, last.cur.uid, last.cur.gid = os.FileMode(sf.Mode).Perm(), sf.UID, sf.GID
+			}
+			continue
+		}
+		data, err := readSnapCopy(root, name, sf)
+		if err != nil {
+			return api.HostChange{}, err
+		}
 		before := len(p.files)
 		l.planFile(p, cur, data, sf.Exists, "")
 		if len(p.files) > before && sf.Exists {
@@ -1090,18 +1172,12 @@ func (l *Local) restoreSnapshot(ctx context.Context, name string, dryRun, keep, 
 		p.hostname = m.Hostname
 		p.actions = append(p.actions, fmt.Sprintf("hostname %s (was %s)", m.Hostname, f.hostname))
 	}
-	ntpTouched := false
+	ntpTouched := len(p.rcBack) > 0
 	for _, fc := range p.files {
-		ntpTouched = ntpTouched || fc.cur.name == "ntp.conf" || fc.cur.name == "rc.conf"
+		ntpTouched = ntpTouched || fc.cur.name == "ntp.conf"
 	}
 	if ntpTouched {
-		after := f.files["rc.conf"].data
-		for _, fc := range p.files {
-			if fc.cur.name == "rc.conf" {
-				after = fc.data
-			}
-		}
-		was, now := strings.EqualFold(parseRC(f.files["rc.conf"].data)["ntpd_enable"], "YES"), strings.EqualFold(parseRC(after)["ntpd_enable"], "YES")
+		was, now := strings.EqualFold(parseRC(f.files["rc.conf"].data)["ntpd_enable"], "YES"), strings.EqualFold(rcAfter["ntpd_enable"], "YES")
 		switch {
 		case now:
 			p.ntpd = "restart"
@@ -1139,6 +1215,110 @@ func (l *Local) restoreSnapshot(ctx context.Context, name string, dryRun, keep, 
 		return res, err
 	}
 	return res, l.writeApplied(m.Applied)
+}
+
+// readSnapCopy reads the copy of a file in a snapshot; "" for a file that did not exist.
+func readSnapCopy(root *os.Root, name string, sf hostSnapFile) (string, error) {
+	if !sf.Exists {
+		return "", nil
+	}
+	b, err := root.ReadFile(snapFilePath(name, sf.Name))
+	if err != nil {
+		return "", mapFSErr(err)
+	}
+	return string(b), nil
+}
+
+// planRestoreRC plans putting the module's rc.conf variables back as the snapshot recorded them (set, or removed
+// when they were not set), and nothing else of rc.conf. It returns the variables as they will be afterwards. A
+// snapshot of an earlier version holds a copy of rc.conf: only the module's variables are read from it.
+func (l *Local) planRestoreRC(p *hostPlan, root *os.Root, name string, m hostManifest, sf hostSnapFile, cur hostFile) (map[string]string, error) {
+	owned := hostModuleRCVars[m.Module]
+	want := m.RC
+	if want == nil {
+		data, err := readSnapCopy(root, name, sf)
+		if err != nil {
+			return nil, err
+		}
+		old := parseRC(data)
+		want = map[string]*string{}
+		for _, v := range owned {
+			if val, ok := old[v]; ok {
+				want[v] = &val
+			} else {
+				want[v] = nil
+			}
+		}
+	}
+	have := parseRC(cur.data)
+	after := maps.Clone(have)
+	var diff []string
+	for _, v := range owned {
+		w, recorded := want[v]
+		if !recorded {
+			continue
+		}
+		h, set := have[v]
+		if (w == nil && !set) || (w != nil && set && *w == h) {
+			continue
+		}
+		if w != nil && !reRCRestore.MatchString(*w) {
+			return nil, invalid("the snapshot's value of rc.conf %s is not one the helper writes back; set it by hand", v)
+		}
+		p.rcBack = append(p.rcBack, rcValue{name: v, value: w})
+		was := " (not set)"
+		if set {
+			diff = append(diff, fmt.Sprintf("-%s=%q", v, h))
+			was = fmt.Sprintf(" (was %q)", h)
+		}
+		if w == nil {
+			delete(after, v)
+			p.actions = append(p.actions, fmt.Sprintf("sysrc -f %s -x %s%s", l.etcPath("rc.conf"), v, was))
+			continue
+		}
+		after[v] = *w
+		diff = append(diff, fmt.Sprintf("+%s=%q", v, *w))
+		p.actions = append(p.actions, fmt.Sprintf("sysrc -f %s %s=%s%s", l.etcPath("rc.conf"), v, *w, was))
+	}
+	if len(diff) > 0 {
+		fmt.Fprintf(&p.diff, "--- %s\n+++ %s (variables set with sysrc)\n%s\n", l.etcPath("rc.conf"), l.etcPath("rc.conf"), strings.Join(diff, "\n"))
+	}
+	return after, nil
+}
+
+// spliceNTPBlock puts the jailops block of snap (none, when snap has none) in place of the block of cur, or at its
+// end; every other line of cur stays as it is.
+func spliceNTPBlock(cur, snap string) (string, error) {
+	sl := splitLines(snap)
+	sb, se, err := ntpBlock(sl)
+	if err != nil {
+		return "", err
+	}
+	var block []string
+	if sb >= 0 {
+		block = sl[sb : se+1]
+	}
+	lines := splitLines(cur)
+	b, e, err := ntpBlock(lines)
+	if err != nil {
+		return "", err
+	}
+	var out []string
+	if b >= 0 {
+		if slices.Equal(lines[b:e+1], block) {
+			return cur, nil
+		}
+		out = append(append(append(out, lines[:b]...), block...), lines[e+1:]...)
+	} else {
+		if block == nil {
+			return cur, nil
+		}
+		out = append(append(out, lines...), block...)
+	}
+	if len(out) == 0 {
+		return "", nil
+	}
+	return strings.Join(out, "\n") + "\n", nil
 }
 
 // ---- wire ----

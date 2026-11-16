@@ -40,6 +40,9 @@ package backupd
 //	PUT    /api/v1/maintenance {mode}               backup-admin. hosts get 503 "maintenance" while it is not online
 //	GET    /api/v1/quarantine                       readonly. []node.QuarantinedChunk {id, size, since, healed}
 //	POST   /api/v1/quarantine/purge                 backup-admin
+//	POST   /api/v1/quarantine/{id}                  backup-admin. moves a chunk a host reported as undecryptable aside: {moved}
+//	GET    /api/v1/escrow                           readonly. {domains: []} key domains with an escrow blob
+//	DELETE /api/v1/escrow/{domain}                  backup-admin. deletes a damaged escrow blob; a host then stores a new one
 //	GET    /api/v1/retention-policies               readonly. {scope: "default" | group id, policy, timezone}
 //	PUT    /api/v1/retention-policies/{scope}       backup-admin. {policy: api.RetentionPolicy, timezone?}
 //	DELETE /api/v1/retention-policies/{scope}       backup-admin

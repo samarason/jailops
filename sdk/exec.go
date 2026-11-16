@@ -102,7 +102,18 @@ func (s *ExecSession) Wait() (int, error) {
 }
 
 // Close drops the connection; the server ends the command.
-func (s *ExecSession) Close() error { return s.conn.Close() }
+func (s *ExecSession) Close() error {
+	err := s.conn.Close()
+	// The goroutine that reads the connection writes into unbuffered pipes: when nobody reads them it would wait for
+	// ever on its first frame. Closing the reading ends makes that write fail and the goroutine end.
+	if s.outR != nil {
+		_ = s.outR.Close()
+	}
+	if s.errR != nil {
+		_ = s.errR.Close()
+	}
+	return err
+}
 
 // Exec runs argv in a running jail over an upgraded connection. The same
 // authentication, project and role rules as every jail route apply; the

@@ -9,9 +9,9 @@ spec:
   hosts: [web1, web2]
   # A network belongs to one project; this one is web's alone.
   networks:
-    - {network: br-web}
+    - {network: web}
   storage:
     - {storage: fast, quota: 200G}
   quotas: {jails: 20}
-  firewall: base
+  firewall_policies: [base]
   images: [freebsd-15]

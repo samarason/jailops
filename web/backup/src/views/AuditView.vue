@@ -4,7 +4,8 @@ import { s } from '@/i18n'
 import { api } from '@/api/endpoints'
 import { useLoad } from '@jailops/shared/composables/load'
 import { session } from '@jailops/shared/composables/session'
-import { stamp } from '@jailops/shared/lib/format'
+import { actionText } from '@jailops/shared/lib/describe'
+import TimeStamp from '@jailops/shared/components/TimeStamp.vue'
 import LoadState from '@jailops/shared/components/LoadState.vue'
 import RoleNote from '@/components/RoleNote.vue'
 import { allows } from '@/lib/roles'
@@ -23,6 +24,7 @@ async function apply(): Promise<void> {
   extra.value = []
   await l.reload()
 }
+const action_ = (a: string) => s.audit.actions[a] ?? actionText(a, {})
 const detail = (d: unknown) => (d && JSON.stringify(d) !== '{}' ? JSON.stringify(d) : '')
 </script>
 
@@ -35,11 +37,11 @@ const detail = (d: unknown) => (d && JSON.stringify(d) !== '{}' ? JSON.stringify
       <LoadState :loading="l.loading.value" :error="l.error.value" :has-data="!!l.data.value" @retry="l.reload">
         <div class="panel">
           <p v-if="!rows.length" class="empty">{{ s.audit.empty }}</p>
-          <div v-else class="table-wrap"><table>
+          <div v-else class="table-wrap"><table class="rtable">
             <thead><tr><th>{{ s.audit.time }}</th><th>{{ s.audit.who }}</th><th>{{ s.audit.action }}</th><th>{{ s.audit.target }}</th><th class="hide-sm">{{ s.audit.detail }}</th><th class="hide-sm">{{ s.audit.source }}</th></tr></thead>
             <tbody><tr v-for="r in rows" :key="r.id">
-              <td class="mono faint nowrap">{{ stamp(r.at) }}</td><td class="mono">{{ r.actor }}</td><td class="mono">{{ r.action }}</td><td class="mono">{{ r.target || '-' }}</td>
-              <td class="mono faint hide-sm">{{ detail(r.detail) }}</td><td class="mono faint hide-sm">{{ r.remote || '-' }}</td>
+              <td class="faint" :data-label="s.audit.time"><TimeStamp :ts="r.at" seconds /></td><td class="mono" :data-label="s.audit.who">{{ r.actor }}</td><td :data-label="s.audit.action" :title="r.action" :data-action="r.action">{{ action_(r.action) }}</td><td class="mono" :data-label="s.audit.target">{{ r.target || '-' }}</td>
+              <td class="mono faint hide-sm" :data-label="s.audit.detail">{{ detail(r.detail) }}</td><td class="mono faint hide-sm" :data-label="s.audit.source">{{ r.remote || '-' }}</td>
             </tr></tbody></table></div>
         </div>
         <div v-if="rows.length >= 100" style="margin-top: 12px"><button class="btn" type="button" @click="older">{{ s.audit.older }}</button></div>

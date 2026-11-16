@@ -93,7 +93,6 @@ $ jailops jail logs web nope
 
 $ jailops jail logs web ../etc/passwd
 ! invalid: log file "../etc/passwd": at most one directory below /var/log
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops jail logs web messages --tail 0
@@ -113,7 +112,7 @@ $ jailops jail logs web --events messages
 
 $ jailops jail logs ghost
 ! not_found: jail "ghost" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops jail logs web

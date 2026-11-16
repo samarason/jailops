@@ -3,8 +3,9 @@ package lifecycle
 import (
 	"context"
 	"fmt"
-	"strings"
+	"time"
 
+	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -12,6 +13,8 @@ import (
 type SnapshotResult struct {
 	Name     string
 	Datasets []string
+	// Created is when the snapshot was taken (the creation property); zero when the ZFS layer does not say.
+	Created time.Time
 	// Written is what a data rollback to this snapshot would discard, per
 	// dataset and in total (bytes written since the snapshot).
 	Written      map[string]int64
@@ -29,12 +32,8 @@ func (s *Service) SnapshotJail(ctx context.Context, name, snapName, comment stri
 	}
 	if snapName == "" {
 		snapName = "snap-" + s.Cfg.now().Format("20060102T150405Z")
-	}
-	if !snapNameRe.MatchString(snapName) {
-		return res, api.Errorf(api.CodeInvalid, "bad snapshot name %q", snapName)
-	}
-	if strings.HasPrefix(snapName, "jo-") {
-		return res, api.Errorf(api.CodeInvalid, "snapshot names starting with jo- are reserved for JailOps")
+	} else if err := validate.SnapshotName("name", snapName); err != nil {
+		return res, err
 	}
 	if len(comment) > 1024 {
 		return res, api.Errorf(api.CodeInvalid, "comment is too long")
@@ -91,9 +90,15 @@ func (s *Service) ListSnapshots(ctx context.Context, name string) ([]SnapshotRes
 	if err != nil {
 		return nil, err
 	}
+	var times map[string]time.Time
+	if t, ok := s.ZFS.(interface {
+		SnapshotTimes(ctx context.Context, dataset string) (map[string]time.Time, error)
+	}); ok {
+		times, _ = t.SnapshotTimes(ctx, st.Container)
+	}
 	var out []SnapshotResult
 	for _, n := range names {
-		r, err := s.fillWritten(ctx, st, SnapshotResult{Name: n, Datasets: st.all()})
+		r, err := s.fillWritten(ctx, st, SnapshotResult{Name: n, Datasets: st.all(), Created: times[n]})
 		if err != nil {
 			return nil, err
 		}

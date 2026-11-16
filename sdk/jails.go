@@ -57,50 +57,6 @@ func (j *JailClient) Create(ctx context.Context, jail api.Jail) (*Operation[api.
 	return op, err
 }
 
-// CreateWithPassphrase creates a jail whose encrypted volumes get passphrase (extension volume_unlock). The
-// passphrase travels in this request only; the server never stores or returns it.
-func (j *JailClient) CreateWithPassphrase(ctx context.Context, jail api.Jail, passphrase string) (*Operation[api.Jail], error) {
-	if err := j.c.need("volume_unlock"); err != nil {
-		return nil, err
-	}
-	body := api.JailCreate{Metadata: jail.Metadata, Spec: jail.Spec, VolumePassphrase: passphrase}
-	op, _, err := sendOp(ctx, j.c, request{method: http.MethodPost, path: j.r.path, body: body},
-		func(ctx context.Context) (api.Jail, error) { return j.Get(ctx, jail.Metadata.Name) })
-	return op, err
-}
-
-// Unlock loads the keys of a jail's encrypted volumes with their passphrase and, with start set, starts the jail
-// (extension volume_unlock). A wrong passphrase fails the operation with bad_passphrase; after five in a row the
-// jail answers rate_limited for 30 seconds.
-func (j *JailClient) Unlock(ctx context.Context, name, passphrase string, start bool) (*Operation[api.Jail], error) {
-	if err := j.c.need("volume_unlock"); err != nil {
-		return nil, err
-	}
-	op, _, err := sendOp(ctx, j.c, request{method: http.MethodPost, path: j.r.item(name) + "/unlock", body: api.JailUnlock{Passphrase: passphrase, Start: start}},
-		func(ctx context.Context) (api.Jail, error) { return j.Get(ctx, name) })
-	return op, err
-}
-
-// Lock stops a jail and unloads the keys of its encrypted volumes (extension volume_unlock).
-func (j *JailClient) Lock(ctx context.Context, name string) (*Operation[api.Jail], error) {
-	if err := j.c.need("volume_unlock"); err != nil {
-		return nil, err
-	}
-	op, _, err := sendOp(ctx, j.c, request{method: http.MethodPost, path: j.r.item(name) + "/lock"},
-		func(ctx context.Context) (api.Jail, error) { return j.Get(ctx, name) })
-	return op, err
-}
-
-// ChangePassphrase changes the passphrase of every encrypted volume of an unlocked jail (extension volume_unlock).
-func (j *JailClient) ChangePassphrase(ctx context.Context, name, oldPass, newPass string) (*Operation[api.Jail], error) {
-	if err := j.c.need("volume_unlock"); err != nil {
-		return nil, err
-	}
-	op, _, err := sendOp(ctx, j.c, request{method: http.MethodPost, path: j.r.item(name) + "/passphrase", body: api.JailPassphraseChange{Old: oldPass, New: newPass}},
-		func(ctx context.Context) (api.Jail, error) { return j.Get(ctx, name) })
-	return op, err
-}
-
 // Delete deletes a jail.
 func (j *JailClient) Delete(ctx context.Context, name string) (*Operation[None], error) {
 	op, _, err := sendOp[None](ctx, j.c, request{method: http.MethodDelete, path: j.r.item(name)}, nil)
@@ -154,6 +110,39 @@ func (j *JailClient) Log(ctx context.Context, name, file string, q api.JailLogQu
 		r.Lines = []api.JailLogLine{}
 	}
 	return r, err
+}
+
+// Volumes lists the volumes the jail attaches (extension volumes).
+func (j *JailClient) Volumes(ctx context.Context, name string) ([]api.VolumeAttach, error) {
+	if err := j.c.need("volumes"); err != nil {
+		return nil, err
+	}
+	v, _, err := get[[]api.VolumeAttach](ctx, j.c, j.r.item(name)+"/volumes", nil)
+	if v == nil && err == nil {
+		v = []api.VolumeAttach{}
+	}
+	return v, err
+}
+
+// AttachVolume attaches a volume of the jail's project to a stopped jail at a path in it (extension volumes). The
+// volume stays what it is; a jail that is running answers busy. The operation's result is the jail.
+func (j *JailClient) AttachVolume(ctx context.Context, name string, req api.VolumeAttachRequest) (*Operation[api.Jail], error) {
+	if err := j.c.need("volumes"); err != nil {
+		return nil, err
+	}
+	op, _, err := sendOp(ctx, j.c, request{method: http.MethodPost, path: j.r.item(name) + "/volumes", body: req},
+		func(ctx context.Context) (api.Jail, error) { return j.Get(ctx, name) })
+	return op, err
+}
+
+// DetachVolume detaches a volume from a stopped jail (extension volumes). The volume and its files stay.
+func (j *JailClient) DetachVolume(ctx context.Context, name, volume string) (*Operation[api.Jail], error) {
+	if err := j.c.need("volumes"); err != nil {
+		return nil, err
+	}
+	op, _, err := sendOp(ctx, j.c, request{method: http.MethodDelete, path: j.r.item(name) + "/volumes/" + esc(volume)},
+		func(ctx context.Context) (api.Jail, error) { return j.Get(ctx, name) })
+	return op, err
 }
 
 // AppDraft drafts an app definition from a running FreeBSD jail (extension
@@ -303,4 +292,10 @@ func (j *JailClient) Config(ctx context.Context, name string, set map[string]str
 func (j *JailClient) Expanded(ctx context.Context, name string) (api.JailExpanded, error) {
 	out, _, err := get[api.JailExpanded](ctx, j.c, j.r.item(name), url.Values{"expanded": {"true"}})
 	return out, err
+}
+
+// Rename gives a stopped jail a new name (its datasets, records and update history move with it) and rewrites the
+// jails of its project that name it (extension "rename"). See Resource.Rename.
+func (j *JailClient) Rename(ctx context.Context, name string, req api.Rename, etag string) (*Operation[api.RenameResult], error) {
+	return renameAt(ctx, j.c, j.r.item(name), req, etag)
 }

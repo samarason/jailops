@@ -74,9 +74,12 @@ async function act(how: 'confirm' | 'revert'): Promise<void> {
   <div class="pending-wrap" role="status" aria-live="polite">
     <div v-if="p" class="pending-bar warn" data-test="pending-banner" :aria-label="s.pending.label">
       <p class="grow">
-        <strong v-if="left > 0">{{ s.pending.text(p.module, countdown(left)) }}</strong>
+        <!-- the countdown is shown once, inside the sentence; screen readers hear it once a minute, not every second -->
+        <template v-if="left > 0">
+          <strong data-test="pending-countdown" aria-hidden="true">{{ s.pending.text(p.module, countdown(left)) }}</strong>
+          <span class="sr-only">{{ s.pending.textMinutes(p.module, Math.ceil(left / 60)) }}</span>
+        </template>
         <strong v-else>{{ s.pending.expired(p.module) }}</strong>
-        <span class="mono pending-count" data-test="pending-countdown" aria-hidden="true">{{ countdown(left) }}</span>
         <span v-if="error" class="pending-err">{{ error }}</span>
         <span v-if="!admin" class="pending-note">{{ s.pending.adminOnly }}</span>
       </p>
@@ -100,7 +103,6 @@ async function act(how: 'confirm' | 'revert'): Promise<void> {
 .pending-bar.warn { background: var(--warn-bg); color: var(--text); border-color: var(--warn); }
 .pending-bar.ok { background: var(--ok-bg); color: var(--text); border-color: var(--ok); }
 .pending-bar.danger { background: var(--danger-bg); color: var(--text); border-color: var(--danger); }
-.pending-count { margin-left: 8px; font-weight: 600; }
 .pending-note, .pending-err { display: block; font-size: 12px; }
 .pending-actions { flex-wrap: wrap; }
 </style>

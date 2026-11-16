@@ -17,8 +17,6 @@ type Op string
 // map to; the executor lives in internal/sys.
 const (
 	OpRequireSysctl  Op = "sysctl.require"
-	OpBridgeCreate   Op = "bridge.create"
-	OpBridgeDestroy  Op = "bridge.destroy"
 	OpSetDescription Op = "iface.description"
 	OpSetMTU         Op = "iface.mtu"
 	OpSetMAC         Op = "iface.mac"
@@ -28,17 +26,10 @@ const (
 	OpIfaceDown      Op = "iface.down"
 	OpEpairCreate    Op = "epair.create"
 	OpEpairDestroy   Op = "epair.destroy"
-	OpAddMember      Op = "bridge.member.add"
-	OpRemoveMember   Op = "bridge.member.remove"
-	OpSetPrivate     Op = "bridge.member.private"
-	OpClearPrivate   Op = "bridge.member.unprivate"
 	OpAddHostRoute   Op = "route.host.add"
 	OpDelHostRoute   Op = "route.host.delete"
-	OpSetStaticARP   Op = "iface.staticarp"
-	OpAddBridgeStat  Op = "bridge.static.add"
-	OpDelBridgeStat  Op = "bridge.static.delete"
-	OpSetNeighbor    Op = "neighbor.set"
-	OpDelNeighbor    Op = "neighbor.delete"
+	OpAddRejectRoute Op = "route.reject.add"
+	OpDelRejectRoute Op = "route.reject.delete"
 	OpNDPProxyAdd    Op = "ndproxy.add"
 	OpNDPProxyDel    Op = "ndproxy.delete"
 	OpLoadAnchor     Op = "pf.anchor.load"
@@ -63,13 +54,12 @@ const (
 type Step struct {
 	Op    Op
 	Phase Phase
-	// Iface is the interface the step acts on (bridge, epair end, uplink).
+	// Iface is the interface the step acts on (an epair end, the uplink).
 	Iface string
 	// Arg is the main argument: an address with prefix, a description, a
 	// MAC, a member name, an anchor name or a "sysctl=value" pair.
 	Arg string
-	// Arg2 is a second argument: the jail-side name of an epair, or the
-	// bridge of a host route.
+	// Arg2 is a second argument: the jail-side name of an epair.
 	Arg2 string
 	// Inverse undoes the step. It is nil when the step is undone implicitly
 	// by the inverse of an earlier step (for example, destroying an epair
@@ -107,10 +97,6 @@ func (s Step) Describe() string {
 	switch s.Op {
 	case OpRequireSysctl:
 		return pre + "require sysctl " + s.Arg
-	case OpBridgeCreate:
-		return pre + "ifconfig bridge create name " + s.Iface
-	case OpBridgeDestroy:
-		return pre + "ifconfig " + s.Iface + " destroy"
 	case OpSetDescription:
 		if s.Arg == "" {
 			return pre + "ifconfig " + s.Iface + " -description"
@@ -132,28 +118,14 @@ func (s Step) Describe() string {
 		return pre + "ifconfig epair create; rename ends to " + s.Iface + " and " + s.Arg
 	case OpEpairDestroy:
 		return pre + "ifconfig " + s.Iface + " destroy"
-	case OpAddMember:
-		return pre + "ifconfig " + s.Iface + " addm " + s.Arg
-	case OpRemoveMember:
-		return pre + "ifconfig " + s.Iface + " deletem " + s.Arg
-	case OpSetPrivate:
-		return pre + "ifconfig " + s.Iface + " private " + s.Arg
-	case OpClearPrivate:
-		return pre + "ifconfig " + s.Iface + " -private " + s.Arg
 	case OpAddHostRoute:
 		return pre + "route add " + afFlag(s.Arg) + " " + s.Arg + " -interface " + s.Iface
 	case OpDelHostRoute:
 		return pre + "route delete " + afFlag(s.Arg) + " " + s.Arg
-	case OpSetStaticARP:
-		return pre + "ifconfig " + s.Iface + " staticarp"
-	case OpAddBridgeStat:
-		return pre + "ifconfig " + s.Iface + " static " + s.Arg2 + " " + s.Arg
-	case OpDelBridgeStat:
-		return pre + "ifconfig " + s.Iface + " deladdr " + s.Arg
-	case OpSetNeighbor:
-		return pre + "ndp -s " + s.Arg + " " + s.Arg2 + "   (on " + s.Iface + ")"
-	case OpDelNeighbor:
-		return pre + "ndp -d " + s.Arg + "   (on " + s.Iface + ")"
+	case OpAddRejectRoute:
+		return pre + "route add " + afFlag(s.Arg) + " " + s.Arg + " " + loopbackOf(s.Arg) + " -reject"
+	case OpDelRejectRoute:
+		return pre + "route delete " + afFlag(s.Arg) + " " + s.Arg + " " + loopbackOf(s.Arg) + " -reject"
 	case OpNDPProxyAdd:
 		return pre + "ndproxy answer " + s.Arg + " on " + s.Iface
 	case OpNDPProxyDel:
@@ -181,6 +153,13 @@ func ifFamily(arg string) string {
 	return "inet"
 }
 
+func loopbackOf(arg string) string {
+	if strings.Contains(arg, ":") {
+		return "::1"
+	}
+	return "127.0.0.1"
+}
+
 func afFlag(arg string) string {
 	if strings.Contains(arg, ":") {
 		return "-inet6"
@@ -199,19 +178,17 @@ func DescribePlan(steps []Step) string {
 
 // NetworkInput is the input of NetworkPlan.
 type NetworkInput struct {
-	// ID is the network's UUID; interfaces that carry the marker of earlier releases (LegacyIfaceDesc) are
-	// recognised by it.
+	// ID is the network's UUID.
 	ID   string
 	Name string
-	// Bridge is the bridge name; spec.Bridge is used when empty.
-	Bridge string
-	Spec   api.NetworkSpec
+	Spec api.NetworkSpec
 }
 
-// NetworkPlan returns the ordered steps that create a network's bridge and
-// host-side configuration. It does not look at the system; reconcile diffs
-// against what it observes and must never touch a bridge it does not own
-// (OwnsIface).
+// NetworkPlan returns the ordered steps of a network: what the host needs before any jail attaches to it. A network
+// has no interface of its own (every jail's attachment is a routed link, see AttachPlan): the plan asserts that the
+// host forwards, rejects the addresses of the network's subnet that no jail has (so that a packet for an unallocated
+// address is answered with an error and never sent out of the uplink to come back), and loads the network's anchor
+// (the translation rule). It does not look at the system.
 func NetworkPlan(in NetworkInput) ([]Step, error) {
 	if err := validate.Name("network", in.Name); err != nil {
 		return nil, err
@@ -222,13 +199,6 @@ func NetworkPlan(in NetworkInput) ([]Step, error) {
 	if err := validateID(in.ID); err != nil {
 		return nil, err
 	}
-	br := in.Bridge
-	if br == "" {
-		br = in.Spec.Bridge
-	}
-	if err := validate.IfName("bridge", br); err != nil {
-		return nil, err
-	}
 	s := in.Spec
 	var out []Step
 	req := func(kv, note string) {
@@ -236,65 +206,25 @@ func NetworkPlan(in NetworkInput) ([]Step, error) {
 		st.Note = note
 		out = append(out, st)
 	}
-	// The bridge pfil sysctls are asserted by the host pass of the reconcile
-	// loop (reconcile.HostDesired), which also loads if_bridge first.
 	v6 := s.IPv6 != nil && s.IPv6.Mode != api.IPv6None
-	if (s.IPv4 != nil && s.IPv4.NAT) || v6 || s.Uplink != "" {
-		if s.IPv4 != nil {
-			req("net.inet.ip.forwarding=1", "jails reach the uplink through the host")
-		}
-		if v6 {
-			req("net.inet6.ip6.forwarding=1", "jails reach the uplink through the host")
-		}
-	}
-	// The bridge carries only layer 2. The host's gateway addresses live on the l3 end of a gateway epair whose
-	// member end is a port of the bridge (see ipam.GatewayNames for why).
-	gm, gl3, err := ipam.GatewayNames(br)
-	if err != nil {
-		return nil, err
-	}
-	gwep := step(OpEpairCreate, gm, gl3)
-	gwep.Arg2 = gl3
-	out = append(out,
-		with(step(OpBridgeCreate, br, ""), step(OpBridgeDestroy, br, "")),
-		with(step(OpSetDescription, br, NetBridgeDesc(in.Name)), step(OpSetDescription, br, "")),
-		with(gwep, step(OpEpairDestroy, gm, "")),
-		with(step(OpSetDescription, gm, NetGatewayDesc(in.Name, false)), step(OpSetDescription, gm, "")),
-		with(step(OpSetDescription, gl3, NetGatewayDesc(in.Name, true)), step(OpSetDescription, gl3, "")),
-	)
-	if s.MTU != 0 {
-		for _, i := range []string{br, gm, gl3} {
-			out = append(out, with(step(OpSetMTU, i, fmt.Sprint(s.MTU)), step(OpSetMTU, i, "1500")))
-		}
-	}
-	// the member end is never private: the jails must be able to reach the gateway through it
-	out = append(out, with(step(OpAddMember, br, gm), step(OpRemoveMember, br, gm)))
-	addr := func(a string) {
-		out = append(out, with(step(OpAddAddr, gl3, a), step(OpRemoveAddr, gl3, a)))
-	}
 	if s.IPv4 != nil {
-		p, _ := netip.ParsePrefix(s.IPv4.Subnet)
-		gw, _ := netip.ParseAddr(s.IPv4.Gateway)
-		addr(netip.PrefixFrom(gw, p.Bits()).String())
+		req("net.inet.ip.forwarding=1", "jails reach the uplink and each other through the host")
 	}
 	if v6 {
-		p, _ := netip.ParsePrefix(s.IPv6.Subnet)
-		gw, _ := netip.ParseAddr(s.IPv6.Gateway)
-		bits := p.Bits()
-		if gw.IsLinkLocalUnicast() {
-			bits = 64
-		}
-		addr(netip.PrefixFrom(gw, bits).String())
-		if !gw.IsLinkLocalUnicast() {
-			// the jails' default gateway (they hold /128 addresses and have no on-link prefix)
-			addr(netip.PrefixFrom(ipam.GatewayLinkLocal6, 64).String())
-		}
+		req("net.inet6.ip6.forwarding=1", "jails reach the uplink and each other through the host")
 	}
-	out = append(out,
-		with(step(OpIfaceUp, br, ""), step(OpIfaceDown, br, "")),
-		with(step(OpIfaceUp, gm, ""), step(OpIfaceDown, gm, "")),
-		with(step(OpIfaceUp, gl3, ""), step(OpIfaceDown, gl3, "")),
-	)
+	reject := func(prefix string) {
+		p, _ := netip.ParsePrefix(prefix)
+		a := p.Masked().String()
+		out = append(out, with(step(OpAddRejectRoute, "", a), step(OpDelRejectRoute, "", a)))
+	}
+	if s.IPv4 != nil {
+		reject(s.IPv4.Subnet)
+	}
+	if v6 && s.IPv6.Mode == api.IPv6Routed {
+		// in proxy mode the subnet is on-link on the uplink: an address nobody has is simply not answered there
+		reject(s.IPv6.Subnet)
+	}
 	a := NetAnchor(in.Name)
 	out = append(out, with(step(OpLoadAnchor, "", a), step(OpFlushAnchor, "", a)))
 	return out, nil
@@ -320,11 +250,9 @@ type AttachInput struct {
 	// Project, Jail and Network name the attachment in the interface descriptions.
 	Project, Jail, Network string
 	Index                  int // attachment index within the jail
-	Bridge                 string
 	// MAC of the jail end; derived from JailUUID when empty.
-	MAC     string
-	MTU     int
-	Private bool
+	MAC string
+	MTU int
 	// IPv4 and IPv6 are the jail's address with the prefix length it
 	// configures (ipam.GuestPrefixLen6 for IPv6); zero means none.
 	IPv4, IPv6 netip.Prefix
@@ -339,14 +267,12 @@ type AttachInput struct {
 	HostConfigured bool
 }
 
-// AttachPlan returns the steps that connect one jail interface to a bridge.
-// Host-phase steps run before the jail starts (the jail-side end is moved
-// into the vnet by jail.conf's vnet.interface); jail-phase steps run after.
+// AttachPlan returns the steps that give one jail interface its routed link: an epair whose host end carries the
+// gateway addresses of the network (the same /32 and fe80::1 on every jail's host end, each on its own link) and a host
+// route to each of the jail's addresses through that end. Host-phase steps run before the jail starts (the jail-side
+// end is moved into the vnet by jail.conf's vnet.interface); jail-phase steps run after.
 func AttachPlan(in AttachInput) ([]Step, error) {
 	if err := validateID(in.JailID); err != nil {
-		return nil, err
-	}
-	if err := validate.IfName("bridge", in.Bridge); err != nil {
 		return nil, err
 	}
 	host, jail, err := ipam.EpairNames(in.JailID, in.Index)
@@ -379,9 +305,6 @@ func AttachPlan(in AttachInput) ([]Step, error) {
 		if err := validate.IfName("uplink", in.Uplink); err != nil {
 			return nil, err
 		}
-		if in.Uplink == in.Bridge {
-			return nil, validate.Invalid("uplink", "uplink must not be the bridge")
-		}
 	}
 
 	var out []Step
@@ -393,49 +316,29 @@ func AttachPlan(in AttachInput) ([]Step, error) {
 	if in.MTU != 0 {
 		out = append(out, step(OpSetMTU, host, fmt.Sprint(in.MTU)), step(OpSetMTU, jail, fmt.Sprint(in.MTU)))
 	}
-	out = append(out, with(step(OpAddMember, in.Bridge, host), step(OpRemoveMember, in.Bridge, host)))
-	// The jail's MAC address is fixed on its port: a jail that sets another jail's MAC address on its own interface
-	// cannot take that jail's frames (a learned entry would move, a static one does not).
-	stat := step(OpAddBridgeStat, in.Bridge, jmac)
-	stat.Arg2 = host
-	out = append(out, with(stat, step(OpDelBridgeStat, in.Bridge, jmac)))
-	// Every jail port is private: frames never pass from a jail to another jail. A jail holds /32 and /128 addresses
-	// and reaches everything, the other jails included, through the host (in.Private is no longer consulted).
-	out = append(out, with(step(OpSetPrivate, in.Bridge, host), step(OpClearPrivate, in.Bridge, host)))
-	out = append(out, with(step(OpIfaceUp, host, ""), step(OpIfaceDown, host, "")))
-	if proxy {
-		a := netip.PrefixFrom(in.IPv6.Addr(), 128).String()
-		gw := ipam.GatewayIface(in.Bridge)
-		r := step(OpAddHostRoute, gw, a)
-		out = append(out,
-			with(r, step(OpDelHostRoute, gw, a)),
-			with(step(OpNDPProxyAdd, in.Uplink, in.IPv6.Addr().String()), step(OpNDPProxyDel, in.Uplink, in.IPv6.Addr().String())))
+	// The host's addresses on the jail's link: the network's gateway as a /32 (the jail reaches it by a host route
+	// to it on its own link) and the link-local gateway fe80::1. The same addresses are on every jail's host end;
+	// each end is a link of its own, so no two jails ever share a segment.
+	if in.IPv4.IsValid() && in.Gateway4.IsValid() {
+		a := netip.PrefixFrom(in.Gateway4, 32).String()
+		out = append(out, with(step(OpAddAddr, host, a), step(OpRemoveAddr, host, a)))
 	}
-	if in.IPv4.IsValid() || in.IPv6.IsValid() {
-		// (After the host route of a proxied address, which the entry needs to find the interface.) The host never
-		// asks a jail for its address: a permanent entry on the gateway interface says where the jail's addresses
-		// are (ARP for IPv4; neighbor discovery for the global and link-local IPv6 addresses), so that nothing a jail
-		// sends can change where the host sends the traffic of another jail.
-		gw := ipam.GatewayIface(in.Bridge)
-		// The host asks nobody on this interface who has an address: only the entries below count, so an address
-		// a jail gives itself is never resolved (the entry is shared by the jails of the network and stays).
-		out = append(out, step(OpSetStaticARP, gw, ""))
-		var addrs []netip.Addr
-		if in.IPv4.IsValid() {
-			addrs = append(addrs, in.IPv4.Addr())
+	if in.IPv6.IsValid() {
+		a := netip.PrefixFrom(ipam.GatewayLinkLocal6, 64).String()
+		out = append(out, with(step(OpAddAddr, host, a), step(OpRemoveAddr, host, a)))
+	}
+	out = append(out, with(step(OpIfaceUp, host, ""), step(OpIfaceDown, host, "")))
+	// The route to each of the jail's addresses leaves through its own link. (A jail never shares a link with
+	// another, so nothing a jail sends can change where the host sends the traffic of another jail.)
+	for _, p := range []netip.Prefix{in.IPv4, in.IPv6} {
+		if !p.IsValid() {
+			continue
 		}
-		if in.IPv6.IsValid() {
-			ll, err := ipam.LinkLocalFromMAC(jmac)
-			if err != nil {
-				return nil, err
-			}
-			addrs = append(addrs, in.IPv6.Addr(), ll)
-		}
-		for _, a := range addrs {
-			set, del := step(OpSetNeighbor, gw, a.String()), step(OpDelNeighbor, gw, a.String())
-			set.Arg2 = jmac
-			out = append(out, with(set, del))
-		}
+		a := netip.PrefixFrom(p.Addr(), p.Addr().BitLen()).String()
+		out = append(out, with(step(OpAddHostRoute, host, a), step(OpDelHostRoute, host, a)))
+	}
+	if proxy {
+		out = append(out, with(step(OpNDPProxyAdd, in.Uplink, in.IPv6.Addr().String()), step(OpNDPProxyDel, in.Uplink, in.IPv6.Addr().String())))
 	}
 	j := func(op Op, iface, arg string) Step { s := step(op, iface, arg); s.Phase = PhaseJail; return s }
 	// The jail end is described from the host once it is in the jail's vnet (ifconfig -j). Destroying the epair

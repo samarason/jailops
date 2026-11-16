@@ -1,31 +1,30 @@
 $ jailops project create web
 project/web created
 
-$ jailops trust add --name laptop --role operator --projects web --ttl 15m
+$ jailops cert enroll laptop --role operator --projects web --expires 15m
 <trust-token>
 ! warning: this trust token is shown only once and works only once; hand it to the new client now.
 ! trust for laptop (operator, web) can be claimed until 2026-03-01 09:15:00 UTC
 
-$ jailops trust add --name laptop --role operator --projects web
+$ jailops cert enroll laptop --role operator --projects web
 <trust-token>
 ! warning: this trust token is shown only once and works only once; hand it to the new client now.
 ! trust for laptop (operator, web) can be claimed until 2026-03-01 10:00:00 UTC
 
-$ jailops trust add --role operator --global
-! usage: --name is required
-! hint: run 'jailops trust add --help' for usage
+$ jailops cert enroll --role operator --global
+! usage: accepts 1 arg(s), received 0
+! hint: run 'jailops cert enroll --help' for usage
 [exit 2]
 
-$ jailops trust add --name ghost --role operator --projects nope
+$ jailops cert enroll ghost --role operator --projects nope
 ! invalid: project "nope" does not exist
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
-$ jailops trust list
-NAME     KIND     PERMISSION   SCOPE   EXPIRES   FINGERPRINT
-laptop   client   operator     web     never     <fingerprint>
+$ jailops cert list
+NAME     KIND     ROLE       SCOPE   EXPIRES   FINGERPRINT
+laptop   client   operator   web     never     <fingerprint>
 
-$ jailops trust show laptop
+$ jailops cert show laptop
 metadata:
   name: laptop
   uuid: <uuid>
@@ -40,7 +39,7 @@ spec:
   projects:
     - web
 
-$ jailops trust edit laptop -f <dir>/e.yaml
+$ jailops cert edit laptop -f <dir>/e.yaml
 certificate/laptop updated
 
 $ jailops whoami
@@ -51,21 +50,21 @@ Scope:       global
 Remote:      adm (https://<addr>)
 Project:     
 
-$ jailops trust revoke laptop
-! Revoke trust of "laptop"? [y/N]: 
-! usage: confirmation required
-! hint: answer on standard input, or pass -y
+$ jailops cert revoke laptop
+! Revoke certificate "laptop"? [y/N]: 
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: answer y on standard input, or pass -y to confirm without a question
 [exit 2]
 
-$ jailops trust revoke -y laptop
+$ jailops cert revoke -y laptop
 certificate/laptop revoked
 
-$ jailops trust list
-! No resources found.
+$ jailops cert list
+! No certificates. Create one with: jailops cert create NAME
 
-$ jailops trust revoke -y laptop
+$ jailops cert revoke -y laptop
 ! not_found: certificate "laptop" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops cert list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops sessions list
@@ -73,6 +72,6 @@ $ jailops sessions list
 
 $ jailops sessions revoke -y nosuch
 ! not_found: session "nosuch" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops sessions list'; check --project, --host and --remote too
 [exit 4]
 

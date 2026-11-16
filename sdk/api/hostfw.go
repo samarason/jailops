@@ -185,9 +185,9 @@ type HostFirewallApply struct {
 	DryRun bool `json:"dry_run,omitempty"`
 	// ConfirmWithin is the confirmation window in seconds (default 120, 10 to 1800).
 	ConfirmWithin int `json:"confirm_within,omitempty"`
-	// IKnow accepts a change whose lock-out check cannot run because the caller's address is unknown (the unix
+	// ConfirmLockout accepts a change whose lock-out check cannot run because the caller's address is unknown (the unix
 	// socket, a hub). The confirmation window still applies.
-	IKnow bool `json:"i_know,omitempty"`
+	ConfirmLockout bool `json:"confirm_lockout,omitempty"`
 }
 
 // HostPendingChange is a change that reverts itself at Deadline unless it is confirmed.
@@ -225,8 +225,10 @@ type HostPendingAction struct {
 	ID string `json:"id,omitempty"`
 }
 
+// MaxHostFWSetName is the longest name of an address set of the host firewall: its pf table is "jo_hf_" and the name.
+const MaxHostFWSetName = 24
+
 var (
-	reHostFWSet     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,23}$`)
 	reHostPendingID = regexp.MustCompile(`^[0-9a-f]{16}$`)
 )
 
@@ -258,7 +260,7 @@ type hostSource struct {
 // parseHostSource accepts an address, a prefix or @set. Zones, mapped addresses and host bits are refused.
 func parseHostSource(s string) (hostSource, error) {
 	if name, ok := strings.CutPrefix(s, "@"); ok {
-		if !reHostFWSet.MatchString(name) {
+		if !IsName(name, MaxHostFWSetName) {
 			return hostSource{}, Errorf(CodeInvalid, "%q is not a set name", s)
 		}
 		return hostSource{set: name}, nil
@@ -375,8 +377,8 @@ func (s HostFirewallSpec) Validate() error {
 	}
 	var names []string
 	for _, set := range s.Sets {
-		if !reHostFWSet.MatchString(set.Name) {
-			return Errorf(CodeInvalid, "set name %q is not valid", set.Name).WithHint("a lower-case letter, then letters, digits or underscores, at most 24 characters")
+		if !IsName(set.Name, MaxHostFWSetName) {
+			return Errorf(CodeInvalid, "set name %q is not valid", set.Name).WithHint("lower case letters, digits and hyphens, starting with a letter, at most 24 characters")
 		}
 		if slices.Contains(names, set.Name) {
 			return Errorf(CodeInvalid, "set %s is defined twice", set.Name)

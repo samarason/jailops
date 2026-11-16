@@ -1,0 +1,9 @@
+apiVersion: jailops/v1
+kind: Volume
+hosts: [nas1]
+metadata:
+  name: movies
+spec:
+  path: /mnt/archive/movies   # a directory of the host, below an admin-host-mount directory of its priv.conf
+  watch: true
+  comment: the movie archive

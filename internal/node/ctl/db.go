@@ -18,6 +18,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -29,7 +30,19 @@ var migrationFiles embed.FS
 
 // DB is the control plane connection pool.
 type DB struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	clock func() time.Time // the time of the leases of sessions; nil is the wall clock
+}
+
+// SetClock makes the leases of sessions run on f (the clock of the node: a test moves it by hand). It is called once,
+// before the DB is used.
+func (d *DB) SetClock(f func() time.Time) { d.clock = f }
+
+func (d *DB) now() time.Time {
+	if d.clock != nil {
+		return d.clock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // Open connects and pings. dsn is a PostgreSQL connection URL or key/value string.

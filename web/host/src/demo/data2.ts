@@ -9,9 +9,9 @@ const meta = (name: string, age = 86400 * 30) => ({ name, scope: 'host' as const
 
 export function stagingJails(): Jail[] {
   const mk = (name: string, power: Jail['status']['power']): Jail => ({
-    metadata: { ...meta(name, 86400 * 5), project: 'staging', labels: { env: 'staging' } },
-    spec: { image: 'freebsd-15@stable', storage: 'fast', network: [{ network: 'stg', ipv4: 'auto' }], firewall: { policy: '' }, boot: {}, resources: { cpu: 1, memory: '1G' } },
-    status: { power, generation: 'freebsd-15#g4', addresses: power === 'running' ? ['10.60.0.12/28'] : [], conditions: [{ type: 'Reconciled', status: 'True' }] },
+    metadata: { ...meta(name, 86400 * 5), project: 'staging', labels: { env: 'staging', team: name === 'stg-db' ? 'data' : 'web' } },
+    spec: { image: 'freebsd-15-1', storage: 'fast', network: [{ network: 'stg', ipv4: 'auto' }], firewall: {}, boot: {}, resources: { cpu: 1, memory: '1G' } },
+    status: { power, generation: 'freebsd-15-1#g4', addresses: power === 'running' ? ['10.60.0.12/28'] : [], conditions: [{ type: 'Reconciled', status: 'True' }] },
   })
   return [mk('stg-web', 'running'), mk('stg-db', 'stopped')]
 }
@@ -23,14 +23,14 @@ export function projects(counts: Record<string, number>): Project[] {
     status: { jails: counts[name] ?? 0, cpu: 0, memory_used: 0, disk_used: 0, addresses: 0, conditions: [], ...status },
   })
   return [
-    p('web', { description: 'The web workloads', networks: [{ network: 'lan' }, { network: 'edge' }, { network: 'backend' }], storage: [{ storage: 'default' }], quotas: {} }, { cpu: 8, memory_used: 9 * GiB, disk_used: 120 * GiB, addresses: 7 }),
+    p('web', { comment: 'The web workloads', networks: [{ network: 'lan' }, { network: 'edge' }, { network: 'backend' }], storage: [{ storage: 'default' }], quotas: {} }, { cpu: 8, memory_used: 9 * GiB, disk_used: 120 * GiB, addresses: 7 }),
     p('shop', {
-      description: 'Web shop on two hosts', hosts: ['bsd01', 'bsd02'],
+      comment: 'Web shop on two hosts', hosts: ['bsd01', 'bsd02'],
       networks: [{ network: 'shop' }],
       storage: [{ storage: 'fast', quota: '500G' }, { storage: 'default', quota: '100G' }],
-      quotas: { jails: 10, cpu: 16, memory: '32G', addresses: 20 }, firewall: 'web-default', images: ['freebsd-15'],
+      quotas: { jails: 10, cpu: 16, memory: '32G', addresses: 20 }, firewall_policies: ['web-default'], images: ['freebsd-15-1'],
     }, { cpu: 14, memory_used: 27 * GiB, disk_used: 210 * GiB, addresses: 8, conditions: [{ type: 'Host:bsd02', status: 'False', reason: 'MissingStorage', message: 'bsd02 has no storage fast' }] }, true),
-    p('staging', { description: 'Disposable tests', networks: [{ network: 'stg' }], storage: [{ storage: 'fast', quota: '50G' }], quotas: { jails: 3, memory: '4G' } }, { cpu: 2, memory_used: 1 * GiB, disk_used: 8 * GiB, addresses: 1 }),
+    p('staging', { comment: 'Disposable tests', networks: [{ network: 'stg' }], storage: [{ storage: 'fast', quota: '50G' }], quotas: { jails: 3, memory: '4G' } }, { cpu: 2, memory_used: 1 * GiB, disk_used: 8 * GiB, addresses: 1 }),
   ]
 }
 
@@ -49,7 +49,7 @@ export function aggregate(p: Project) {
 
 export function storages(): Storage[] {
   return [
-    { metadata: meta('default'), spec: { dataset: 'tank/jailops', description: 'First storage', compression: 'lz4' }, status: { pool: 'tank', health: 'ONLINE', size: 1800 * GiB, used: 1290 * GiB, available: 510 * GiB, fragmentation: 18 } },
+    { metadata: meta('default'), spec: { dataset: 'tank/jailops', comment: 'First storage', compression: 'lz4' }, status: { pool: 'tank', health: 'ONLINE', size: 1800 * GiB, used: 1290 * GiB, available: 510 * GiB, fragmentation: 18 } },
     { metadata: meta('fast'), spec: { dataset: 'nvme/jailops', compression: 'zstd', encrypted: true }, status: { pool: 'nvme', health: 'DEGRADED', size: 900 * GiB, used: 300 * GiB, available: 600 * GiB, fragmentation: 4, conditions: [{ type: 'Healthy', status: 'False', reason: 'Degraded' }] } },
   ]
 }
@@ -74,7 +74,7 @@ export function certificates(): Certificate[] {
 }
 
 export function profiles(): { project: Profile[]; host: Profile[] } {
-  const p = (name: string, project: string, description: string, config: Record<string, string>): Profile => ({ metadata: { ...meta(name), project }, spec: { description, config } })
+  const p = (name: string, project: string, comment: string, config: Record<string, string>): Profile => ({ metadata: { ...meta(name), project }, spec: { comment, config } })
   return {
     project: [
       p('web-limits', 'web', 'Sensible limits for web jails', { 'limits.memory': '2G', 'limits.cpu': '2', 'boot.autostart': 'true', 'nic.eth0.mtu': '1400' }),
@@ -88,7 +88,7 @@ export function updateReports(jails: Jail[]): UpdateReport[] {
   return jails.map((j): UpdateReport => {
     const name = j.metadata.name
     const base = { jail: name, project: j.metadata.project ?? 'web', mode: j.spec.update?.mode ?? 'manual', checked_at: ago(3600), available: false }
-    if (name === 'web') return { ...base, available: true, packages: [{ name: 'nginx', from: '1.26.1', to: '1.26.3' }, { name: 'openssl', from: '3.0.15', to: '3.0.16' }], os: { from: 'freebsd-15#g4', to: 'freebsd-15#g5' } }
+    if (name === 'web') return { ...base, available: true, packages: [{ name: 'nginx', from: '1.26.1', to: '1.26.3' }, { name: 'openssl', from: '3.0.15', to: '3.0.16' }], os: { from: 'freebsd-15-1#g4', to: 'freebsd-15-1#g5' } }
     if (name === 'cache' || name === 'stg-web') return { ...base, available: true, packages: [{ name: 'redis', from: '7.2.4', to: '7.2.5' }] }
     if (name === 'build') return { ...base, error: 'the jail is stopped: its packages cannot be listed' }
     return base
@@ -99,7 +99,7 @@ export function updateHistory(name: string): UpdateRecord[] {
   if (name !== 'web') return []
   return [
     { id: 'u2', jail: name, project: 'web', kind: 'packages', result: 'ok', started: ago(86400 * 2), finished: ago(86400 * 2 - 40), snapshot: 'pre-update-20261020', packages: [{ name: 'curl', from: '8.9.0', to: '8.9.1' }], scheduled: true },
-    { id: 'u1', jail: name, project: 'web', kind: 'os', result: 'rolled_back', started: ago(86400 * 9), finished: ago(86400 * 9 - 120), snapshot: 'pre-update-20261013', from: 'freebsd-15#g3', to: 'freebsd-15#g4', root_rolled_back: true, error: 'health check /usr/local/bin/check exited 1' },
+    { id: 'u1', jail: name, project: 'web', kind: 'os', result: 'rolled_back', started: ago(86400 * 9), finished: ago(86400 * 9 - 120), snapshot: 'pre-update-20261013', from: 'freebsd-15-1#g3', to: 'freebsd-15-1#g4', root_rolled_back: true, error: 'health check /usr/local/bin/check exited 1' },
   ]
 }
 

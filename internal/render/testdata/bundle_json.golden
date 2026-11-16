@@ -1,5 +1,5 @@
 {
-  "image_generation": "freebsd-15.0#g3",
+  "image_generation": "freebsd-15-0#g3",
   "image_manifest": "sha256:abc",
   "networks": [
     {
@@ -16,7 +16,7 @@
       "B": "2"
     },
     "firewall": {},
-    "image": "freebsd-15.0@stable",
+    "image": "freebsd-15-0@stable",
     "network": [
       {
         "ipv4": "10.20.0.10",

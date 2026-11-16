@@ -3,6 +3,23 @@
 // screen, no mouse: a full-screen program shows as plain text and a line-mode shell works as expected.
 
 export interface Cell { ch: string; fg: number; bg: number; bold: boolean; ul: boolean; rev: boolean }
+
+const BASE16 = ['#000', '#c91b00', '#00c200', '#c7c400', '#2225c4', '#c930c7', '#00c5c7', '#c7c7c7', '#686868', '#ff6e67', '#5ffa68', '#fffc67', '#6871ff', '#ff77ff', '#60fdff', '#fff']
+const hex2 = (n: number) => n.toString(16).padStart(2, '0')
+
+/** The colour of an SGR colour number (30-37/90-97 as 0-15, or 38;5;N): the 16 base colours, the 6x6x6 cube
+ *  (16-231) and the grey ramp (232-255) of xterm. The default prompt of a jail is 38;5;39, a light blue. */
+export function xtermColor(n: number): string | undefined {
+  if (!Number.isInteger(n) || n < 0 || n > 255) return undefined
+  if (n < 16) return BASE16[n]
+  if (n < 232) {
+    const v = [0, 95, 135, 175, 215, 255]
+    const i = n - 16
+    return '#' + hex2(v[Math.floor(i / 36)]) + hex2(v[Math.floor(i / 6) % 6]) + hex2(v[i % 6])
+  }
+  const g = 8 + (n - 232) * 10
+  return '#' + hex2(g) + hex2(g) + hex2(g)
+}
 const blank = (): Cell => ({ ch: ' ', fg: -1, bg: -1, bold: false, ul: false, rev: false })
 
 export class Screen {

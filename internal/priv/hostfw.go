@@ -27,9 +27,9 @@ import (
 // copy of what it replaces, writes the pending record (hostpending.go) and only then writes and loads the file. Every
 // change reverts itself unless it is confirmed.
 //
-// UNVERIFIED: pfctl has run against fakes only; scripts/ci-freebsd-e2e.sh has a block for a real host
-// (JAILOPS_E2E_HOSTFW=1). Not verified either: a host whose pf was disabled before the first apply, and sources of
-// the other address family than the one the test connects with.
+// The block of scripts/ci-freebsd-e2e.sh with JAILOPS_E2E_HOSTFW=1 runs the module against a real pf (it rewrites the
+// machine's pf.conf, so CI does not set it). Not covered by it: a host whose pf was disabled before the first apply, and
+// sources of the other address family than the one the test connects with.
 
 // pfctlBin is the one program the firewall module runs, with the forms checkHostPfctl accepts.
 const pfctlBin = "/sbin/pfctl"
@@ -118,12 +118,12 @@ func pfPorts(ports []string) string {
 }
 
 // hostFWTable is the pf table of a set (at most 30 characters: pf allows 31).
-func hostFWTable(set string) string { return "jo_hf_" + set }
+func hostFWTable(set string) string { return "jo_hf_" + strings.ReplaceAll(set, "-", "_") }
 
 // renderHostPF renders the whole of /etc/pf.conf from a canonical spec, in the order pf requires: tables, options,
-// normalisation, translation, filtering. The three anchor lines the jails need are always there; the filter anchor
-// comes first among the filter rules, because the jails' anchors are final (quick) for their own interfaces and a
-// broad pass before them would decide for them.
+// normalisation, then the rules. The anchor line the jails need is always there; it comes first among the rules,
+// because the jails' anchors hold the NAT and the port forwards of their networks and are final (quick) for their own
+// interfaces, and a broad pass before them would decide for them.
 func renderHostPF(s api.HostFirewallSpec) string {
 	var b strings.Builder
 	w := func(format string, a ...any) { fmt.Fprintf(&b, format+"\n", a...) }
@@ -142,19 +142,15 @@ func renderHostPF(s api.HostFirewallSpec) string {
 	w("set state-policy if-bound")
 	w("scrub in all fragment reassemble")
 	w("")
-	w("# translation: the NAT and the port forwards of the jails' networks")
-	w(`nat-anchor "jailops/*"`)
-	w(`rdr-anchor "jailops/*"`)
+	w("# the jails' anchors first: their filter rules and the NAT and port forwards of their networks")
+	w(`anchor "jailops/*"`)
 	if a := s.ACME; a != nil {
 		// after the jails' anchors: a port forward of a jail on the same port wins over the challenge
 		from := api.ACMEChallengePort(a.Challenge)
 		w("# ACME %s challenges of the console's certificate: port %d to the daemon's unprivileged port %d", a.Challenge, from, a.Port)
-		w("rdr inet proto tcp from any to (self) port %d -> 127.0.0.1 port %d", from, a.Port)
-		w("rdr inet6 proto tcp from any to (self) port %d -> ::1 port %d", from, a.Port)
+		w("match in inet proto tcp from any to (self) port %d rdr-to 127.0.0.1 port %d", from, a.Port)
+		w("match in inet6 proto tcp from any to (self) port %d rdr-to ::1 port %d", from, a.Port)
 	}
-	w("")
-	w("# filtering: the jails' own anchors first")
-	w(`anchor "jailops/*"`)
 	switch {
 	case s.Template == api.HostFirewallOpen:
 		w("# open template: everything may reach the host")
@@ -328,6 +324,10 @@ func (l *Local) HostFirewallRead(ctx context.Context) (service.HostFirewallState
 	pf := f.files["pf.conf"]
 	st := service.HostFirewallState{FileExists: pf.exists, FileManaged: pf.exists && strings.HasPrefix(pf.data, HostResolvHeader+"\n"),
 		PFEnabled: f.pf, Modules: append([]string(nil), l.cfg.HostManage...)}
+	if pf.exists {
+		b := service.PFBindsStates(pf.data)
+		st.StatePolicyIfBound = &b
+	}
 	rec, err := l.readFirewallRecord()
 	if err != nil {
 		return st, err
@@ -383,7 +383,7 @@ func lockoutGuard(spec api.HostFirewallSpec, peer string, iKnow bool) error {
 			return nil
 		}
 		return api.Errorf(api.CodeInvalid, "the address this request came from is unknown (the unix socket or a hub), so the lock-out check cannot run").
-			WithHint("check that you keep a way in, then repeat with --i-know (i_know in the API); the change still reverts unless you confirm it").
+			WithHint("check that you keep a way in, then repeat with --confirm-lockout (confirm_lockout in the API); the change still reverts unless you confirm it").
 			WithDetail("guard", "unknown_peer")
 	}
 	a, err := netip.ParseAddr(peer)
@@ -463,7 +463,7 @@ func (l *Local) HostFirewallApply(ctx context.Context, q service.HostFirewallReq
 	if pend != nil {
 		res.Warnings = append(res.Warnings, l.busyPending(*pend).Error())
 	}
-	guard := lockoutGuard(spec, q.Peer, q.IKnow)
+	guard := lockoutGuard(spec, q.Peer, q.ConfirmLockout)
 	if q.DryRun || !changed {
 		if guard != nil && changed {
 			res.Warnings = append(res.Warnings, "the apply would be refused: "+guard.Error())
@@ -595,7 +595,7 @@ func (l *Local) restoreFirewall(ctx context.Context, root *os.Root, name string,
 	if effective && !pfAfter && nowOn && (m.PFEnabled == nil || *m.PFEnabled) {
 		p.actions = append(p.actions, "note: the snapshot has no pf.conf; pf keeps the ruleset it has loaded")
 	}
-	res := api.HostChange{DryRun: dryRun, Changed: len(p.files) > 0 || reload || toggle != "", Diff: p.diff.String(), Actions: p.actions}
+	res := api.HostChange{DryRun: dryRun, Changed: p.changed() || reload || toggle != "", Diff: p.diff.String(), Actions: p.actions}
 	if res.Actions == nil {
 		res.Actions = []string{}
 	}
@@ -638,19 +638,22 @@ func (l *Local) restoreFirewall(ctx context.Context, root *os.Root, name string,
 	return res, l.writeFirewallRecord(m.Firewall)
 }
 
-// planRestoreFiles plans putting the files of a snapshot back, with the mode and owner each one had.
+// planRestoreFiles plans putting the files of a snapshot back, with the mode and owner each one had; of rc.conf only
+// the module's variables.
 func (l *Local) planRestoreFiles(root *os.Root, name string, m hostManifest, cur map[string]hostFile) (*hostPlan, error) {
 	p := &hostPlan{}
 	for _, sf := range m.Files {
-		data := ""
-		if sf.Exists {
-			b, err := root.ReadFile(snapFilePath(name, sf.Name))
-			if err != nil {
-				return nil, mapFSErr(err)
-			}
-			data = string(b)
-		}
 		c := cur[sf.Name]
+		if sf.Name == "rc.conf" {
+			if _, err := l.planRestoreRC(p, root, name, m, sf, c); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		data, err := readSnapCopy(root, name, sf)
+		if err != nil {
+			return nil, err
+		}
 		before := len(p.files)
 		l.planFile(p, c, data, sf.Exists, "")
 		if len(p.files) > before && sf.Exists {

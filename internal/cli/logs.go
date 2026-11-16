@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -190,14 +188,5 @@ func (a *app) readLog(ctx context.Context, jail, file string, o logOpts) error {
 	}
 }
 
-// terminalSafe replaces the control characters of a log line (escape
-// sequences, C0 and C1 controls, except tab) with U+FFFD: what a jail writes
-// into its logs must not drive the reader's terminal.
-func terminalSafe(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r != '\t' && unicode.IsControl(r) {
-			return '\uFFFD'
-		}
-		return r
-	}, s)
-}
+// terminalSafe cleans one log line: what a jail writes into its logs must not drive the reader's terminal.
+func terminalSafe(s string) string { return termText(s, false) }

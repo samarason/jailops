@@ -3,6 +3,7 @@ package hostbackup
 import (
 	"context"
 	"errors"
+	"jailops.net/jailops/internal/supervise"
 	"sort"
 	"sync"
 	"time"
@@ -81,17 +82,54 @@ func (s *Service) stateJail(ctx context.Context) (JailRecord, bool) {
 }
 
 // members returns the jails a policy applies to, plus the state record when
-// include_state is set.
-func (s *Service) members(ctx context.Context, p api.BackupPolicy, jails []JailRecord) []JailRecord {
+// include_state is set, plus the volumes (see volumeMembers).
+func (s *Service) members(ctx context.Context, p api.BackupPolicy, jails []JailRecord, noVolumes bool) []JailRecord {
 	var out []JailRecord
+	var chosen []JailRecord
 	for _, j := range jails {
 		if selects(p, j) {
 			out = append(out, j)
+			chosen = append(chosen, j)
 		}
 	}
 	if p.Spec.IncludeState {
 		if st, ok := s.stateJail(ctx); ok {
 			out = append(out, st)
+		}
+	}
+	if !p.Spec.ExcludeVolumes && !noVolumes {
+		out = append(out, s.volumeMembers(ctx, p, chosen)...)
+	}
+	return out
+}
+
+// volumeMembers returns the volumes a policy backs up: those the selected jails attach and those whose own labels
+// match the selector. A volume is one record, so it is backed up once per run however many jails attach it.
+func (s *Service) volumeMembers(ctx context.Context, p api.BackupPolicy, chosen []JailRecord) []JailRecord {
+	if s.deps.Volumes == nil {
+		return nil
+	}
+	vols, err := s.deps.Volumes.Volumes(ctx)
+	if err != nil {
+		s.cfg.Log.Error("backup: listing the volumes failed", "err", err)
+		return nil
+	}
+	attached := map[string]bool{}
+	for _, j := range chosen {
+		for _, v := range j.Spec.Volumes {
+			attached[j.Project+"/"+v.Name] = true
+		}
+	}
+	var out []JailRecord
+	seen := map[string]bool{}
+	for _, v := range vols {
+		v.IsVolume = true
+		if v.Project != p.Metadata.Project || seen[v.UUID] {
+			continue
+		}
+		if attached[v.Project+"/"+v.Name] || selects(p, v) {
+			seen[v.UUID] = true
+			out = append(out, v)
 		}
 	}
 	return out
@@ -131,7 +169,7 @@ func (s *Service) dueJobs(ctx context.Context, now time.Time) ([]job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, p := range policies {
-		for _, j := range s.members(ctx, p, jails) {
+		for _, j := range s.members(ctx, p, jails, false) {
 			for _, k := range []struct{ kind, expr string }{{RunBackup, p.Spec.Schedule}, {RunDrill, p.Spec.VerifySchedule}} {
 				if k.expr == "" {
 					continue
@@ -205,7 +243,7 @@ func (s *Service) Tick(ctx context.Context) (int, error) {
 		go func() {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
-			s.runJob(ctx, jo)
+			_ = supervise.Guard(nil, "backup-job", func() { s.runJob(ctx, jo) })
 		}()
 	}
 	return started, nil
@@ -276,7 +314,7 @@ func (s *Service) captureOptions(p api.BackupPolicy, attempt int) CaptureOptions
 func retryable(err error) bool {
 	switch errCode(err) {
 	case api.CodeKeyNotEscrowed, api.CodePlaintextDenied, api.CodeInvalid, api.CodeForbidden, api.CodeNotFound,
-		api.CodeUnsupported, api.CodeAlreadyExists:
+		api.CodeUnsupported, api.CodeAlreadyExists, api.CodeLocked:
 		return false
 	}
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, ErrVerifyFailed)
@@ -355,6 +393,17 @@ func (s *Service) policyByName(ctx context.Context, project, name string) (api.B
 // Config.Concurrency jobs at once and one per jail. It returns one Run per
 // jail and target; a failed job is a Run with OK false, not an error.
 func (s *Service) RunNow(ctx context.Context, project, policy string) ([]Run, error) {
+	return s.RunNowWith(ctx, project, policy, RunOptions{})
+}
+
+// RunOptions change one RunNow.
+type RunOptions struct {
+	// NoVolumes leaves the volumes out of this run.
+	NoVolumes bool
+}
+
+// RunNowWith is RunNow with options.
+func (s *Service) RunNowWith(ctx context.Context, project, policy string, o RunOptions) ([]Run, error) {
 	p, err := s.policyByName(ctx, project, policy)
 	if err != nil {
 		return nil, err
@@ -365,7 +414,7 @@ func (s *Service) RunNow(ctx context.Context, project, policy string) ([]Run, er
 			return nil, err
 		}
 	}
-	members := s.members(ctx, p, jails)
+	members := s.members(ctx, p, jails, o.NoVolumes)
 	s.cfg.Log.Info("backup: run policy", "policy", policy, "project", p.Metadata.Project, "selector", p.Spec.Selector, "jails", len(jails), "selected", len(members))
 	var (
 		mu  sync.Mutex
@@ -378,8 +427,14 @@ func (s *Service) RunNow(ctx context.Context, project, policy string) ([]Run, er
 		go func() {
 			defer wg.Done()
 			defer func() { <-s.sem }()
-			res, err := s.BackupJail(ctx, j, CaptureOptions{Policy: policy, Targets: p.Spec.Targets,
-				FullEvery: time.Duration(p.Spec.FullEvery) * 24 * time.Hour})
+			var res *CaptureResult
+			var err error
+			if perr := supervise.Guard(nil, "backup-jail", func() {
+				res, err = s.BackupJail(ctx, j, CaptureOptions{Policy: policy, Targets: p.Spec.Targets,
+					FullEvery: time.Duration(p.Spec.FullEvery) * 24 * time.Hour})
+			}); perr != nil {
+				res, err = nil, perr
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			switch {

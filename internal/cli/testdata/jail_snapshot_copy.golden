@@ -39,13 +39,13 @@ spec:
 
 $ jailops jail snapshot show web nope
 ! not_found: snapshot "nope" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail snapshot list JAIL'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops jail snapshot delete web s1
 ! Delete snapshot "s1" of jail "web"? [y/N]: 
-! usage: confirmation required
-! hint: answer on standard input, or pass -y
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: answer y on standard input, or pass -y to confirm without a question
 [exit 2]
 
 $ jailops jail snapshot delete -y web s1

@@ -12,9 +12,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
+	"jailops.net/jailops/internal/auth"
 	"jailops.net/jailops/internal/store"
 	"jailops.net/jailops/sdk/api"
 )
@@ -36,19 +38,73 @@ type setupTokenFile struct {
 
 func (s *Service) setupTokenPath() string { return filepath.Join(s.d.StateDir, "setup", "token.json") }
 
-// adminExists reports whether a global administrator exists (disabled ones count: disabling the last one does not
-// open the setup again).
-func (s *Service) adminExists(ctx context.Context) (bool, error) {
+// adminIdentities lists the global administrators of the host as "user:NAME", "token:NAME" and "certificate:NAME":
+// users (disabled ones count: disabling the last one does not open the setup again), and API tokens and client
+// certificates that have not expired. Root on the socket is not one of them: it is the host's recovery access.
+func (s *Service) adminIdentities(ctx context.Context) ([]string, error) {
+	var out []string
 	us, err := s.d.DB.Users.List(ctx)
 	if err != nil {
-		return false, internal(err)
+		return nil, internal(err)
 	}
 	for _, u := range us {
 		if u.Permission == api.PermAdmin && u.Global {
-			return true, nil
+			out = append(out, "user:"+u.Name)
 		}
 	}
-	return false, nil
+	now := s.now()
+	live := func(exp time.Time) bool { return exp.IsZero() || now.Before(exp) }
+	ts, err := s.d.DB.Tokens.List(ctx)
+	if err != nil {
+		return nil, internal(err)
+	}
+	for _, t := range ts {
+		if t.Permission == api.PermAdmin && t.Global && live(t.ExpiresAt) {
+			out = append(out, "token:"+t.Name)
+		}
+	}
+	cs, err := s.certKind.list()
+	if err != nil {
+		return nil, internal(err)
+	}
+	for _, c := range cs {
+		if c.Spec.Permission == api.PermAdmin && c.Spec.Global && live(c.Spec.ExpiresAt) {
+			out = append(out, "certificate:"+c.Meta.Name)
+		}
+	}
+	return out, nil
+}
+
+// adminExists reports whether a global administrator exists. When one does, a setup token left over (one issued
+// before the administrator was made another way) is removed: it can never be used, and it must not wait on disk.
+func (s *Service) adminExists(ctx context.Context) (bool, error) {
+	ids, err := s.adminIdentities(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(ids) == 0 {
+		return false, nil
+	}
+	if err := os.Remove(s.setupTokenPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.log.Error("setup: a setup token left over could not be removed", "err", err)
+	}
+	return true, nil
+}
+
+// keepAdmin refuses a change that removes or demotes the identity drop ("user:NAME", "token:NAME",
+// "certificate:NAME") when it is the host's last global administrator: the first-run setup would open again, and
+// the setup token every start of jailopsd prints on the console would let whoever reads it create a new one.
+func (s *Service) keepAdmin(ctx context.Context, drop string) error {
+	ids, err := s.adminIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(ids, drop) || len(ids) > 1 {
+		return nil
+	}
+	kind, name, _ := strings.Cut(drop, ":")
+	return api.Errorf(api.CodeConflict, "%s %q is the last global administrator of this host", kind, name).
+		WithHint("make another global administrator first (as root on the host: jailops user create NAME --admin), then change or remove this one")
 }
 
 func errSetupDone() error {
@@ -149,7 +205,7 @@ var errBadSetupToken = api.Errorf(api.CodeUnauthorized, "the setup token is not 
 // consumes the token. Wrong, expired and missing tokens get the same answer and count toward the lockout of the
 // source; once an administrator exists the answer is not_found.
 func (s *Service) Setup(ctx context.Context, in api.SetupRequest, remote string) (api.SetupResult, error) {
-	key := setupLimitKey + remote
+	key := setupLimitKey + auth.SourceKey(remote)
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
 	if ok, err := s.adminExists(ctx); err != nil || ok {

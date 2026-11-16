@@ -5,7 +5,8 @@ import { api } from '@/api/endpoints'
 import { useLoad } from '@jailops/shared/composables/load'
 import { runOp } from '@jailops/shared/composables/ops'
 import { ApiError } from '@jailops/shared/api/client'
-import { stamp, ago } from '@jailops/shared/lib/format'
+import { stamp } from '@jailops/shared/lib/format'
+import TimeStamp from '@jailops/shared/components/TimeStamp.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
 import Modal from '@jailops/shared/components/Modal.vue'
 import ErrorPanel from '@jailops/shared/components/ErrorPanel.vue'
@@ -94,7 +95,7 @@ const tone = (r: string) => (r === 'ok' ? 'ok' : r === 'rolled_back' ? 'warn' : 
           </div>
           <Callout v-if="policy.mode === 'managed'" tone="warn">{{ s.updates.managedWarn }}</Callout>
           <div class="row"><button class="btn btn-primary" type="button" :disabled="!pdirty" data-test="policy-save" @click="savePolicy">{{ s.updates.savePolicy }}</button>
-            <span class="faint">{{ s.updates.lastCheck }}: {{ report ? ago(report.checked_at) : s.updates.never }}</span></div>
+            <span class="faint">{{ s.updates.lastCheck }}: <TimeStamp v-if="report" :ts="report.checked_at" /><template v-else>{{ s.updates.never }}</template></span></div>
         </div>
       </section>
 
@@ -129,7 +130,7 @@ const tone = (r: string) => (r === 'ok' ? 'ok' : r === 'rolled_back' ? 'warn' : 
           <p v-else class="muted">{{ s.updates.needPreview }}</p>
           <ErrorPanel v-if="error" :error="error" />
         </div>
-        <template #footer><button class="btn" type="button" @click="open = false">{{ s.app.cancel }}</button><button class="btn btn-primary" type="button" :disabled="!previewed || busy" data-test="update-go" @click="apply">{{ s.updates.apply }}</button></template>
+        <template #footer><span v-if="!previewed" class="why-disabled">{{ s.updates.needPreview }}</span><button class="btn" type="button" @click="open = false">{{ s.app.cancel }}</button><button class="btn btn-primary" type="button" :disabled="!previewed || busy" data-test="update-go" @click="apply">{{ s.updates.apply }}</button></template>
       </Modal>
     </div>
   </LoadState>

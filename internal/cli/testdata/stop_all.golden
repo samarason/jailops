@@ -1,0 +1,44 @@
+$ jailops stop-all
+! No jail is running.
+
+$ jailops create db --image freebsd-15@stable --storage default --network lan --start
+jail/db created
+jail/db started
+
+$ jailops create web --image freebsd-15@stable --storage default --network lan --start --depends db
+jail/web created
+jail/web started
+
+$ jailops create cache --image freebsd-15@stable --storage default --network lan --start
+jail/cache created
+jail/cache started
+
+$ jailops create idle --image freebsd-15@stable --storage default --network lan --start
+jail/idle created
+jail/idle started
+
+$ jailops stop idle
+jail/idle stopped
+
+$ jailops stop-all --dry-run
+dry-run: would stop jail main/web
+dry-run: would stop jail main/db
+dry-run: would stop jail main/cache
+
+$ jailops stop-all --grace 30s
+jail/main/web stopped
+jail/main/db stopped
+jail/main/cache stopped
+
+$ jailops list -c name,state
+NAME    STATE
+cache   stopped
+db      stopped
+idle    stopped
+web     stopped
+
+$ jailops stop-all --grace soon
+! usage: --grace must be a number of seconds or a duration such as 30s, not "soon"
+! hint: run 'jailops stop-all --help' for usage
+[exit 2]
+

@@ -6,7 +6,8 @@ describe('format', () => {
   it('formats bytes', () => {
     expect(bytes(0)).toBe('0 B')
     expect(bytes(1536)).toBe('1.5 KiB')
-    expect(bytes(5 * 1024 ** 3)).toBe('5.0 GiB')
+    expect(bytes(5 * 1024 ** 3)).toBe('5 GiB')
+    expect(bytes(96 * 1024 ** 2)).toBe('96 MiB')
     expect(bytes(undefined)).toBe('-')
   })
   it('clamps percent', () => {

@@ -63,14 +63,16 @@ stage() { # stage NAME: install the files of one package under $work/NAME
 			'zsh/site-functions/_jailops' 'zsh/site-functions/_jailops-sync' \
 			'fish/vendor_completions.d/jailops.fish' 'fish/vendor_completions.d/jailops-sync.fish' 'man/man1/*' ;;
 	jailops)
-		install -d "$root/usr/local/sbin" "$root/usr/local/libexec" "$root/usr/local/etc/rc.d" "$root/usr/local/etc/jailops" "$root/usr/local/share/doc/jailops"
+		install -d "$root/usr/local/sbin" "$root/usr/local/libexec" "$root/usr/local/etc/rc.d" "$root/usr/local/etc/jailops" "$root/usr/local/etc/newsyslog.conf.d" "$root/usr/local/share/doc/jailops"
 		install -m 755 "$(bin jailopsd)" "$root/usr/local/sbin/jailopsd"
+		install -m 755 "$pk/jailops-setup" "$root/usr/local/sbin/jailops-setup"
 		install -m 755 "$(bin jailops-priv)" "$root/usr/local/libexec/jailops-priv"
-		install -m 555 "$pk/rc.d/jailopsd" "$pk/rc.d/jailops_priv" "$pk/rc.d/jailops_revert" "$root/usr/local/etc/rc.d/"
+		install -m 555 "$pk/rc.d/jailopsd" "$pk/rc.d/jailops_priv" "$pk/rc.d/jailops_revert" "$pk/rc.d/jailops_shutdown" "$root/usr/local/etc/rc.d/"
 		install -m 644 "$pk/jailopsd.yaml" "$root/usr/local/etc/jailops/jailopsd.yaml.sample"
 		install -m 644 "$pk/priv.conf.sample" "$root/usr/local/etc/jailops/priv.conf.sample"
+		install -m 644 "$pk/newsyslog.conf" "$root/usr/local/etc/newsyslog.conf.d/jailops.conf"
 		install -m 644 "$here/README.md" "$here/LICENSE.md" "$here/docs/design.md" "$root/usr/local/share/doc/jailops/"
-		share_install "$root" 'man/man8/jailopsd.8' 'man/man8/jailops-priv.8' ;;
+		share_install "$root" 'man/man8/jailopsd.8' 'man/man8/jailops-priv.8' 'man/man8/jailops-setup.8' ;;
 	jailops-backupd)
 		install -d "$root/usr/local/sbin" "$root/usr/local/etc/rc.d" "$root/usr/local/etc/jailops" "$root/usr/local/share/doc/jailops-backupd"
 		install -m 755 "$(bin jailops-backupd)" "$root/usr/local/sbin/jailops-backupd"
@@ -98,7 +100,7 @@ comment() {
 desc() {
 	case $1 in
 	jailops-client) echo "The jailops command line client and jailops-sync, the declarative fleet tool." ;;
-	jailops) echo "jailopsd, the JailOps daemon (REST API, web console), and jailops-priv, the small privileged helper it uses. After installing run: jailops-priv init -pool POOL" ;;
+	jailops) echo "jailopsd, the JailOps daemon (REST API, web console), and jailops-priv, the small privileged helper it uses. After installing run, as root: jailops-setup" ;;
 	jailops-backupd) echo "The JailOps backup node: stores encrypted, deduplicated backups and never holds the key. Needs PostgreSQL for its control plane." ;;
 	esac
 }
@@ -115,7 +117,7 @@ scripts() {
 		cat <<'JSON'
 "scripts": {
   "pre-install": "pw groupshow jailops >/dev/null 2>&1 || pw groupadd jailops; pw usershow jailops >/dev/null 2>&1 || pw useradd jailops -g jailops -d /var/db/jailops -s /usr/sbin/nologin -c 'JailOps daemon'; true",
-  "post-install": "install -d -m 0750 -o jailops -g jailops /var/db/jailops; echo 'JailOps is installed. Next: jailops-priv init -pool POOL; sysrc jailops_priv_enable=YES jailopsd_enable=YES; service jailops_priv start; service jailopsd start'"
+  "post-install": "install -d -m 0750 -o jailops -g jailops /var/db/jailops; echo 'JailOps is installed. Next, as root: jailops-setup (jailops-setup -n shows what it would do; man jailops-setup)'"
 },
 JSON
 		;;

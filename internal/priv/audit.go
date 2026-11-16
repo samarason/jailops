@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"log/syslog"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -99,7 +100,7 @@ func clip(s string, n int) string {
 }
 
 // targetKeys are the argument fields that name what a request acts on.
-var targetKeys = []string{"name", "snapshot", "target", "dataset", "anchor", "path", "iface", "bridge", "member", "jail", "from", "to", "conf", "table", "tag", "src", "dst", "addr", "uplink", "requester_ip"}
+var targetKeys = []string{"name", "snapshot", "target", "dataset", "anchor", "path", "iface", "jail", "from", "to", "conf", "table", "tag", "src", "dst", "addr", "uplink", "requester_ip"}
 
 // auditTarget extracts the named targets of a request. For commands only the
 // program (or the jail command's first word) is recorded.
@@ -130,8 +131,9 @@ func auditTarget(op string, raw json.RawMessage) map[string]string {
 		if json.Unmarshal(v, &l) == nil && len(l) > 0 {
 			out["cmd"] = clip(l[0], 100)
 			if op == OpExecSession {
-				// Sessions are interactive: the whole command line is recorded.
-				out["argv"] = clip(strings.Join(l, " "), 300)
+				// The program and how many arguments it got: a command line may carry a secret, and the log is
+				// readable by whoever reads the helper's logs.
+				out["argv"] = clip(l[0], 100) + " (" + strconv.Itoa(len(l)-1) + " arguments)"
 			}
 		}
 	}

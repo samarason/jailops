@@ -100,6 +100,10 @@ type Stream struct {
 	// FS reads the tree (nil = the local file system). An unprivileged daemon reads a snapshot through
 	// an agent that holds the privileges; Root is then a path in the agent's view.
 	FS catalog.ScanFS
+	// OpenFS, when set, is called when the engine starts this stream and gives its file system (FS is then ignored);
+	// the returned func is called as soon as the stream has been read, also when it failed. A reader that is a process
+	// of its own (an agent) lives for one stream and not for the whole backup.
+	OpenFS func(ctx context.Context) (catalog.ScanFS, func(), error)
 	// ZFSSnapshot, GUID, CreateTxg and Props identify the consistent ZFS
 	// snapshot that was read and are recorded in the manifest.
 	ZFSSnapshot string

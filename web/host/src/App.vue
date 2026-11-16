@@ -9,10 +9,14 @@ import { useRoute } from 'vue-router'
 import NoProject from '@/components/NoProject.vue'
 import PendingBanner from '@/components/PendingBanner.vue'
 import AppShell, { type NavItem } from '@jailops/shared/components/AppShell.vue'
+import Icon from '@jailops/shared/components/Icon.vue'
+import QuickSwitcher from '@/components/QuickSwitcher.vue'
+import { openSwitcher } from '@/composables/search'
 
 const items = computed<NavItem[]>(() => ([
   { to: '/', label: s.nav.overview, icon: 'layoutDashboard', show: true },
   { to: '/jails', label: s.nav.jails, icon: 'box', show: can('jails') },
+  { to: '/volumes', label: s.nav.volumes, icon: 'database', show: hasExt('volumes') },
   { to: '/projects', label: s.nav.projects, icon: 'users', show: can('projects') },
   { to: '/storage', label: s.nav.storage, icon: 'hardDrive', show: can('storage') },
   { to: '/images', label: s.nav.images, icon: 'layers', show: can('images') },
@@ -35,13 +39,31 @@ const route = useRoute()
 /** A page that works inside a project needs one: there is no default project to fall back to. */
 const needsProject = computed(() => !!route.meta.project && can('projects') && !projectState.current)
 watch(() => session.authed, (a) => { if (a && can('projects')) void initProjects() }, { immediate: true })
+const mac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 </script>
 
 <template>
   <AppShell :brand="s.app.name" :subtitle="s.app.role" :items="items" :events="can('events')">
     <template v-if="can('projects')" #header><ProjectSwitcher /></template>
+    <template v-if="session.authed" #search="{ where }">
+      <button class="btn search-btn" :class="`search-${where}`" type="button" :aria-label="s.search.openTitle" :title="s.search.openTitle" :data-test="`search-open-${where}`" aria-haspopup="dialog" @click="openSwitcher">
+        <Icon name="search" /><span class="search-word">{{ s.search.open }}</span><kbd class="search-kbd">{{ mac ? '⌘K' : 'Ctrl K' }}</kbd>
+      </button>
+    </template>
     <PendingBanner v-if="session.authed && hasExt('host_pending')" />
     <NoProject v-if="needsProject" />
-    <router-view v-else />
+    <!-- keyed by the path: another jail (from the search) is a new page, not the old one with a new name -->
+    <router-view v-else :key="route.path" />
   </AppShell>
+  <QuickSwitcher v-if="session.authed" :pages="items" />
 </template>
+
+<style>
+.search-btn { justify-content: flex-start; color: var(--text-2); }
+.search-side { width: 100%; background: var(--surface-2); }
+.search-side .search-word { flex: 1; text-align: left; }
+.search-kbd { font-size: 11px; padding: 0 5px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface); color: var(--text-2); }
+.search-top { min-width: 36px; min-height: 36px; padding: 4px 8px; }
+.search-top .search-kbd { display: none; }
+@media (max-width: 480px) { .search-top .search-word { display: none; } }
+</style>

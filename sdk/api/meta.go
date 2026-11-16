@@ -43,6 +43,7 @@ const (
 	KindOperation       Kind = "Operation"
 	KindProject         Kind = "Project"
 	KindStorage         Kind = "Storage"
+	KindVolume          Kind = "Volume"
 	KindWireGuard       Kind = "WireGuard"
 	KindHostIdentity    Kind = "HostIdentity" // the singleton host identity object
 	KindLogForward      Kind = "LogForward"   // the singleton list of log sinks

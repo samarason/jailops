@@ -240,7 +240,6 @@ var (
 	versionRE = regexp.MustCompile(`^[0-9][A-Za-z0-9._,+-]{0,63}$`)
 	rcNameRE  = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
 	rcKeyRE   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
-	shortRE   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 	iconRE    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}\.(png|svg)$`)
 	releaseRE = regexp.MustCompile(`^([0-9]{1,3})\.([0-9]{1,3})$`)
 	cpuRE     = regexp.MustCompile(`^[0-9]{1,3}(\.[0-9]{1,2})?$`)
@@ -266,6 +265,9 @@ func Validate(app *api.App) error {
 	}
 	if !slices.Contains(api.AppCategories, app.Category) {
 		return invalid("category", "%q is not one of %s", app.Category, joinCategories())
+	}
+	if app.StopTimeout < 0 || app.StopTimeout > api.MaxStopTimeout {
+		return invalid("stop_timeout", "must be between 0 and %d seconds", api.MaxStopTimeout)
 	}
 	if app.Homepage != "" {
 		u, err := url.Parse(app.Homepage)
@@ -459,7 +461,7 @@ func validatePorts(ports []api.AppPort) error {
 	for i := range ports {
 		p := &ports[i]
 		f := fmt.Sprintf("ports[%d]", i)
-		if !shortRE.MatchString(p.Name) {
+		if !api.IsName(p.Name, 32) {
 			return invalid(f+".name", "%q must match ^[a-z][a-z0-9-]{0,31}$", p.Name)
 		}
 		if names[p.Name] {
@@ -597,7 +599,7 @@ func validateLogs(logs []api.AppLog) error {
 	names := map[string]bool{}
 	for i, l := range logs {
 		f := fmt.Sprintf("logs[%d]", i)
-		if !shortRE.MatchString(l.Name) {
+		if !api.IsName(l.Name, 32) {
 			return invalid(f+".name", "%q must match ^[a-z][a-z0-9-]{0,31}$", l.Name)
 		}
 		if names[l.Name] {

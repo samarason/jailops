@@ -16,6 +16,7 @@ import LoadState from '@jailops/shared/components/LoadState.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import StatePill from '@/components/StatePill.vue'
 import AppInstallDialog from '@/components/AppInstallDialog.vue'
+import NotesText from '@/components/NotesText.vue'
 import type { Jail } from '@jailops/shared/api/types'
 
 const route = useRoute()
@@ -97,7 +98,7 @@ const invalid = computed(() => l.error.value?.code === 'invalid')
                 <p class="muted">{{ s.apps.dataLead }}</p>
                 <p v-if="!app.data?.length" class="faint">{{ s.app.none }}</p>
                 <ul class="app-paths">
-                  <li v-for="d in app.data" :key="d.path"><Icon name="database" /><div><span class="mono">{{ d.path }}</span> <span class="faint">· {{ s.apps.volume }} <span class="mono">{{ volumeName(d.path) }}</span></span><div class="muted">{{ d.description }}</div></div></li>
+                  <li v-for="d in app.data" :key="d.path"><Icon name="database" /><div><span class="mono">{{ d.path }}</span> <span class="faint">· {{ s.apps.volume }} <span class="mono">&lt;jail&gt;-{{ volumeName(d.path) }}</span></span><div class="muted">{{ d.description }}</div></div></li>
                 </ul>
               </div>
             </section>
@@ -191,7 +192,7 @@ const invalid = computed(() => l.error.value?.code === 'invalid')
 
             <section v-if="app.notes" class="panel" aria-labelledby="ad-notes" data-section="notes">
               <header><h2 id="ad-notes">{{ s.apps.notes }}</h2></header>
-              <div class="body app-notes"><p v-for="(p, i) in paras(app.notes)" :key="i">{{ p }}</p></div>
+              <NotesText class="body app-notes" :text="app.notes" />
             </section>
 
             <section class="panel" aria-labelledby="ad-def">
@@ -199,7 +200,7 @@ const invalid = computed(() => l.error.value?.code === 'invalid')
               <div class="body">
                 <dl class="kv">
                   <dt>{{ s.apps.image }}</dt><dd>{{ s.apps.releaseMin(app.image.os, app.image.release_min) }}</dd>
-                  <dt>{{ s.apps.file }}</dt><dd class="mono">{{ l.data.value.file }}</dd>
+                  <dt>{{ s.apps.file }}</dt><dd class="mono app-path" data-test="app-file"><template v-for="(seg, i) in l.data.value.file.split('/')" :key="i">{{ i ? '/' : '' }}<wbr v-if="i" />{{ seg }}</template></dd>
                   <dt>{{ s.apps.hash }}</dt><dd class="mono app-hash" data-test="app-hash">{{ l.data.value.hash }}</dd>
                 </dl>
               </div>
@@ -233,11 +234,13 @@ const invalid = computed(() => l.error.value?.code === 'invalid')
 .app-restart { margin-left: 8px; }
 .app-loglinks { margin-top: 4px; }
 .app-note { font-size: 12px; margin: 0; }
-.app-setup { margin: 0; padding-left: 32px; display: grid; gap: 2px; overflow-wrap: anywhere; }
+.panel > .app-setup { margin: 0; padding-left: 36px; display: grid; gap: 2px; overflow-wrap: anywhere; }
 .app-res { display: grid; gap: 8px; margin-bottom: 8px; }
 .app-res > div { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center; }
 .app-res .icon { color: var(--text-3); }
 .app-notes p:last-child { margin: 0; }
 .app-hash { font-size: 12px; }
+/* a path breaks after a slash, never inside a name */
+dl.kv dd.app-path { overflow-wrap: normal; word-break: normal; }
 @media (max-width: 1000px) { .app-detail-grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

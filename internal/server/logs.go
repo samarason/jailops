@@ -54,7 +54,7 @@ func (s *Server) logRoutes() []route {
 				tr, hp, _ := k.SinkTarget()
 				names = append(names, k.Name+"="+tr+"://"+hp)
 			}
-			c.detail = "sinks=" + strings.Join(names, ",")
+			c.detail = "sinks=" + auditValue(strings.Join(names, ","))
 			v, err := svc.SetLogForward(c.r.Context(), spec, expect)
 			return view(c, v, err)
 		}},
@@ -67,7 +67,7 @@ func (s *Server) logRoutes() []route {
 			if err := c.decode(&t); err != nil {
 				return err
 			}
-			c.detail = "sink=" + t.Sink
+			c.detail = "sink=" + auditValue(t.Sink)
 			v, err := svc.TestLogForward(c.r.Context(), t.Sink)
 			if err != nil {
 				return err

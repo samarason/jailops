@@ -1,0 +1,164 @@
+$ jailops firewall policy create floor
+firewall policy/floor created
+
+$ jailops firewall rule add floor in --action allow --proto tcp --port 22 --comment ssh
+firewall policy/floor: rule 1 added: allow in tcp port 22
+
+$ jailops firewall policy create monitoring
+firewall policy/monitoring created
+
+$ jailops firewall rule add monitoring in --action allow --proto tcp --port 22 --comment ssh
+firewall policy/monitoring: rule 1 added: allow in tcp port 22
+
+$ jailops firewall policy create postgres
+firewall policy/postgres created
+
+$ jailops firewall rule add postgres in --action allow --proto tcp --port 22 --comment ssh
+firewall policy/postgres: rule 1 added: allow in tcp port 22
+
+$ jailops firewall policy create ssh-office
+firewall policy/ssh-office created
+
+$ jailops firewall rule add ssh-office in --action allow --proto tcp --port 22 --comment ssh
+firewall policy/ssh-office: rule 1 added: allow in tcp port 22
+
+$ jailops jail create db --image freebsd-15@stable --storage default --network lan --firewall-policy postgres --firewall-policy ssh-office
+jail/db created
+
+$ jailops config get db firewall.policies
+postgres,ssh-office
+
+$ jailops config set db firewall.policies ssh-office,postgres
+jail/db configuration updated
+
+$ jailops config get db firewall.policies
+ssh-office,postgres
+
+$ jailops project set main --firewall-policy floor --firewall-policy monitoring
+project/main updated
+
+$ jailops project show main
+Project main
+  Hosts:       this host
+  Networks:    lan
+  Storage:     default
+  Firewall:    floor, monitoring
+  Images:      any
+  Age:         3h
+
+Usage
+  Jails:       1 (no quota)
+  CPU:         0 cores (no quota)
+  Memory:      0 B (no quota)
+  Disk:        0 B
+  Addresses:   1 (no quota)
+
+$ jailops jail info db
+Jail db
+  Project:      main
+  Hostname:     db
+  State:        stopped
+  Type:         thin jail
+  Image:        freebsd-15@stable, generation g1
+  Storage:      default
+  Created:      2026-03-01 09:00 UTC (3h ago)
+  UUID:         <uuid>
+
+Resources
+  Limits:       none
+  Firewall:     floor (project), monitoring (project), ssh-office, postgres
+  Usage:        - (the jail is not running)
+  Disk:         root 256.0 MiB used (1.5 GiB referenced), data 70.0 MiB
+
+Network
+  eth0:         network lan, mac derived by the server, mtu network default, down
+    10.20.0.10                                 ipv4 global
+
+Snapshots
+  Count:        0
+
+Update policy
+  Strategy:     -, mode manual
+  Last:         no update yet
+
+$ jailops jail info db -o json
+{
+  "name": "db",
+  "project": "main",
+  "uuid": "<uuid>",
+  "hostname": "db",
+  "state": "stopped",
+  "layout": "thin",
+  "image": "freebsd-15@stable",
+  "generation": "g1",
+  "storage": "default",
+  "created_at": "2026-03-01T09:00:00Z",
+  "resources": {
+    "limits": {},
+    "usage": {
+      "jail": "db",
+      "power": "stopped",
+      "measured_at": "2026-03-01T09:00:00Z",
+      "disk": {
+        "root_bytes": 268435456,
+        "root_referenced_bytes": 1610612736,
+        "data_bytes": 73400320
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "name": "eth0",
+      "network": "lan",
+      "state": "down",
+      "addresses": [
+        {
+          "address": "10.20.0.10",
+          "family": "ipv4",
+          "scope": "global",
+          "configured": false
+        }
+      ]
+    }
+  ],
+  "firewall_policies": [
+    {
+      "name": "floor",
+      "source": "project"
+    },
+    {
+      "name": "monitoring",
+      "source": "project"
+    },
+    {
+      "name": "ssh-office"
+    },
+    {
+      "name": "postgres"
+    }
+  ],
+  "snapshots": {
+    "count": 0
+  },
+  "update": {}
+}
+
+$ jailops project set main --firewall-policy 
+project/main updated
+
+$ jailops project show main
+Project main
+  Hosts:       this host
+  Networks:    lan
+  Storage:     default
+  Firewall:    none
+  Images:      any
+  Age:         3h
+
+Usage
+  Jails:       1 (no quota)
+  CPU:         0 cores (no quota)
+  Memory:      0 B (no quota)
+  Disk:        0 B
+  Addresses:   1 (no quota)
+

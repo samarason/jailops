@@ -234,14 +234,14 @@ func TestHostSelectionAndGroups(t *testing.T) {
 	e.Write("hosts/db1/host.yaml", "apiVersion: jailops/v1\nkind: Host\nmetadata:\n  name: db1\n  labels: {role: db, env: prod}\nspec:\n  url: "+e.Hosts["db1"].URL()+"\n")
 	e.Write("groups/prod.yaml", "apiVersion: jailops/v1\nkind: HostGroup\nmetadata:\n  name: prod\nspec:\n  selector: {env: prod}\n")
 	e.Write("groups/everything.yaml", "apiVersion: jailops/v1\nkind: HostGroup\nmetadata:\n  name: everything\nspec:\n  members: [\"@prod\", web2]\n")
-	e.Write("projects/main/address-sets/prod_only.yaml", "apiVersion: jailops/v1\nkind: AddressSet\nmetadata:\n  name: prod_only\nhosts: [\"@prod\"]\nspec:\n  addresses: [192.0.2.1]\n")
+	e.Write("projects/main/address-sets/prod-only.yaml", "apiVersion: jailops/v1\nkind: AddressSet\nmetadata:\n  name: prod-only\nhosts: [\"@prod\"]\nspec:\n  addresses: [{address: 192.0.2.1}]\n")
 
 	mustOK(t, run(t, e, "validate"))
 	mustOK(t, run(t, e, "sync", "--apply", "--host", "@everything"))
 	for h, want := range map[string]bool{"web1": true, "web2": false, "db1": true} {
-		_, err := client(t, e.Hosts[h]).Project(fleettest.Project).Firewall().AddressSets().Get(context.Background(), "prod_only")
+		_, err := client(t, e.Hosts[h]).Project(fleettest.Project).Firewall().AddressSets().Get(context.Background(), "prod-only")
 		if (err == nil) != want {
-			t.Fatalf("%s: prod_only present=%v, want %v (%v)", h, err == nil, want, err)
+			t.Fatalf("%s: prod-only present=%v, want %v (%v)", h, err == nil, want, err)
 		}
 	}
 	// --host limits what is planned and applied.
@@ -259,14 +259,14 @@ kind: JailTemplate
 metadata:
   name: web-base
 spec:
-  description: a web jail
+  comment: a web jail
   jail:
     image: freebsd-15@stable
     storage: default
     network:
       - network: internal
         ipv4: auto
-    firewall: {policy: web}
+    firewall: {policies: [web]}
     resources: {memory: 1G, cpu: 1}
   after:
     - action: snapshot
@@ -316,7 +316,7 @@ spec:
   image: freebsd-15@stable
   storage: default
   network: [{network: internal}]
-  firewall: {policy: web}
+  firewall: {policies: [web]}
 `)
 	mustOK(t, run(t, e, "validate"))
 	mustFail(t, run(t, e, "sync", "--apply", "--host", "web1"), "is not running")
@@ -344,7 +344,7 @@ spec:
   image: nothing@stable
   network:
     - network: nowhere
-  firewall: {policy: missing}
+  firewall: {policies: [missing]}
   env: {TOKEN: "secret:absent"}
 `)
 	r := mustFail(t, run(t, e, "validate"), "")
@@ -365,6 +365,7 @@ metadata:
   name: open
 spec:
   default_in: allow
+  default_out: allow
   rules:
     - {action: allow, direction: in, proto: tcp, ports: ["22"]}
 `)
@@ -383,11 +384,11 @@ func TestAdoptAndClaim(t *testing.T) {
 		Networks: []api.ProjectNetwork{{Network: "lan"}},
 		Storage:  []api.ProjectStorage{{Storage: "default"}},
 	}})
-	srv.SeedFirewallPolicy(api.FirewallPolicy{Metadata: api.ObjectMeta{Name: "base", Project: fleettest.Project}, Spec: api.FirewallPolicySpec{DefaultIn: "deny"}})
+	srv.SeedFirewallPolicy(api.FirewallPolicy{Metadata: api.ObjectMeta{Name: "base", Project: fleettest.Project}, Spec: api.FirewallPolicySpec{DefaultIn: "deny", DefaultOut: "allow"}})
 	srv.SeedJail(api.Jail{
 		Metadata: api.ObjectMeta{Name: "old", Project: fleettest.Project, Labels: map[string]string{"tier": "web"}},
 		Spec: api.JailSpec{Image: "freebsd-15@stable", Hostname: "old", Layout: api.LayoutThin, Storage: "default",
-			Network: []api.NetworkAttach{{Network: "lan", IPv4: "10.9.0.12"}}, Firewall: api.FirewallAttach{Policy: "base"}},
+			Network: []api.NetworkAttach{{Network: "lan", IPv4: "10.9.0.12"}}, Firewall: api.FirewallAttach{Policies: []string{"base"}}},
 	})
 	// A foreign object is skipped.
 	srv.SeedNetwork(api.Network{Metadata: api.ObjectMeta{Name: "theirs", ManagedBy: "sync:other"}, Spec: api.NetworkSpec{IPv4: &api.IPv4Net{Subnet: "10.8.0.0/24", Gateway: "10.8.0.1", Range: "10.8.0.10-10.8.0.20"}}})

@@ -1,7 +1,0 @@
-apiVersion: jailops/v1
-kind: AddressSet
-metadata:
-  name: app_tier
-spec:
-  # The addresses the jails are given (a fixed address, so rules can name it). nginx talks to app, app talks to postgres.
-  addresses: [10.60.0.20, 10.60.0.30]

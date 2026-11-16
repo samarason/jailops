@@ -1,7 +1,6 @@
 package backupd
 
 import (
-	"strings"
 	"testing"
 
 	"jailops.net/jailops/internal/auth"
@@ -22,12 +21,5 @@ func TestPeerPermission(t *testing.T) {
 		if got := peerPermission(tc.c); got != tc.want {
 			t.Errorf("%s: %q want %q", tc.name, got, tc.want)
 		}
-	}
-}
-
-func TestConfigRefusesRemovedAdminGroup(t *testing.T) {
-	_, err := ParseConfig([]byte("hostname: n\nadmin_group: wheel\n"))
-	if err == nil || !strings.Contains(err.Error(), "admin_group") {
-		t.Fatalf("want an error naming admin_group, got %v", err)
 	}
 }

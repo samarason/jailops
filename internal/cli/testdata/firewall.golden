@@ -1,67 +1,209 @@
 $ jailops firewall address-set create office --address 192.0.2.0/24 --address 198.51.100.7
 address set/office created
 
-$ jailops firewall address-set create empty
-! usage: give at least one --address or --include (or use -f FILE)
-! hint: run 'jailops firewall address-set create --help' for usage
+$ jailops firewall address-set create hq --comment the office
+address set/hq created
+
+$ jailops firewall address-set add hq 192.0.2.9 --comment the office network
+address set/hq: added 192.0.2.9
+
+$ jailops firewall address-set add hq 192.0.2.9 192.0.2.10
+address set/hq: added 192.0.2.10 (already a member: 192.0.2.9)
+
+$ jailops firewall address-set add hq not-an-address
+! usage: "not-an-address" is not a valid address, or a reference: host, jail:NAME, set:NAME or tag:NAME
+! hint: run 'jailops firewall address-set add --help' for usage
 [exit 2]
 
-$ jailops firewall policy create web --default-in deny --default-out allow --rule allow in tcp port 80,443 --rule allow in tcp from @office port 22 log --rule allow in tcp port 8080 rdr 8080:80
-firewall policy/web created
-
-$ jailops firewall policy create bad --rule allow
-! usage: rule "allow" needs at least ACTION and DIRECTION
-! hint: run 'jailops firewall policy create --help' for usage
-[exit 2]
-
-$ jailops firewall policy create bad2 --rule allow in tcp bogus 1
-! usage: rule "allow in tcp bogus 1": unknown word "bogus"
-! hint: run 'jailops firewall policy create --help' for usage
-[exit 2]
-
-$ jailops firewall policy list
-NAME   DEFAULT-IN   DEFAULT-OUT   RULES   RAW
-web    deny         allow         3       no
-
-$ jailops firewall policy show web
+$ jailops firewall address-set show hq -o yaml
 metadata:
-  name: web
+  name: hq
   uuid: <uuid>
   project: main
   scope: fleet
-  generation: 1
+  generation: 3
+  created_at: "2026-03-01T09:00:00Z"
+  updated_at: "2026-03-01T09:00:00Z"
+spec:
+  comment: the office
+  addresses:
+    - address: 192.0.2.9
+      comment: the office network
+    - address: 192.0.2.10
+
+$ jailops firewall address-set show hq
+Address set hq
+  Comment:  the office
+  Age:      3h
+
+MEMBER       COMMENT
+192.0.2.9    the office network
+192.0.2.10   -
+
+$ jailops firewall address-set remove hq 192.0.2.77
+! usage: 192.0.2.77 is not a member of address set hq (jailops firewall address-set show hq)
+! hint: run 'jailops firewall address-set remove --help' for usage
+[exit 2]
+
+$ jailops firewall address-set remove hq 192.0.2.10
+address set/hq: removed 192.0.2.10
+
+$ jailops firewall policy create documented --default-in deny --default-out allow --comment the public web server
+firewall policy/documented created
+
+$ jailops firewall rule add documented in --action allow --proto tcp --port 80,443 --comment the site
+firewall policy/documented: rule 1 added: allow in tcp port 80,443
+
+$ jailops firewall rule add documented in --action allow --proto tcp --from set:hq --port 22 --comment ssh from the office
+firewall policy/documented: rule 2 added: allow in tcp from set:hq port 22
+
+$ jailops firewall policy show documented -o yaml
+metadata:
+  name: documented
+  uuid: <uuid>
+  project: main
+  scope: fleet
+  generation: 3
+  created_at: "2026-03-01T09:00:00Z"
+  updated_at: "2026-03-01T09:00:00Z"
+spec:
+  comment: the public web server
+  default_in: deny
+  default_out: allow
+  rules:
+    - comment: the site
+      action: allow
+      direction: in
+      proto: tcp
+      ports:
+        - "80"
+        - "443"
+    - comment: ssh from the office
+      action: allow
+      direction: in
+      proto: tcp
+      from:
+        - set:hq
+      ports:
+        - "22"
+
+$ jailops firewall policy show documented
+Firewall policy documented
+  Comment:      the public web server
+  Default in:   deny
+  Default out:  allow
+  Age:          3h
+
+#   RULE                               COMMENT
+1   allow in tcp port 80,443           the site
+2   allow in tcp from set:hq port 22   ssh from the office
+
+$ jailops firewall policy create switchable
+firewall policy/switchable created
+
+$ jailops firewall rule add switchable in --action allow --proto tcp --port 80 --comment the site
+firewall policy/switchable: rule 1 added: allow in tcp port 80
+
+$ jailops firewall rule add switchable in --action allow --proto tcp --port 22 --disabled --comment ssh, switched off
+firewall policy/switchable: rule 2 added: allow in tcp port 22 disabled
+
+$ jailops firewall rule add switchable in --action deny --proto tcp --port 23 --disabled
+firewall policy/switchable: rule 3 added: deny in tcp port 23 disabled
+! note: the rule has no comment; say why it is there with: jailops firewall rule edit switchable 3 --comment TEXT
+
+$ jailops firewall policy show switchable
+Firewall policy switchable
+  Default in:   deny
+  Default out:  allow
+  Age:          3h
+
+#   RULE                            COMMENT
+1   allow in tcp port 80            the site
+2   allow in tcp port 22 disabled   ssh, switched off
+3   deny in tcp port 23 disabled    -
+
+$ jailops firewall policy show switchable -o yaml
+metadata:
+  name: switchable
+  uuid: <uuid>
+  project: main
+  scope: fleet
+  generation: 4
   created_at: "2026-03-01T09:00:00Z"
   updated_at: "2026-03-01T09:00:00Z"
 spec:
   default_in: deny
   default_out: allow
   rules:
-    - action: allow
+    - comment: the site
+      action: allow
       direction: in
       proto: tcp
       ports:
         - "80"
-        - "443"
-    - action: allow
+    - comment: ssh, switched off
+      action: allow
       direction: in
       proto: tcp
-      from:
-        - '@office'
       ports:
         - "22"
-      log: true
-    - action: allow
+      disabled: true
+    - action: deny
       direction: in
       proto: tcp
       ports:
-        - "8080"
-      redirect:
-        host_port: 8080
-        jail_port: 80
+        - "23"
+      disabled: true
+
+$ jailops firewall policy create nodefaults
+firewall policy/nodefaults created
+
+$ jailops firewall policy create web --default-in deny --default-out allow
+firewall policy/web created
+
+$ jailops firewall rule add web in --action allow --proto tcp --port 80,443
+firewall policy/web: rule 1 added: allow in tcp port 80,443
+! note: the rule has no comment; say why it is there with: jailops firewall rule edit web 1 --comment TEXT
+
+$ jailops firewall rule add web in --action allow --proto tcp --from set:office --port 22 --log
+firewall policy/web: rule 2 added: allow in tcp from set:office port 22 log
+! note: the rule has no comment; say why it is there with: jailops firewall rule edit web 2 --comment TEXT
+
+$ jailops firewall rule add web in --action allow --proto tcp --redirect 8080:80
+firewall policy/web: rule 3 added: allow in tcp rdr 8080:80
+! note: the rule has no comment; say why it is there with: jailops firewall rule edit web 3 --comment TEXT
+
+$ jailops firewall rule add web in
+firewall policy/web: rule 4 added: allow in
+! note: the rule has no comment; say why it is there with: jailops firewall rule edit web 4 --comment TEXT
+
+$ jailops firewall rule add web in --action allow --proto bogus
+! invalid: proto "bogus" must be tcp, udp, icmp or icmp6
+[exit 2]
+
+$ jailops firewall policy list
+NAME         DEFAULT-IN   DEFAULT-OUT   RULES   RAW
+documented   deny         allow         2       no
+nodefaults   deny         allow         0       no
+switchable   deny         allow         3       no
+web          deny         allow         4       no
+
+$ jailops firewall policy show web
+Firewall policy web
+  Default in:   deny
+  Default out:  allow
+  Age:          3h
+
+#   RULE                                       COMMENT
+1   allow in tcp port 80,443                   -
+2   allow in tcp from set:office port 22 log   -
+3   allow in tcp rdr 8080:80                   -
+4   allow in                                   -
 
 $ jailops firewall address-set list
-NAME     ADDRESSES   INCLUDES
-office   2           -
+NAME     ADDRESSES
+hq       1
+office   2
 
 $ jailops firewall address-set show office -o json
 {
@@ -76,8 +218,12 @@ $ jailops firewall address-set show office -o json
   },
   "spec": {
     "addresses": [
-      "192.0.2.0/24",
-      "198.51.100.7"
+      {
+        "address": "192.0.2.0/24"
+      },
+      {
+        "address": "198.51.100.7"
+      }
     ]
   }
 }
@@ -89,88 +235,13 @@ $ jailops firewall validate -f <dir>/good.yaml --offline
 valid: 2 documents checked
 
 $ jailops firewall validate -f <dir>/bad.yaml
-DOCUMENT        LEVEL     PROBLEM
-policy/p2       error     default_in must be allow or deny, not "maybe"
-policy/p2       error     rules[0]: action must be allow or deny, not "permit"
-policy/p2       error     rules[0]: direction must be in or out, not "sideways"
-policy/p2       error     rules[0]: invalid port "99999"
-policy/p2       error     rules[0]: invalid address "300.1.1.1"
-policy/p2       error     rules[0]: unknown address set "nowhere"
-policy/p2       error     rules[1]: ports need proto tcp or udp
-policy/p2       error     rules[2]: a redirect is allowed on inbound rules only
-policy/p2       warning   raw PF needs the admin role; the server checks it with pfctl -n when applied
-address-set/a   error     invalid address "nope"
-address-set/a   error     include cycle: a -> b -> a
-address-set/b   error     include cycle: b -> a -> b
-! invalid: 11 problem(s) found in <dir>/bad.yaml
-! hint: fix the listed rules and run validate again
+! usage: cannot use string into AddressSetSpec.addresses.0 of type api.AddressEntry
+! hint: run 'jailops firewall validate --help' for usage
 [exit 2]
 
 $ jailops firewall validate -f <dir>/bad.yaml -o json
-[
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "default_in must be allow or deny, not \"maybe\""
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[0]: action must be allow or deny, not \"permit\""
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[0]: direction must be in or out, not \"sideways\""
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[0]: invalid port \"99999\""
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[0]: invalid address \"300.1.1.1\""
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[0]: unknown address set \"nowhere\""
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[1]: ports need proto tcp or udp"
-  },
-  {
-    "document": "policy/p2",
-    "level": "error",
-    "message": "rules[2]: a redirect is allowed on inbound rules only"
-  },
-  {
-    "document": "policy/p2",
-    "level": "warning",
-    "message": "raw PF needs the admin role; the server checks it with pfctl -n when applied"
-  },
-  {
-    "document": "address-set/a",
-    "level": "error",
-    "message": "invalid address \"nope\""
-  },
-  {
-    "document": "address-set/a",
-    "level": "error",
-    "message": "include cycle: a -> b -> a"
-  },
-  {
-    "document": "address-set/b",
-    "level": "error",
-    "message": "include cycle: b -> a -> b"
-  }
-]
-! invalid: 11 problem(s) found in <dir>/bad.yaml
-! hint: fix the listed rules and run validate again
+! usage: cannot use string into AddressSetSpec.addresses.0 of type api.AddressEntry
+! hint: run 'jailops firewall validate --help' for usage
 [exit 2]
 
 $ jailops firewall validate

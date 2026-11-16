@@ -1,9 +1,11 @@
 import { defineConfig, devices } from '@playwright/test'
 import { e2eConfig } from '../shared/vite.app.ts'
 
-// The specs run against the built console in demo mode (`?demo`), so no server is needed.
-// Build first: `npm run build -- --app backup`.
-const { port } = e2eConfig('backup')
+// The specs run against a demo build of the console (`?demo`), so no server is needed; the web server below makes
+// it (JAILOPS_DEMO_BUILD=1, into .demo-dist) and serves it.
+const { port, command } = e2eConfig('backup')
+// E2E_BASE_URL runs the specs against a server that is already up (a dev server) instead of the built demo.
+const base = process.env.E2E_BASE_URL
 export default defineConfig({
   testDir: 'e2e',
   outputDir: 'e2e/.results',
@@ -11,8 +13,8 @@ export default defineConfig({
   workers: process.env.CI ? 4 : undefined, // a hosted runner has 4 cores; the default is half of them
   retries: 0,
   reporter: [['list']],
-  use: { baseURL: `http://127.0.0.1:${port}`, testIdAttribute: 'data-test', trace: 'retain-on-failure' },
-  webServer: { command: `npx vite preview --host 127.0.0.1`, url: `http://127.0.0.1:${port}`, reuseExistingServer: true },
+  use: { baseURL: base ?? `http://127.0.0.1:${port}`, testIdAttribute: 'data-test', trace: 'retain-on-failure' },
+  webServer: base ? undefined : { command, url: `http://127.0.0.1:${port}`, reuseExistingServer: true },
   projects: [
     { name: 'desktop', use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 } } },
     { name: 'phone', use: { ...devices['Pixel 5'] } },

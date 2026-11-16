@@ -1,0 +1,11 @@
+{
+  "comment": "Label rules shared by TestLabelRulesFixture (Go) and web/host/src/lib/labels.test.ts, so the console checks what the server checks. A case is a list of parts; a part is a string or [string, times].",
+  "keys": {
+    "valid": [["env"], ["a"], ["Z9"], ["jailops.app"], ["jailops.app.version"], ["example.org/tier"], ["Team_1"], ["a-b.c_d"], [["x", 63]], [["p", 253], "/n"], ["a.b-c/x_y"]],
+    "invalid": [[""], ["-env"], ["env-"], [".env"], ["env."], ["_env"], ["e nv"], ["env=x"], ["a/b/c"], ["/name"], ["prefix/"], ["pre_fix/name"], [["x", 64]], [["p", 254], "/n"], ["ümlaut"], ["a:b"], ["tab\tkey"]]
+  },
+  "values": {
+    "valid": [[""], ["prod"], ["web ops, 2026"], [["x", 253]], [["ä", 126]], ["café"], ["日本"], ["emoji 🚀"]],
+    "invalid": [[["x", 254]], [["ä", 127]], ["a\nb"], ["tab\there"], ["esc\u001b[31m"], ["del\u007f"], ["c1\u0085"], ["rtl‮"], ["lrm‎"], ["zw​"], ["wj⁠"], ["bom﻿"], ["iso⁦"], ["nul\u0000"]]
+  }
+}

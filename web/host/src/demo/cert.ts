@@ -36,7 +36,7 @@ export function certificate(st: CertState, now = Date.now()): HostCertificate {
   }
   const out: HostCertificate = { kind: 'HostCertificate', source: st.source, current: structuredClone(st.current), configured: false, listener: true }
   const host = st.source === 'self-signed' ? HOST : st.current.names[0]
-  out.remote_add = st.current.public_ca ? `jailops remote add bsd01 https://${host}:${PORT} --token-stdin` : `jailops remote add bsd01 https://${host}:${PORT} --fingerprint ${st.current.fingerprint} --token-stdin`
+  out.remote_add = st.current.public_ca ? `jailops remote add bsd01 https://${host}:${PORT} --token-file -` : `jailops remote add bsd01 https://${host}:${PORT} --fingerprint ${st.current.fingerprint} --token-file -`
   if (st.source === 'acme' && a) {
     const ch = a.challenge ?? 'http-01'
     out.stored = true
@@ -46,7 +46,7 @@ export function certificate(st: CertState, now = Date.now()): HostCertificate {
     out.redirect = { managed: true, applied: false }
   }
   if (st.source === 'uploaded') out.stored = true
-  if (st.current.self_signed) out.warnings = ['browsers warn about a self-signed certificate until it is trusted or replaced']
+  if (st.current.self_signed) out.warnings = ['the certificate is self-signed: browsers warn, and clients pin its fingerprint']
   return out
 }
 

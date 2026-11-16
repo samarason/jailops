@@ -100,7 +100,7 @@ func TestNDPOpenPassesADescriptor(t *testing.T) {
 		t.Errorf("captured %v", got)
 	}
 	// An uplink the operator did not approve gets nothing, and the device is never opened for it.
-	if _, err := c.NDPOpen(ctx, "igb0", false); !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), "ndp-proxy = igb0=") {
+	if _, err := c.NDPOpen(ctx, "igb0", false); !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), "no network in IPv6 proxy mode uses") {
 		t.Errorf("an uplink outside the approval: %v", err)
 	}
 	if len(dev.captures()) != 3 {

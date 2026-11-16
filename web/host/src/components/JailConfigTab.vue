@@ -8,7 +8,7 @@ import { runOp } from '@jailops/shared/composables/ops'
 import { lifecycle } from '@/composables/jailActions'
 import Callout from '@jailops/shared/components/Callout.vue'
 import ErrorPanel from '@jailops/shared/components/ErrorPanel.vue'
-import { rowsFor, grouped, getValue, setValue, validate, diff, configChange, type Row } from '@/lib/configKeys'
+import { rowsFor, grouped, getValue, setValue, validate, diff, configChange, helpText, type Row } from '@/lib/configKeys'
 import type { ConfigResult } from '@/types'
 import type { Jail } from '@jailops/shared/api/types'
 
@@ -109,6 +109,7 @@ async function restart(): Promise<void> {
     <section v-for="[g, list] in groups" :key="g" class="panel" :data-group="g">
       <header><h2>{{ s.config.groups[g] ?? g }}</h2></header>
       <div class="table-wrap"><table>
+        <thead class="sr-only"><tr><th>{{ s.profiles.key }}</th><th>{{ s.profiles.value }}</th></tr></thead>
         <tbody>
           <tr v-for="r in list" :key="r.name" :data-key="r.name" :class="{ drift: delta.changed.includes(r.name) }">
             <td style="width: 34%">
@@ -128,7 +129,7 @@ async function restart(): Promise<void> {
               </select>
               <input v-else :id="'k-' + r.name" class="mono" :class="{ invalid: errors[r.name] }" type="text" :value="read(r)" :disabled="fixed(r)" :placeholder="r.key.example" :aria-invalid="!!errors[r.name]" @input="edit(r, ($event.target as HTMLInputElement).value)" />
               <span v-if="errors[r.name]" class="err" data-test="config-error">{{ errors[r.name] }}</span>
-              <span class="hint faint">{{ r.key.name === 'shell' ? s.config.shellHint : r.key.description }}</span>
+              <span class="hint faint">{{ r.key.name === 'shell' ? s.config.shellHint : r.key.name === 'prompt' ? s.config.promptHint : helpText(r.key.description) }}</span>
             </td>
           </tr>
         </tbody>

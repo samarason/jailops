@@ -20,9 +20,9 @@ function recorded(): { sent: RawRequest[] } {
   return { sent }
 }
 
-/** Let the pending promises and timers run, and wait until `until` holds (up to five seconds: a loaded CI machine is slow). */
+/** Let the pending promises and timers run, and wait until `until` holds (up to twenty seconds: a loaded CI machine is slow). */
 async function settle(until?: () => boolean): Promise<void> {
-  const deadline = Date.now() + 5000
+  const deadline = Date.now() + 20000
   for (let i = 0; i < 20 || (until && !until() && Date.now() < deadline); i++) {
     await flushPromises()
     await new Promise((r) => setTimeout(r, 5))
@@ -44,7 +44,7 @@ describe('UnlockDialog', () => {
 
   it('hides the passphrase until asked, never echoes it and clears it', async () => {
     const { sent } = recorded()
-    const w = mount(UnlockDialog, { props: { open: true, jail: 'vault' }, global: { stubs: { Teleport: true } } })
+    const w = mount(UnlockDialog, { props: { open: true, volume: 'secrets' }, global: { stubs: { Teleport: true } } })
     await w.vm.$nextTick()
     const input = () => w.get('[data-test="unlock-pass"]')
     expect(input().attributes('type')).toBe('password')
@@ -72,7 +72,7 @@ describe('UnlockDialog', () => {
     expect(w.emitted('done')).toBeTruthy()
     expect(w.emitted('close')).toBeTruthy()
     for (const r of sent) expect(r.path).not.toContain(demoVaultPassphrase)
-    expect(sent.find((r) => r.path.includes('/unlock'))?.path).toBe('/jails/vault/unlock?project=web')
+    expect(sent.find((r) => r.path.includes('/unlock'))?.path).toBe('/volumes/secrets/unlock?project=web')
     const stored = JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage })
     expect(stored).not.toContain(demoVaultPassphrase)
     expect(stored).not.toContain(WRONG)
@@ -80,7 +80,7 @@ describe('UnlockDialog', () => {
 
   it('forgets a typed passphrase when the dialog closes', async () => {
     recorded()
-    const w = mount(UnlockDialog, { props: { open: true, jail: 'vault' }, global: { stubs: { Teleport: true } } })
+    const w = mount(UnlockDialog, { props: { open: true, volume: 'secrets' }, global: { stubs: { Teleport: true } } })
     await w.get('[data-test="unlock-pass"]').setValue('typed-but-not-sent')
     await w.setProps({ open: false })
     await w.setProps({ open: true })
@@ -90,7 +90,7 @@ describe('UnlockDialog', () => {
 
   it('shows the lockout hint after five wrong passphrases', async () => {
     recorded()
-    const w = mount(UnlockDialog, { props: { open: true, jail: 'vault' }, global: { stubs: { Teleport: true } } })
+    const w = mount(UnlockDialog, { props: { open: true, volume: 'secrets' }, global: { stubs: { Teleport: true } } })
     for (let i = 0; i < 6; i++) {
       await w.get('[data-test="unlock-pass"]').setValue(WRONG)
       await w.get('form').trigger('submit')
@@ -109,7 +109,7 @@ describe('PassphraseDialog', () => {
   it('checks length and match before sending, and sends old and new once', async () => {
     POLL_MS.value = 1
     const { sent } = recorded()
-    const w = mount(PassphraseDialog, { props: { open: true, jail: 'vault' }, global: { stubs: { Teleport: true } } })
+    const w = mount(PassphraseDialog, { props: { open: true, volume: 'secrets' }, global: { stubs: { Teleport: true } } })
     await w.get('#pc-old').setValue(demoVaultPassphrase)
     await w.get('#pc-new').setValue('short')
     expect(w.get('[data-test="pass-error"]').text()).toBe('Use at least 12 characters.')
@@ -119,7 +119,7 @@ describe('PassphraseDialog', () => {
     await w.get('#pc-again').setValue('a-new-long-passphrase')
     await w.get('form').trigger('submit')
     await settle()
-    // the demo jail is locked: the host refuses, and nothing typed is shown back
+    // the demo volume is locked: the host refuses, and nothing typed is shown back
     expect(sent.find((r) => r.path.includes('/passphrase'))?.body).toEqual({ old_passphrase: demoVaultPassphrase, new_passphrase: 'a-new-long-passphrase' })
     expect(w.html()).not.toContain('a-new-long-passphrase')
     expect((w.get('#pc-old').element as HTMLInputElement).value).toBe('')

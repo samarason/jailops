@@ -21,7 +21,13 @@ non-JSON error body (a proxy, a crash) is mapped from the status: 400 invalid, 4
 ## Conventions
 
 - `GET /api/v1` returns `api.ServerInfo` (allowed unauthenticated; `auth` says how the caller was seen).
-  `api_extensions` drives `Client.Has`.
+  `api_extensions` drives `Client.Has`. An `untrusted` caller gets `api_version`, `api_extensions`, `role` and
+  `auth` only; the software version, host name, host UUID, environment and secrets recipient need an identity.
+- Request bodies are strict: a member the request type does not have (a misspelled option), a member in other
+  cases, a member twice and anything after the JSON value are `invalid` (400), and the message names the member.
+  The `status` of an object sent back with it is ignored. Maps (`labels`, configuration keys) and merge patches
+  take any key.
+- Every API answer carries `Cache-Control: no-store` (and `Pragma: no-cache`).
 - Lists: `GET /api/v1/<resource>` returns `metadata` as an array of full objects (never URLs). Optional
   `?label=k=v` (repeatable, AND) and `?recursion=n` (reserved).
 - Items: `/api/v1/<resource>/<name>`. `GET` sends `ETag: "<generation>"`.
@@ -29,7 +35,7 @@ non-JSON error body (a proxy, a crash) is mapped from the status: 400 invalid, 4
   The server owns `uuid`, `scope`, `host`, `created_at` and all `status`; clients cannot change them.
   `PATCH` applies a JSON merge patch (RFC 7386) with the same `If-Match` rule.
   Responses to `PUT`/`PATCH` carry the new `ETag`. `generation` increases when the stored object changes.
-- Creates are `POST /api/v1/<resource>` with the full object. Names: lowercase letters, digits, `-_.`.
+- Creates are `POST /api/v1/<resource>` with the full object. Names: lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen (`^[a-z]([a-z0-9-]*[a-z0-9])?$`), at most 63 characters unless a derived name sets a shorter limit (a project 13, a jail 29, an address set 29).
 - Operation results: on success `operation.metadata` is the resulting object (for example the `Jail`);
   when it is empty the client fetches the object by name where it knows it.
 - Multi-host (hub): add `?host=<uuid-or-name>` to any request, including `/api/v1/events`. The hub
@@ -43,24 +49,37 @@ non-JSON error body (a proxy, a crash) is mapped from the status: 400 invalid, 4
 
 | Method and path | Request | Reply |
 |---|---|---|
-| `GET /api/v1` | | `ServerInfo` |
-| `/api/v1/jails` GET, POST | `Jail`; POST also `JailCreate` (`volume_passphrase` for volumes with `encrypted: true`, never returned) | list; POST async, result `Jail` |
+| `GET /api/v1` | | `ServerInfo`; `environment.kernel_version` is the host's `kern.osrelease` (`15.1-RELEASE-p3`), empty when it cannot be read: the console proposes it, without the patch level, as the release of the base image |
+| `GET /healthz` | | `ok`, plain text, always 200: liveness, the process answers. Public, not in the access log |
+| `GET /readyz` | | plain text, `ok` (200) or `not ready: CLASS` (503), CLASS one of `starting`, `stopping`, `helper`, `storage`, `store`: start-up finished, the helper answers a read-only call (the JailOps dataset exists), the database answers a query. Cached for 2 s; `?host=` is not forwarded. Public, not in the access log |
+| `/api/v1/jails` GET, POST | `Jail` (`spec.volumes`: `{volume, mount, read_only}`, volumes of the project that exist) | list; POST async, result `Jail` |
 | `/api/v1/jails/<n>` GET, PUT, PATCH, DELETE | | `Jail`; DELETE async |
 | `GET /api/v1/jails/<n>/state` | | `JailStatus` |
 | `GET /api/v1/jails/<n>/usage` | | `JailUsage`, measured for this reply and never stored: `accounting` (processes, `cpu_seconds`, `memory_bytes` from racct through `rctl -u`) only while the jail runs, with `error` instead of numbers when racct is off; `disk` (`root_bytes` and `root_referenced_bytes` of the root dataset, `data_bytes` of the persistent datasets and volumes) always, with `error` when a dataset cannot be read. Readonly; the jail list does not carry it (`jail_usage`) |
 | `PUT /api/v1/jails/<n>/state` | `JailAction` (start, stop, restart) | async, result `Jail` |
-| `POST /api/v1/jails/<n>/unlock` | `JailUnlock` (`passphrase`, `start`) | async, result `Jail`: loads the keys of the jail's encrypted volumes and starts it with `start` or when the boot wanted to; `bad_passphrase` (403) fails the operation, five in a row answer `rate_limited` (429) for 30 seconds; `invalid` for a jail without an encrypted volume. Operator (`volume_unlock`) |
-| `POST /api/v1/jails/<n>/lock` | | async, result `Jail`: stops the jail, unmounts its datasets, unloads the keys; state `locked`. Operator (`volume_unlock`) |
-| `POST /api/v1/jails/<n>/passphrase` | `JailPassphraseChange` (`old_passphrase`, `new_passphrase`, 12 to 512 bytes) | async, result `Jail`; the jail must be unlocked (`locked` otherwise). Admin (`volume_unlock`) |
+| `/api/v1/volumes` GET, POST | `Volume`; POST takes `VolumeCreate` (`passphrase` for an encrypted volume, never returned) | list; POST async, result `Volume` (extension `volumes`) |
+| `/api/v1/volumes/<n>` GET, PUT, PATCH, DELETE | `Volume` | `Volume`; a PUT changes labels, comment and `size` only; DELETE async, `busy` while a jail attaches it |
+| `POST /api/v1/volumes/<n>/unlock` | `VolumeUnlock` (`passphrase`, `start`) | async, result `Volume`: loads the key and, with `start` or when the boot wanted to, starts the jail that attaches it; `bad_passphrase` (403) fails the operation, five in a row answer `rate_limited` (429) for 30 seconds. Operator |
+| `POST /api/v1/volumes/<n>/lock` | | async, result `Volume`: stops the jail that attaches it, unmounts the volume, unloads the key. Operator |
+| `POST /api/v1/volumes/<n>/passphrase` | `VolumePassphraseChange` (`old_passphrase`, `new_passphrase`, 12 to 512 bytes) | async, result `Volume`; the volume must be unlocked (`locked` otherwise). Admin |
+| `/api/v1/volumes/<n>/snapshots` GET, POST | `VolumeSnapshot` (name optional) | list; POST async, result `VolumeSnapshot` |
+| `DELETE /api/v1/volumes/<n>/snapshots/<s>` | | async |
+| `POST /api/v1/volumes/<n>/rollback` | `VolumeRollback` (`snapshot`, `confirm_data_loss` required) | async, result `Volume`; refused while a jail that attaches the volume runs |
+| `GET /api/v1/jails/<n>/volumes` | | the jail's `VolumeAttach` list |
+| `POST /api/v1/jails/<n>/volumes` | `VolumeAttachRequest` (`volume`, `mount`, `read_only`, `copy_existing`) | async, result `Jail`; the jail must be stopped (`busy`) |
+| `DELETE /api/v1/jails/<n>/volumes/<volume>` | | async, result `Jail`; the volume and its files stay |
 | `/api/v1/jails/<n>/snapshots` GET, POST | `JailSnapshot` (name optional) | list; POST async, result `JailSnapshot` |
 | `/api/v1/jails/<n>/snapshots/<s>` GET, DELETE | | `JailSnapshot`; DELETE async |
 | `POST /api/v1/jails/<n>/rollback` | `JailRollback` | async, result `Jail`; data/all without `confirm_data_loss` is `data_loss_unconfirmed` |
 | `POST /api/v1/jails/<n>/upgrade` | `JailUpgrade` | async, result `Jail` |
+| `POST /api/v1/<kind>/<n>/rename` for `networks`, `firewall/address-sets`, `firewall/policies`, `profiles`, `jails`, `images`, `projects` | `Rename` (`new_name`, `dry_run`); `If-Match` optional | `dry_run`: sync `RenameResult` (`changes`, `counts`, `steps`, `warnings`), nothing changes; otherwise async, result `RenameResult`. The object and every reference to it change in one operation or not at all; a jail must be stopped (`busy`), a project's jails too; a `managed_by` object is `forbidden`. Admin; networks, images and projects need a global admin (`rename`) |
 | `GET /api/v1/jails/<n>?expanded=true` | | `JailExpanded`: the jail with its profiles merged in (`spec` is the effective spec) and `sources`, the origin of every key (`jail` or `profile:<name>`) |
 | `POST /api/v1/jails/<n>/config?restart=true` | `ConfigChange` (`set`, `unset`) | async, result `{...Jail, restart_required: [keys], restarted}`; **never restarts the jail unless `restart=true`**, and then only when a changed key needs it |
 | `POST /api/v1/jails/<n>/exec` | `ExecRequest` | upgrade to a framed stream, see Exec |
 | `GET /api/v1/jails/<n>/logs` | | `[]JailLogFile`: the regular files below `/var/log` of the jail root, one directory deep (`name`, `size`, `modified_at`, `kind` active or rotated, `compressed`), sorted by name; running or stopped, `busy` ("jail not mounted", the hint names the dataset) while the root of a stopped jail is not mounted. Operator (`jail_logs`) |
 | `GET /api/v1/jails/<n>/logs/<file>?tail=N&since=T&grep=S&offset=O` | | `JailLogRead`: the last `tail` lines (default 200, at most 5000) of the file (a name below `/var/log`, segments `[A-Za-z0-9._-]+` not starting with a dot, at most two), read from at most 1 MiB before its end; `since` (RFC 3339 or a duration such as `15m`) keeps the lines whose timestamp is not older, a line without one belonging to the preceding line; `grep` (plain substring, case-insensitive, at most 128 bytes) keeps the lines containing it; `offset` continues from `next_offset` of a previous reply. `lines` are `{n, text}` (`n` when the reply starts at the beginning of the file), `next_offset` the size when read, `rotated` when the file was shorter than `offset` (the reply then starts over), `truncated` when a limit left lines out. A compressed rotated copy is `invalid` ("not readable (compressed)"). Operator; audited (`jail_logs`) |
+| `POST /api/v1/firewall/test` | `FirewallTestRequest`: `from`, `to` (`jail:NAME`, an address, `host`), `proto`, `port`, `icmp_type`, `family` | `FirewallTestResult`: `verdict` `pass`, `block` or `unknown`, `cases` (`family`, `from`, `to`, `proto`, `port`, `icmp_type`, `verdict`, `hops`: `side`, `jail`, `anchor`, `interface`, `direction`, `verdict`, `decided_by` (`stage`, `policy`, `rule`, `name`, `comment`, `pf`), `skipped` (`rule`, `why`), `why`, `loaded_matches_rendered`), `caveats`. Operator in the project; reads only |
+| `GET /api/v1/boot` | | `BootPlan`: `order` (`position`, `project`, `jail`, `priority`, `depends?`, `reason` `autostart` or `dependency of NAME`, `running?`) is what the daemon starts after a boot of the host, in order (a jail after its `boot.depends`, which start even without autostart, then the lower `boot.priority`, then the key), `not_started` (`project`, `jail`, `reason`) the jails with autostart a boot does not start: a dependency cycle or a dependency that does not exist, an encrypted volume that waits for its passphrase, a jail that depends on such a jail. The order is the host's: the reply holds the jails of the request's project, or of every project the caller may use when `all_projects=true` is given, numbered again. Readonly (`boot_plan`) |
 | `GET /api/v1/logs?jail=J&label=K=V&app=A&app_logs=true&file=F&tail=N&since=T&grep=S&cursor=C` | | `LogsRead`: the end of one file (`file`, default `messages`) of every jail of the request's project, or of every project the caller may use when `all_projects=true` (or no project) is given, narrowed by `jail` and `label` (repeatable) and `app` (the `jailops.app` label); `app_logs=true` adds the files the jails' apps declare below `/var/log`. Each file is read like `GET .../logs/<file>` (`tail`, `since`, `grep` per file) and the lines are merged by the timestamp they start with (RFC 3339, RFC 5424, `YYYY-MM-DD HH:MM:SS`, `Mon DD HH:MM:SS` in the current year or the one before, the bracketed web form); a line without one keeps its place after the line before it in its file, equal times keep the order of the files. `lines` are `{time?, project, jail, app?, file, line}`, `sources` `{key, project, jail, app?, file, next_offset, rotated?, truncated?, error?}` (a file that could not be read, such as a jail that is not mounted, carries the error and the rest are read), `next` maps `project/jail/file` to the offset to continue from: send it back as `cursor` (JSON, at most 32 KiB). At most 50 files and 2000 lines (the newest); `truncated` when something was left out. Operator; audited once per identity and selection every five minutes (`logs_unified`) |
 | `GET /api/v1/logs/forward` | | `LogForward`: `spec.sinks` (`name`, `type` syslog or webhook, `to`, `facility`, `ca_file`, `token_file`, `queue`, `sources`) and `status`: `origin` (`config`: logging.forward of jailopsd.yaml; `api`: a stored list), `generation` (also the ETag; 0 for the file's list), `updated_at`, `sinks` (`name`, `type`, `to`, `sources`, `sent`, `queued`, `dropped`, `skipped_bytes`, `last_success`, `failing_since`, `last_error`, `warning`). Global admin (`log_forward`) |
 | `PUT /api/v1/logs/forward` | `LogForwardSpec` | `LogForward`; stores the list, which replaces the file's. `If-Match` is the generation read (0 while the file's list is in force); a stale one is `conflict`. Invalid lists, and a `ca_file` or `token_file` that is not a regular root-owned file writable by nobody else (the token file not readable by others either) are `invalid`. Global admin; audited (`log_forward`) |
@@ -68,10 +87,11 @@ non-JSON error body (a proxy, a crash) is mapped from the status: 400 invalid, 4
 | `POST /api/v1/logs/forward/test` | `LogForwardTest` (`sink`) | `LogForwardTestResult`: `sink`, `ok`, `line` (the tagged line sent), `error`, `millis`; a failed send is `ok: false`, not an error; an unknown sink is `not_found`. Global admin; audited (`log_forward`) |
 | `GET /api/v1/jails/<n>/app-draft` | | `AppDraft`: a definition drafted from a running FreeBSD jail, for a person to complete (docs/apps.md, "Write your own app"): `definition` (valid as it is, with `TODO` in the values a jail cannot tell: summary, description, license, notes, a secret-looking rc.conf knob), `todo` (a top-level key of the definition and what is left to do there) and `findings` (what was found and what was left out, one line each). It reads and changes nothing: the packages installed on purpose (`pkg -r <root> query -e "%a = 0" "%n %v %R %w"` on the host, through the helper), `/etc/rc.conf` (services with `<name>_enable` set to yes and their knobs, base services left out), in the jail `sockstat -4 -6 -l -q`, the names of the files below `/usr/local/etc` and `/var/log` newer than pkg's database (`find`), and the owners of the volumes, of the log directories and of `/var/run/<service>` (`stat`), which become `setup` lines. It never reads a configuration file. `busy` while the jail is stopped or an app is being installed into it, `invalid` for a Linux jail. Operator; audited (`app_draft`) |
 | `GET /api/v1/jails/<n>/access` | | `AppAccess` of an installed app (docs/apps.md, "Who may connect"): `jail`, `project`, `app`, `type` (`postgresql` for a definition with an access block), `policy` (the managed firewall policy `app-<jail>`), `closed` (the policy denies by default), `ports` (what a grant opens by default), `grants` (`source` in canonical form, `source_kind`, `source_project`, `addresses`, `ports`, `database`, `role`, `role_created`, `database_created`, `rules` as typed text, `pf` the lines of the rendered anchor, `hba` the `pg_hba.conf` lines, `created_at`, `updated_at`, `created_by`, `problems`: drift), `warnings`. Never a password. `invalid` for a jail without the label `jailops.app`. Readonly (`app_access`) |
-| `POST /api/v1/jails/<n>/access` | `AppAllow` (`source`: `@jail`, `@project/jail`, `@set`, an address or prefix, or `host`; `ports` `N[/proto]`; `database`; `rotate`; `dry_run`) | `AppAllowResult` at once, not an operation: `grant`, `changed` (false when it existed as it is), `connection_string` (only when a role was made or rotated: shown once, stored nowhere), `sql` (the password left out), `steps`, `notes`. Writes the managed policy and, for a postgresql app, runs psql as postgres in the jail with the statements on stdin and the `pg_hba.conf` block. `busy` for a stopped jail of a postgresql app, `conflict` for a role or database JailOps did not make or another database for the same source, `not_found` for an unknown source or a project the caller may not use. Operator; audited with the source, ports and database name |
+| `POST /api/v1/jails/<n>/access` | `AppAllow` (`source`: `jail:NAME`, `set:NAME`, an address or prefix, or `host`; `ports` `N[/proto]`; `database`; `rotate`; `dry_run`) | `AppAllowResult` at once, not an operation: `grant`, `changed` (false when it existed as it is), `connection_string` (only when a role was made or rotated: shown once, stored nowhere), `sql` (the password left out), `steps`, `notes`. Writes the managed policy and, for a postgresql app, runs psql as postgres in the jail with the statements on stdin and the `pg_hba.conf` block. `busy` for a stopped jail of a postgresql app, `conflict` for a role or database JailOps did not make or another database for the same source, `not_found` for an unknown source or a project the caller may not use. Operator; audited with the source, ports and database name |
 | `POST /api/v1/jails/<n>/access/deny` | `AppDeny` (`source`, `drop_role`, `dry_run`) | `AppDenyResult`: `removed`, `changed`, `sql`, `steps`, `notes`; the role JailOps made loses its login (or is dropped with `drop_role`, its objects reassigned to postgres, the database kept). Operator; audited |
 | `GET /api/v1/jails/<n>/updates` | | `[]UpdateRecord`, newest first (`updates`) |
 | `POST /api/v1/jails/<n>/provision` | `ProvisionRequest` (`again`) | async, result `ProvisionResult`; `already_exists` when it ran before and `again` is not set (`provisioning`) |
+| `POST /api/v1/jails/<n>/shell-setup` | `ShellSetupRequest` (empty) | async, result `ShellSetupResult` (`jail`, `shell`, `prompt`, `ps1`, `steps`): the keys `shell` and `prompt` the jail leaves empty are set from `jails.*` of `jailopsd.yaml`, bash is installed with `pkg -r ROOT` when it is the shell and missing, the prompt file and the blocks are written (docs/shell.md). `busy` for a stopped jail, `invalid` for a Linux jail. Operator (`jail_shell_setup`) |
 | `GET /api/v1/config-keys` | | `[]ConfigKey`: the key registry (name, type, values, description, example, `restart_required`, `profile`, `admin`, `path` into the spec); any authenticated identity |
 | `GET /api/v1/apps` | | `[]AppSummary`: the application catalog (docs/apps.md), every definition sorted by name, invalid ones with `valid: false` and `error`; `source` is `catalog` (`apps.catalog_dir`) or `local` (`apps.local_dir`), and a local definition that hides a packaged one of the same name carries `overrides: catalog`; any authenticated identity (`apps`) |
 | `GET /api/v1/apps/<n>` | | `AppDetail`: the `definition` with defaults filled in, `hash` (`sha256:<hex>` of the file), `file`, `icon` (a data URI), `source` and `overrides` as in the list (the local definition is the one answered when both directories have the name); `invalid` with the reason for an invalid definition, `not_found` for an unknown name (`apps`) |
@@ -102,7 +122,7 @@ non-JSON error body (a proxy, a crash) is mapped from the status: 400 invalid, 4
 | `GET /api/v1/host/snapshots` | | `[]HostSnapshot`, newest first (`reason` apply, adopt (the first apply of a module, which keeps the administrator's file) or restore; `module` identity or firewall); at most 20 are kept. Global identity, readonly |
 | `POST /api/v1/host/snapshots/<name>/restore` | `HostRestore` (optional) | sync `HostChange`: the files of the snapshot back byte for byte (`<name>` or `latest`), the host name it recorded, ntpd restarted or stopped to match (a firewall snapshot: `/etc/pf.conf` loaded with `pfctl -f` and pf on or off as it was); `snapshot` names the copy of what it replaced. The module of the snapshot must be enabled; `busy` while a change waits for its confirmation. `dry_run` as above. `not_managed` as above. Global admin; audited |
 | `GET /api/v1/host/firewall` | | `HostFirewall`: `spec` is what was applied last or the default (`template` default, ssh port 22, `icmp`), `status` the management state, `file_managed`, `drift` (`pf.conf`, `pf_enable`, `pf_rules`), `pf_enabled` (omitted when pfctl did not answer), `rules` in plain words, `warnings`, `pending`, `console_port`. Works whether the module is enabled or not. Global identity, readonly (`host_firewall`) |
-| `PUT /api/v1/host/firewall` | `HostFirewallApply` | sync `HostChange`: the spec is applied whole (`/etc/pf.conf` rendered by the helper around the three anchor lines, checked with `pfctl -n`, loaded with `pfctl -f`, pf turned on when it was off, `pf_enable` and `pf_rules` set). `dry_run` returns `diff`, `rules`, `actions`, `warnings` and changes nothing. A real change returns `snapshot` and `pending`: it reverts at `pending.deadline` (`confirm_within` seconds, default 120, 10 to 1800) unless confirmed. `forbidden` with detail `guard=lockout` when the caller's address would reach neither ssh nor the console; `invalid` with detail `guard=unknown_peer` without `i_know` when the address is unknown (unix socket, hub); `busy` with `detail.pending` while another change waits; `not_managed`, `invalid` and `unsupported` (`nat`) as usual. Global admin; audited (detail `dry_run` or `snapshot=<name> pending=<id>`) |
+| `PUT /api/v1/host/firewall` | `HostFirewallApply` | sync `HostChange`: the spec is applied whole (`/etc/pf.conf` rendered by the helper around the three anchor lines, checked with `pfctl -n`, loaded with `pfctl -f`, pf turned on when it was off, `pf_enable` and `pf_rules` set). `dry_run` returns `diff`, `rules`, `actions`, `warnings` and changes nothing. A real change returns `snapshot` and `pending`: it reverts at `pending.deadline` (`confirm_within` seconds, default 120, 10 to 1800) unless confirmed. `forbidden` with detail `guard=lockout` when the caller's address would reach neither ssh nor the console; `invalid` with detail `guard=unknown_peer` without `confirm_lockout` when the address is unknown (unix socket, hub); `busy` with `detail.pending` while another change waits; `not_managed`, `invalid` and `unsupported` (`nat`) as usual. Global admin; audited (detail `dry_run` or `snapshot=<name> pending=<id>`) |
 | `GET /api/v1/host/certificate` | | `HostCertificate`: the served certificate (`current`), its `source`, `acme` state, `redirect`, `remote_add`. Global identity, readonly (`host_certificate`) |
 | `PUT /api/v1/host/certificate` | `HostCertificateUpload` | sync `HostCertificate`: the chain and key are checked, written 0600 and served from the next handshake on. `invalid` with the reason; `conflict` when `jailopsd.yaml` names the files. Global admin; audited |
 | `POST /api/v1/host/certificate/acme` | `ACMESpec` | sync `HostCertificate` with `acme.state` `requesting`; the order runs in the background. `invalid` (terms, names, email, directory), `unsupported` (a wildcard). Global admin; audited |
@@ -132,7 +152,7 @@ non-JSON error body (a proxy, a crash) is mapped from the status: 400 invalid, 4
 | `GET /api/v1/audit` | | `[]AuditEntry`, newest first; admin (`audit_log`) |
 | `GET /api/v1/doctor` | | `DoctorReport`: checks with `ok`, `info` (a fact that is not a fault; counts as ok), `warn`, `fail` or `unknown` (`doctor`) |
 | `GET /api/v1/resources` | | host resources and usage (`resources`) |
-| `POST /api/v1/jails/<n>` | copy or rename request | async, result `Jail` (`jail_copy`) |
+| `POST /api/v1/jails/<n>` | copy request | async, result `Jail` (`jail_copy`) |
 
 ### Console
 
@@ -214,10 +234,11 @@ users, certificates, tokens, remotes and the server configuration.
   `jails`, `cpu`, `memory`, `pids` and `addresses` are sums over the project's jails. A project with a
   `cpu`, `memory` or `pids` quota requires every jail to set the matching `resources` limit (`invalid`
   otherwise). The per-storage `quota` is applied as a ZFS quota on the project dataset.
-- `spec.firewall` names a policy of the project that is rendered before every jail's own policy in the
-  jail's anchor `jailops/<project>/<jail>`; only a global admin may edit or delete that policy or change
-  the field. `spec.images`, when not empty, restricts the images a jail may use.
-- `POST /api/v1/projects` with `spec.new_network: true` creates a dedicated bridge and subnet from the
+- `spec.firewall_policies` lists the policies of the project that are rendered, in this order, before every jail's own
+  policies (`spec.firewall.policies` of the jail, also a list) in the jail's anchor `jailops/<project>/<jail>`; only a
+  global admin may edit or delete one of them or change the field. A jail's list may not name one of them, nor a
+  managed policy, and names none twice. `spec.images`, when not empty, restricts the images a jail may use.
+- `POST /api/v1/projects` with `spec.new_network: true` creates a dedicated network with a subnet from the
   server's pool of subnets, grants it to the project and stores the project with the flag cleared
   (`unsupported` when the server has no pool configured).
 - A project is deleted only when it holds no jails, policies, address sets or backup policies
@@ -263,7 +284,7 @@ call the `/api/v1/auth/*` self-service routes and the public routes. Creating an
 (`forbidden`) and then the object's project (`not_found`). Host-level writes need a global admin
 (`forbidden` otherwise). Unix socket: the peer uid 0 (root) is a global admin (kind `unix`, the host's recovery
 access); every other local peer is anonymous, exactly like an unauthenticated remote client, and reaches only the public
-routes (`GET /api/v1`, `GET /healthz`, `POST /api/v1/auth/login`, `POST /api/v1/trust/clients`, `POST /api/v1/cluster/join`, the static
+routes (`GET /api/v1`, `GET /healthz`, `GET /readyz`, `POST /api/v1/auth/login`, `POST /api/v1/trust/clients`, `POST /api/v1/cluster/join`, the static
 console) until it authenticates with a token or a session cookie. No Unix user or group maps to a role.
 
 - `GET /api/v1/auth/session` returns `Identity` (`user`, `kind`, `permission`, `projects`, `global`).
@@ -285,8 +306,11 @@ console) until it authenticates with a token or a session cookie. No Unix user o
   cannot exceed its permission and the claimed scope must lie inside its `projects` (or it needs `global`).
   The header is rejected (`forbidden`) on the unix socket, with a token, with a session and with a
   non-hub certificate. Without a claim a hub certificate acts with the rights of its own entry only.
-- `GET /api/v1/sessions` lists the caller's sessions (a global admin sees all); `DELETE /api/v1/sessions/<id>`
-  revokes one (own sessions, or any for a global admin). Revocation ends the session on its next request.
+- `GET /api/v1/sessions` lists the caller's sessions (a global admin sees all; a global identity with a lower role
+  only its own); `DELETE /api/v1/sessions/<id>` revokes one (own sessions, or any for a global admin). Revocation ends
+  the session on its next request, and its event streams, console outputs and exec sessions at the next keepalive.
+- `POST /api/v1/auth/totp` starts an enrolment with `{"password": ...}` and confirms it with `{"code": ...}`;
+  `POST /api/v1/auth/recovery-codes` takes `{"password": ...}`. A missing or wrong password is `unauthorized`.
 - Failed authentication (bad token, unknown or revoked certificate on a non-public route, bad trust token)
   is rate limited per source and audited as `denied`.
 
@@ -301,7 +325,9 @@ data: <api.Event as one line of JSON>
 
 ```
 
-`?type=` filters. A client that reconnects sends `Last-Event-ID`; the server replays retained events
+`?type=` filters. The credential travels in the `Authorization` header (a token in the query string is not
+accepted). One identity holds at most 16 streams (`rate_limited`, 429, beyond); a stream ends when its credential
+is deleted, disabled or changed. A client that reconnects sends `Last-Event-ID`; the server replays retained events
 with a larger id, then continues live. Without it the stream starts at "now". A `retry:` field sets
 the reconnect delay. Lines beginning with `:` are comments (keep-alives). Lifecycle metadata is
 `api.LifecycleEvent` with actions like `jail-created`, `jail-started`, `network-updated`, and `app.installed` or
@@ -330,10 +356,13 @@ lists the name, and otherwise reports `unsupported`.
 | `jail_console` | `POST /api/v1/jails/<n>/console` and the session routes | see Console |
 | `sealed_secrets` | `secrets_recipient` in `ServerInfo` | the age public key of the host; a jail `env` value `sealed:age:<base64>` is opened by the daemon only when it starts a process in the jail (design 18.8) |
 | `audit_log`, `doctor`, `resources` | `GET /api/v1/audit`, `/api/v1/doctor`, `/api/v1/resources` | see Routes |
-| `jail_copy` | `POST /api/v1/jails/<n>` | copy or rename |
+| `jail_copy` | `POST /api/v1/jails/<n>` | copy |
+| `rename` | `POST /api/v1/<kind>/<n>/rename` | renames with every reference; `jailops <kind> rename OLD NEW`, `jailops rename` for a jail; see Routes and docs/design.md 8.8 |
 | `image_upgrade` | `POST /api/v1/images/<n>/upgrade` | build the next generation and move the jails that use the image; see Routes |
 | `jail_usage` | `GET /api/v1/jails/<n>/usage` | what a jail uses now; `jailops jail info` reads it; see Routes |
 | `jail_logs` | `GET /api/v1/jails/<n>/logs`, `GET .../logs/<file>` | the log files of a jail root and the end of one; `jailops jail logs` reads them; see Routes |
+| `firewall_test` | `POST /api/v1/firewall/test` | whether a connection would pass the firewall and which rule decides; `jailops firewall test`; see Routes and docs/networking-ipv6.md |
+| `boot_plan` | `GET /api/v1/boot` | what a boot of the host starts and in which order; `jailops boot` reads it; see Routes and docs/operations.md |
 | `logs_unified` | `GET /api/v1/logs` | the logs of many jails merged by time; `jailops logs` reads them; see Routes and docs/logging.md |
 | `log_forward` | `/api/v1/logs/forward`, `POST .../forward/test` | log forwarding to syslog and webhooks; `jailops logs forward`; see Routes and docs/logging.md |
 | `apps` | `GET /api/v1/apps`, `/api/v1/apps/<n>` | the application catalog: local definition files the daemon reads and never fetches; see Routes and docs/apps.md |
@@ -342,11 +371,13 @@ lists the name, and otherwise reports `unsupported`.
 | `host_firewall` | `GET`/`PUT /api/v1/host/firewall` | host management, module firewall (docs/appliance.md): `/etc/pf.conf` rendered whole by the helper; `jailops host firewall show|set|apply|diff`; changes need the module enabled on both sides and go through commit confirmed |
 | `setup` | `GET`/`POST /api/v1/setup`, `POST /api/v1/setup/token` | the first administrator with a one-time setup token (docs/appliance.md) |
 | `host_certificate` | `GET`/`PUT /api/v1/host/certificate`, `POST .../acme`, `POST .../self-signed` | the console's certificate: upload and ACME (docs/exposure.md) |
+| `jail_shell_setup` | `POST /api/v1/jails/<n>/shell-setup` | bash and the prompt of a FreeBSD jail, as a new jail gets them; `jailops jail shell-setup`; the `prompt` key (docs/shell.md) |
 | `host_pending` | `GET /api/v1/host/pending`, `POST .../pending/confirm`, `POST .../pending/revert` | commit confirmed: the change that reverts unless confirmed; `jailops host pending|confirm|revert`; the timer is the helper's |
 | `app_draft` | `GET /api/v1/jails/<n>/app-draft` | a definition drafted from a running jail; `jailops app export` reads it; see Routes and docs/apps.md |
 | `app_access` | `GET`, `POST /api/v1/jails/<n>/access`, `POST .../access/deny` | who may connect to an installed app; `jailops app allow`, `deny` and `access`; see Routes and docs/apps.md |
-| `volume_unlock` | `POST /api/v1/jails/<n>/unlock`, `.../lock`, `.../passphrase`; `volume_passphrase` in `POST /api/v1/jails` | encrypted volumes; `jailops jail unlock`, `lock`, `passphrase` and `jail create --volume NAME:MOUNT:encrypted`; see Routes and docs/storage.md |
+| `volumes` | `/api/v1/volumes` and below, `/api/v1/jails/<n>/volumes` | volumes of a project, attached to jails by name; encrypted volumes; `jailops volume ...`; see Routes and docs/storage.md |
 | `backup_pull`, `backup_push` | the backup transport permissions of the backup node | not routes of the host daemon (see above) |
 
-Update and provisioning keys of the registry: `shell`, `updates.mode` (manual, notify, managed),
+Update and provisioning keys of the registry: `shell` (`bash`, `sh` or a path), `prompt` (`default`, `none` or a PS1 text
+that passes `api.CheckPrompt`), `updates.mode` (manual, notify, managed),
 `updates.schedule` (cron), `updates.packages`, `updates.os`, `updates.reboot` (manual, auto).

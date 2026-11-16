@@ -42,7 +42,7 @@ func QualifiedName(project, name string) (string, error) {
 	k := project + "_" + name
 	if len(k) > MaxJailKeyLen {
 		return "", Invalid("name", "project %q and jail %q are too long together", project, name).
-			WithHint("the project and jail names together may be at most 63 characters")
+			WithHint(fmt.Sprintf("the project and jail names together may be at most %d characters (the jail key project_jail at most %d)", MaxJailKeyLen-1, MaxJailKeyLen))
 	}
 	return k, nil
 }
@@ -84,6 +84,9 @@ func ProjectSpec(name string, s api.ProjectSpec) error {
 	if err := ProjectName(name); err != nil {
 		return err
 	}
+	if err := api.ValidFreeText("comment", s.Comment, false); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for i, n := range s.Networks {
 		f := fmt.Sprintf("networks[%d]", i)
@@ -123,14 +126,12 @@ func ProjectSpec(name string, s api.ProjectSpec) error {
 			return Invalid("quotas.memory", "memory %q is not a size", q.Memory)
 		}
 	}
-	if s.Firewall != "" {
-		if err := Name("firewall", s.Firewall); err != nil {
-			return err
-		}
+	if err := PolicyNames("firewall_policies", s.FirewallPolicies); err != nil {
+		return err
 	}
 	seen = map[string]bool{}
 	for i, im := range s.Images {
-		if !imageNmRE.MatchString(im) {
+		if !api.IsName(im, api.MaxName) {
 			return Invalid(fmt.Sprintf("images[%d]", i), "image name %q is invalid", im)
 		}
 		if seen[im] {
@@ -160,6 +161,9 @@ var (
 // StorageSpec validates the shape of a storage.
 func StorageSpec(name string, s api.StorageSpec) error {
 	if err := Name("name", name); err != nil {
+		return err
+	}
+	if err := api.ValidFreeText("comment", s.Comment, false); err != nil {
 		return err
 	}
 	d := s.Dataset

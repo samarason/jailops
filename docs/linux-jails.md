@@ -58,7 +58,8 @@ For Debian only:
   the helper's `debootstrap` rule refuses anything else (debootstrap itself only warns about a missing signature and goes on).
   The Alpine rootfs is checked against its published (or pinned) sha256.
 - The image's base is built with the helper (`debootstrap` runs with a fixed environment so that it finds its tools). Only the
-  hosts in `fetch-host` of `priv.conf` can be downloaded from.
+  hosts in `fetch-host` of `priv.conf` can be downloaded from, and the keyring that checks the release is a file in `keyring-dir`
+  (default `/usr/local/share/keyrings`) that root owns.
 - Linux jails default to the **thick** layout (a full copy of the generation); copying it into the jail runs inside the helper
   (`zfs.replicate`), 140 MB in about 2 seconds.
 
@@ -66,8 +67,9 @@ For Debian only:
 
 - **Mounts:** a private devfs ruleset, `fdescfs`, a `nullfs` mirror of the root on `compat/linux` (the Linuxulator resolves paths
   through `/compat/linux` first, and a file create below it fails otherwise), `tmpfs` on `compat/linux/dev/shm`, `linprocfs` and
-  `linsysfs`. JailOps writes the jail's `fstab` and a `devfs.rules` file beside the configuration, and the helper accepts only
-  lines it renders itself.
+  `linsysfs`. JailOps writes the jail's `fstab`. The jail's `/dev` is mounted with a private devfs ruleset that the helper loads into
+  the kernel before the jail is created, from rules it validates itself; a jail whose ruleset cannot be loaded does not start
+  (see [Devices](security-model.md#devices)).
 - **Network:** a Linux userland has no tooling that works here, so the host configures the jail with the `-j` forms
   (`ifconfig -j`, `route -j`) after the epair moved. Linux sees the interface as `eth0`.
 - **Updates** are in place (`apk` inside the jail), with a snapshot first. A root swap does not apply.

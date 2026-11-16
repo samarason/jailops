@@ -8,13 +8,14 @@ import (
 	"sync"
 	"time"
 
+	"jailops.net/jailops/internal/lifecycle"
 	"jailops.net/jailops/internal/store"
 	"jailops.net/jailops/internal/sys/zfs"
 	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/sdk/api"
 )
 
-// Encrypted volumes: unlock, lock and the passphrase change of a jail (docs/storage.md). The passphrase arrives in the
+// Encrypted volumes: unlock, lock and the passphrase change of a volume (docs/storage.md). The passphrase arrives in the
 // request body, is handed to the helper on its request stream and is dropped; it is in no operation, journal, audit
 // entry, log line or reply.
 
@@ -42,29 +43,6 @@ func wipe(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
-}
-
-// creationPassphrase checks the passphrase of a create request against its volumes.
-func (s *Service) creationPassphrase(spec api.JailSpec, p string) ([]byte, error) {
-	enc := false
-	for _, v := range spec.Volumes {
-		enc = enc || v.Encrypted
-	}
-	switch {
-	case !enc && p != "":
-		return nil, invalid("volume_passphrase was given but no volume is encrypted").WithHint("mark the volume encrypted (--volume NAME:MOUNT:encrypted) or leave the passphrase out")
-	case !enc:
-		return nil, nil
-	case s.d.Keys == nil:
-		return nil, api.Errorf(api.CodeUnsupported, "encrypted volumes are not available on this host").
-			WithHint("the daemon runs without the privileged helper's key operations")
-	case p == "":
-		return nil, invalid("a jail with an encrypted volume needs volume_passphrase").WithHint("jailops prompts for it; scripts use --passphrase-file")
-	}
-	if err := api.CheckPassphrase(p); err != nil {
-		return nil, err
-	}
-	return []byte(p), nil
 }
 
 // givenPassphrase checks a passphrase that must match an existing one: 1 to MaxPassphrase bytes, one line.
@@ -161,74 +139,89 @@ func (s *Service) observeLocked(ctx context.Context, key string) {
 	}
 }
 
-// keyedJail resolves the jail of a key request.
-func (s *Service) keyedJail(ctx context.Context, name string) (project, string, error) {
-	if err := s.requireHost("jails"); err != nil {
-		return project{}, "", err
-	}
-	p, key, err := s.jailRef(ctx, name)
+// keyedVolume resolves the encrypted volume of a key request and the jails that attach it.
+func (s *Service) keyedVolume(ctx context.Context, name string) (project, lifecycle.Storage, object[api.VolumeSpec], []string, error) {
+	p, o, st, err := s.volumeOf(ctx, name)
 	if err != nil {
-		return p, "", err
+		return p, st, o, nil, err
 	}
-	j, err := s.getByKey(ctx, key)
-	if err != nil {
-		return p, "", err
+	if s.d.Keys == nil {
+		return p, st, o, nil, api.Errorf(api.CodeUnsupported, "encrypted volumes are not available on this host")
 	}
-	if s.d.Keys == nil || s.life == nil {
-		return p, "", api.Errorf(api.CodeUnsupported, "encrypted volumes are not available on this host")
+	if !o.Spec.Encrypted {
+		return p, st, o, nil, invalid("volume %q is not encrypted", name)
 	}
-	for _, v := range j.Spec.Volumes {
-		if v.Encrypted {
-			return p, key, nil
-		}
+	var keys []string
+	for _, u := range s.volumeUses(p.Meta.Name, name) {
+		k, _ := validate.QualifiedName(p.Meta.Name, u.Jail)
+		keys = append(keys, k)
 	}
-	return p, "", invalid("jail %q has no encrypted volume", name)
+	return p, st, o, keys, nil
 }
 
-// UnlockJail loads the keys of a jail's encrypted volumes with the passphrase, as an operation. The jail starts
-// afterwards when the request asks for it or when the boot wanted to start it while it was locked.
-func (s *Service) UnlockJail(ctx context.Context, name string, req api.JailUnlock) (api.Operation, error) {
-	p, key, err := s.keyedJail(ctx, name)
+// volumeLocks are the locks of an operation on an encrypted volume: the volume and the jails that attach it.
+func volumeLocks(project, name string, jails []string) []string {
+	locks := []string{volumeLock(project, name)}
+	for _, k := range jails {
+		locks = append(locks, jailLock(k), anchorLock(k))
+	}
+	return locks
+}
+
+// UnlockVolume loads the key of an encrypted volume with the passphrase, as an operation. The jail that attaches it
+// starts afterwards when the request asks for it or when the boot wanted to start it while it was locked.
+func (s *Service) UnlockVolume(ctx context.Context, name string, req api.VolumeUnlock) (api.Operation, error) {
+	p, st, _, jails, err := s.keyedVolume(ctx, name)
 	if err != nil {
 		return api.Operation{}, err
 	}
+	proj := p.Meta.Name
+	fkey := "vol:" + proj + "/" + name
 	pass, err := givenPassphrase(req.Passphrase, "passphrase")
 	if err != nil {
 		return api.Operation{}, err
 	}
-	if err := s.lockedOut(key); err != nil {
+	if err := s.lockedOut(fkey); err != nil {
 		wipe(pass)
 		return api.Operation{}, err
 	}
 	op, err := s.Submit(ctx, OpSpec{
-		Description: "Unlock jail " + name, Locks: []string{jailLock(key), anchorLock(key)}, Project: p.Meta.Name,
-		Resources: map[string][]string{"jails": {"/api/v1/jails/" + name}},
+		Description: "Unlock volume " + name, Locks: volumeLocks(proj, name, jails), Project: proj,
+		Resources: map[string][]string{"volumes": {"/api/v1/volumes/" + name}},
 		Run: func(ctx context.Context, h *OpHandle) (any, error) {
 			defer wipe(pass)
-			if err := s.lockedOut(key); err != nil {
+			if err := s.lockedOut(fkey); err != nil {
 				return nil, err
 			}
-			err := s.life.UnlockVolumes(ctx, key, pass)
-			s.passphraseResult(key, err)
-			s.observeLocked(ctx, key)
+			err := s.life.UnlockVolume(ctx, st, proj, name, pass)
+			s.passphraseResult(fkey, err)
+			for _, k := range jails {
+				s.observeLocked(ctx, k)
+			}
 			if err != nil {
 				return nil, err
 			}
-			s.emitIn(ctx, p.Meta.Name, "jail-unlocked", "/api/v1/jails/"+name)
-			if req.Start || s.startDue(key) {
-				s.markStartDue(key, false)
-				_ = h.Bind("start/"+key, &opRequest{Kind: "start", Jail: key})
-				if err := s.life.StartJail(ctx, key); err != nil {
-					return nil, fmt.Errorf("unlocked, but the start failed: %w", err)
+			s.emitIn(ctx, proj, "volume-unlocked", "/api/v1/volumes/"+name)
+			for _, k := range jails {
+				if !req.Start && !s.startDue(k) {
+					continue
 				}
-				if err := s.provisionPending(ctx, key); err != nil {
+				_, jail := validate.SplitQualified(k)
+				s.markStartDue(k, false)
+				_ = h.Bind("start/"+k, &opRequest{Kind: "start", Jail: k})
+				s.installBashBeforeFirstStart(ctx, k)
+				if err := s.life.StartJail(ctx, k); err != nil {
+					return nil, fmt.Errorf("unlocked, but the start of %s failed: %w", jail, err)
+				}
+				s.shellAtStart(ctx, k)
+				if err := s.provisionPending(ctx, k); err != nil {
 					s.kick()
 					return nil, err
 				}
-				s.emitIn(ctx, p.Meta.Name, "jail-started", "/api/v1/jails/"+name)
+				s.emitIn(ctx, proj, "jail-started", "/api/v1/jails/"+jail)
 			}
 			s.kick()
-			return s.getByKey(ctx, key)
+			return s.volumeIn(ctx, proj, name)
 		},
 	})
 	if err != nil {
@@ -237,38 +230,49 @@ func (s *Service) UnlockJail(ctx context.Context, name string, req api.JailUnloc
 	return op, err
 }
 
-// LockJail stops a jail, unmounts its datasets and unloads the keys of its encrypted volumes, as an operation.
-func (s *Service) LockJail(ctx context.Context, name string) (api.Operation, error) {
-	p, key, err := s.keyedJail(ctx, name)
+// LockVolume stops the jail that attaches an encrypted volume, unmounts the volume and unloads its key, as an
+// operation.
+func (s *Service) LockVolume(ctx context.Context, name string) (api.Operation, error) {
+	p, st, _, jails, err := s.keyedVolume(ctx, name)
 	if err != nil {
 		return api.Operation{}, err
 	}
+	proj := p.Meta.Name
 	return s.Submit(ctx, OpSpec{
-		Description: "Lock jail " + name, Locks: []string{jailLock(key), anchorLock(key)}, Project: p.Meta.Name,
-		Resources: map[string][]string{"jails": {"/api/v1/jails/" + name}},
+		Description: "Lock volume " + name, Locks: volumeLocks(proj, name, jails), Project: proj,
+		Resources: map[string][]string{"volumes": {"/api/v1/volumes/" + name}},
 		Run: func(ctx context.Context, h *OpHandle) (any, error) {
-			s.markStartDue(key, false)
-			_ = h.Bind("stop/"+key, &opRequest{Kind: "stop", Jail: key})
-			err := s.life.LockVolumes(ctx, key)
-			s.observeLocked(ctx, key)
+			for _, k := range jails {
+				s.markStartDue(k, false)
+				_ = h.Bind("stop/"+k, &opRequest{Kind: "stop", Jail: k})
+				if err := s.life.StopJail(ctx, k); err != nil {
+					return nil, err
+				}
+				s.markStopped(k)
+			}
+			err := s.life.LockVolume(ctx, st, proj, name)
+			for _, k := range jails {
+				s.observeLocked(ctx, k)
+			}
 			if err != nil {
 				return nil, err
 			}
-			s.markStopped(key)
-			s.emitIn(ctx, p.Meta.Name, "jail-locked", "/api/v1/jails/"+name)
+			s.emitIn(ctx, proj, "volume-locked", "/api/v1/volumes/"+name)
 			s.kick()
-			return s.getByKey(ctx, key)
+			return s.volumeIn(ctx, proj, name)
 		},
 	})
 }
 
-// ChangeJailPassphrase changes the passphrase of every encrypted volume of an unlocked jail, as an operation. A
-// wrong old passphrase counts like a wrong unlock.
-func (s *Service) ChangeJailPassphrase(ctx context.Context, name string, req api.JailPassphraseChange) (api.Operation, error) {
-	p, key, err := s.keyedJail(ctx, name)
+// ChangeVolumePassphrase changes the passphrase of an unlocked encrypted volume, as an operation. A wrong old
+// passphrase counts like a wrong unlock.
+func (s *Service) ChangeVolumePassphrase(ctx context.Context, name string, req api.VolumePassphraseChange) (api.Operation, error) {
+	p, st, _, _, err := s.keyedVolume(ctx, name)
 	if err != nil {
 		return api.Operation{}, err
 	}
+	proj := p.Meta.Name
+	fkey := "vol:" + proj + "/" + name
 	oldPass, err := givenPassphrase(req.Old, "old_passphrase")
 	if err != nil {
 		return api.Operation{}, err
@@ -280,25 +284,25 @@ func (s *Service) ChangeJailPassphrase(ctx context.Context, name string, req api
 		return api.Operation{}, invalid("the new passphrase is the old one")
 	}
 	newPass := []byte(req.New)
-	if err := s.lockedOut(key); err != nil {
+	if err := s.lockedOut(fkey); err != nil {
 		return api.Operation{}, err
 	}
 	op, err := s.Submit(ctx, OpSpec{
-		Description: "Change the volume passphrase of jail " + name, Locks: []string{jailLock(key)}, Project: p.Meta.Name,
-		Resources: map[string][]string{"jails": {"/api/v1/jails/" + name}},
+		Description: "Change the passphrase of volume " + name, Locks: []string{volumeLock(proj, name)}, Project: proj,
+		Resources: map[string][]string{"volumes": {"/api/v1/volumes/" + name}},
 		Run: func(ctx context.Context, h *OpHandle) (any, error) {
 			defer wipe(oldPass)
 			defer wipe(newPass)
-			if err := s.lockedOut(key); err != nil {
+			if err := s.lockedOut(fkey); err != nil {
 				return nil, err
 			}
-			err := s.life.ChangePassphrase(ctx, key, oldPass, newPass)
-			s.passphraseResult(key, err)
+			err := s.life.ChangeVolumePassphrase(ctx, st, proj, name, oldPass, newPass)
+			s.passphraseResult(fkey, err)
 			if err != nil {
 				return nil, err
 			}
-			s.emitIn(ctx, p.Meta.Name, "jail-passphrase-changed", "/api/v1/jails/"+name)
-			return s.getByKey(ctx, key)
+			s.emitIn(ctx, proj, "volume-passphrase-changed", "/api/v1/volumes/"+name)
+			return s.volumeIn(ctx, proj, name)
 		},
 	})
 	if err != nil {
@@ -343,21 +347,12 @@ func (s *Service) LockedJails() map[string][]string {
 // doctorEncryption reports the jails that wait for a passphrase (volumes.locked) and whether the pools of the
 // storages can hold encrypted volumes (volumes.encryption).
 func (s *Service) doctorEncryption(ctx context.Context, c *checkSet) {
-	var keys []string
-	s.mu.RLock()
-	for k, e := range s.jails {
-		for _, v := range e.jail.Spec.Volumes {
-			if v.Encrypted {
-				keys = append(keys, k)
-				break
+	encrypted := map[string]bool{} // pool -> a volume there is encrypted
+	if vols, err := s.volKind.listAll(); err == nil {
+		for _, o := range vols {
+			if si, ok := s.storage(o.Spec.Storage); ok && o.Spec.Encrypted {
+				encrypted[poolOf(si.Root)] = true
 			}
-		}
-	}
-	s.mu.RUnlock()
-	encrypted := map[string]bool{} // pool -> a jail there has an encrypted volume
-	for _, k := range keys {
-		if si, ok := s.storageOfJail(k); ok {
-			encrypted[poolOf(si.Root)] = true
 		}
 	}
 	if locked := s.LockedJails(); len(locked) > 0 {
@@ -368,7 +363,7 @@ func (s *Service) doctorEncryption(ctx context.Context, c *checkSet) {
 		}
 		sort.Strings(names)
 		c.add("volumes.locked", api.DoctorInfo, fmt.Sprintf("%d jail(s) wait for a passphrase: %s", len(names), strings.Join(names, ", ")),
-			"jailops jail unlock NAME (a jail due for autostart starts after its unlock)")
+			"jailops volume unlock NAME (a jail due for autostart starts after the unlock of its volume)")
 	} else if len(encrypted) > 0 {
 		c.add("volumes.locked", api.DoctorOK, "no jail waits for a passphrase", "")
 	}

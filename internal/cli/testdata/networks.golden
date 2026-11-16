@@ -3,7 +3,6 @@ network/dmz created
 
 $ jailops network create bad --subnet nonsense --gateway 10.30.0.1 --range a-b
 ! invalid: invalid subnet "nonsense"
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops network create short
@@ -12,16 +11,16 @@ $ jailops network create short
 [exit 2]
 
 $ jailops network list
-NAME   BRIDGE   IPV4           GATEWAY     RANGE                   USED   FREE   UPLINK
-dmz    -        10.30.0.0/24   10.30.0.1   10.30.0.10-10.30.0.12   0      3      em1
-lan    -        10.20.0.0/24   10.20.0.1   10.20.0.10-10.20.0.20   0      11     em0
+NAME   IPV4           GATEWAY     RANGE                   USED   FREE   UPLINK
+dmz    10.30.0.0/24   10.30.0.1   10.30.0.10-10.30.0.12   0      3      em1
+lan    10.20.0.0/24   10.20.0.1   10.20.0.10-10.20.0.20   0      11     em0
 
 $ jailops network grant dmz --project main
 network/dmz granted to project main
 
 $ jailops network grant lan --project other
 ! not_found: project "other" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops project list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops jail create web --image freebsd-15@stable --storage default --network dmz
@@ -102,18 +101,14 @@ $ jailops network edit viafile -f <dir>/net2.yaml
 network/viafile updated
 
 $ jailops network show viafile
-Name:        viafile
-UUID:        <uuid>
-Generation:  2
-Age:         3h
-
-SPEC                             STATUS
-----                             ------
-ipv4:                            free: 26
-  subnet: 10.40.0.0/24
-  gateway: 10.40.0.1
-  range: 10.40.0.5-10.40.0.30
-mtu: 1400
+Network viafile
+  Uplink:     none
+  IPv4:       10.40.0.0/24, gateway 10.40.0.1
+  IPv4 range: 10.40.0.5-10.40.0.30
+  IPv6:       none
+  MTU:        1400
+  Addresses:  0 used, 26 free
+  Age:        3h
 
 $ jailops network create sw --ipv4 10.94.0.1/24 --uplink em0 --ipv6 2001:db8:1:2:100::/80 --ipv6-mode proxy
 network/sw created
@@ -135,7 +130,6 @@ spec:
   ipv6:
     mode: proxy
     subnet: 2001:db8:1:2:100::/80
-    gateway: fe80::1
     range: 2001:db8:1:2:100::10-2001:db8:1:2:100:0:1:e
 status:
   free: 253

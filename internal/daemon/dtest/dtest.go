@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,6 +52,9 @@ type Options struct {
 	Mutate func(*daemon.Config)
 	// Listen opens the real listeners (unix socket, HTTPS on loopback).
 	Listen bool
+	// NoAdmin makes no global administrator token: a host before its first administrator (Admin is nil; the
+	// tokens of other roles are made as usual).
+	NoAdmin bool
 	// Clients wraps or replaces the fake clients.
 	Clients func(c *daemon.Clients)
 	// Dir of an earlier Env to restart on top of the same state.
@@ -78,6 +82,8 @@ type Options struct {
 	HostManage []string
 	// LogForwardTune adjusts the log forwarder (poll interval, file check).
 	LogForwardTune func(*logfwd.Env)
+	// KeepAlive and ReadTimeout replace the keepalive interval of long requests and the listeners' read timeout.
+	KeepAlive, ReadTimeout time.Duration
 	// ApplianceModules is the -appliance-modules flag (jailops_appliance in rc.conf).
 	ApplianceModules []string
 	// ACMEHTTPClient, TLSRoots and ListenChallenge are the daemon's options of the same names.
@@ -122,6 +128,9 @@ type Env struct {
 	DialFn func(ctx context.Context, network, address string) (net.Conn, error)
 	// PkgInstallErr makes the fake pkg fail an app's package installation.
 	PkgInstallErr error
+	pkgDry        string // what `pkg -r ROOT upgrade -n` lists until an upgrade ran (SetPkgUpgrades)
+	pkgUpgErr     error  // makes `pkg -r ROOT upgrade -y` fail (SetPkgUpgradeErr)
+	pkgUpgraded   bool
 	// Installed lists what the fake pkg installed into jail roots, "root name".
 	Installed []string
 	// Host is the simulated host of host management.
@@ -135,6 +144,21 @@ func (e *Env) SetDial(fn func(ctx context.Context, network, address string) (net
 	e.sysmu.Lock()
 	defer e.sysmu.Unlock()
 	e.DialFn = fn
+}
+
+// SetPkgUpgrades sets the dry-run output of `pkg -r ROOT upgrade -n` (the packages a jail would get); once an upgrade
+// ran, the fake answers that the packages are up to date.
+func (e *Env) SetPkgUpgrades(dry string) {
+	e.sysmu.Lock()
+	defer e.sysmu.Unlock()
+	e.pkgDry, e.pkgUpgraded = dry, false
+}
+
+// SetPkgUpgradeErr makes `pkg -r ROOT upgrade -y` fail with err (nil for success).
+func (e *Env) SetPkgUpgradeErr(err error) {
+	e.sysmu.Lock()
+	defer e.sysmu.Unlock()
+	e.pkgUpgErr = err
 }
 
 // SetPkgInstallErr sets PkgInstallErr while the daemon may be running.
@@ -236,6 +260,15 @@ func (e *Env) Events(ctx context.Context, c *sdk.Client, opts ...sdk.EventOption
 	return ch
 }
 
+// hostFile reads a file of the simulated host: /etc/NAME is NAME in Host.Etc; nothing else exists.
+func (e *Env) hostFile(p string) ([]byte, error) {
+	name, ok := strings.CutPrefix(p, "/etc/")
+	if !ok || strings.Contains(name, "/") {
+		return nil, os.ErrNotExist
+	}
+	return os.ReadFile(filepath.Join(e.Host.Etc, name))
+}
+
 // New builds and starts an Env. The daemon is stopped when the test ends.
 func New(t testing.TB, o Options) *Env {
 	tt, _ := t.(*testing.T)
@@ -254,6 +287,7 @@ func New(t testing.TB, o Options) *Env {
 		e.ZFS = zfs.NewFake("tank")
 		e.PF = pfctl.NewFake()
 		e.Net = ifconfig.NewFake(ifconfig.Options{})
+		addHostIfaces(e.Net)
 		e.Jails = jailos.NewFake()
 		e.Files = fakes.NewFiles(e.Fault)
 		e.Run = run.NewFake()
@@ -306,14 +340,14 @@ func (e *Env) Start() {
 	}
 	env := api.Environment{OS: "FreeBSD", Arch: "amd64", Pool: "tank", PF: true}
 	d, err := daemon.Start(context.Background(), daemon.Options{
-		Config: &cfg, Version: "test", ForceWeb: e.Opts.ForceWeb, NoWeb: e.Opts.NoWeb, LogOutput: out, Hostname: host, Env: &env, NoListen: !e.Opts.Listen, Registrar: e.Opts.Registrar, Now: e.Opts.Now, Backups: e.Opts.Backups, Execer: e.execer(), BackupTLS: e.Opts.BackupTLS, BackupMounter: e.Opts.BackupMounter, LogForwardTune: e.Opts.LogForwardTune,
+		Config: &cfg, Version: "test", ForceWeb: e.Opts.ForceWeb, NoWeb: e.Opts.NoWeb, LogOutput: out, Hostname: host, Env: &env, NoListen: !e.Opts.Listen, Registrar: e.Opts.Registrar, Now: e.Opts.Now, Backups: e.Opts.Backups, Execer: e.execer(), BackupTLS: e.Opts.BackupTLS, BackupMounter: e.Opts.BackupMounter, LogForwardTune: e.Opts.LogForwardTune, KeepAlive: e.Opts.KeepAlive, ReadTimeout: e.Opts.ReadTimeout,
 		ApplianceModules: e.Opts.ApplianceModules, ACMEHTTPClient: e.Opts.ACMEHTTPClient, TLSRoots: e.Opts.TLSRoots, ListenChallenge: e.Opts.ListenChallenge, ACMEAttempted: e.Opts.ACMEAttempted,
 		Clients: func(ctx context.Context, c *daemon.Config, dev bool) (*daemon.Clients, error) {
 			cl := &daemon.Clients{ZFS: e.ZFS, Jails: e.Jails, PF: e.PF, Net: e.Net, Runner: e.Run, Files: e.Files, Logs: fileLogs{e.Files},
 				Sysctl:  func(_ context.Context, name string) (string, error) { return e.sysctl(name) },
 				Mount:   func(context.Context, string) error { return nil },
 				Unmount: func(context.Context, string) error { return nil },
-				Dial:    e.dial, HostSystem: e.Host.Local, WG: e.WG, Keys: e.Keys}
+				Dial:    e.dial, HostSystem: e.Host.Local, WG: e.WG, Keys: e.Keys, HostFile: e.hostFile}
 			if e.Opts.Clients != nil {
 				e.Opts.Clients(cl)
 			}
@@ -327,7 +361,9 @@ func (e *Env) Start() {
 	t.Cleanup(func() { e.Stop() })
 	e.HTTP = httptest.NewServer(d.Handler())
 	t.Cleanup(e.HTTP.Close)
-	e.Admin = e.Client(api.PermAdmin)
+	if !e.Opts.NoAdmin {
+		e.Admin = e.Client(api.PermAdmin)
+	}
 }
 
 // Stop shuts the daemon down.
@@ -347,10 +383,26 @@ func (e *Env) Stop() {
 	}
 }
 
+// HostIfaces are the fake host's own interfaces, which networks name as their uplink: em0 and vtnet0 are on a
+// segment whose IPv6 prefix 2001:db8:1:2::/64 proxy-mode networks take parts of; em1 has only IPv4.
+var HostIfaces = []ifconfig.Iface{
+	{Name: "em0", Flags: []string{"UP", "RUNNING"}, Inet: []netip.Prefix{netip.MustParsePrefix("203.0.113.2/24")},
+		Inet6: []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::2/64")}},
+	{Name: "em1", Flags: []string{"UP", "RUNNING"}, Inet: []netip.Prefix{netip.MustParsePrefix("192.0.2.2/24")}},
+	{Name: "vtnet0", Flags: []string{"UP", "RUNNING"}, Inet: []netip.Prefix{netip.MustParsePrefix("198.51.100.15/24")},
+		Inet6: []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::3/64")}},
+}
+
+func addHostIfaces(f *ifconfig.Fake) {
+	for _, i := range HostIfaces {
+		f.AddHost(i)
+	}
+}
+
 // Sysctls are the values the fake host reports.
 var Sysctls = map[string]string{
 	"net.inet6.ip6.forwarding": "1", "net.inet.ip.forwarding": "1", "kern.racct.enable": "1", "net.inet6.icmp6.nd6_onlink_ns_rfc4861": "1",
-	"net.link.bridge.pfil_member": "1", "net.link.bridge.pfil_bridge": "0", "net.link.bridge.pfil_onlyip": "1", "kern.elf64.fallback_brand": "-1", "kern.osrelease": "15.1-RELEASE-p1",
+	"kern.elf64.fallback_brand": "-1", "kern.osrelease": "15.1-RELEASE-p1", "kern.boottime": "{ sec = 1700000000, usec = 0 }",
 }
 
 func (e *Env) sysctl(name string) (string, error) {
@@ -370,6 +422,11 @@ func (e *Env) sysctl(name string) (string, error) {
 // image builder run. They write into the in-memory files like the real tools
 // write into the jail roots.
 func (e *Env) script() {
+	// dummynet: the module is there and the pipes of the bandwidth limits can be set
+	e.Run.Add(run.Rule{Name: "kldstat", Args: []string{"-q", "-n", "dummynet"}})
+	e.Run.Add(run.Rule{Name: "kldstat", Args: []string{"-n", "dummynet"}})
+	e.Run.Add(run.Rule{Name: "kldload", Args: []string{"dummynet"}})
+	e.Run.Add(run.Rule{Name: "dnctl", Args: []string{run.RestArgs}})
 	e.Run.Add(run.Rule{Name: "pkg", Args: []string{run.RestArgs}, Fn: func(c run.Cmd) (run.Result, error) {
 		argv := append([]string{"pkg"}, c.Args...)
 		if len(argv) > 2 && argv[1] == "config" && argv[2] == "abi" {
@@ -378,11 +435,19 @@ func (e *Env) script() {
 		// pkg -r <root> [-o k=v]... <sub> [args]: the image builder passes -o
 		// options and installs a whole base, the app installer names packages.
 		root, i, options := "", 1, false
-		for i < len(argv) && (argv[i] == "-r" || argv[i] == "-o") {
-			if argv[i] == "-r" {
+		for i < len(argv) && (argv[i] == "-r" || argv[i] == "-j" || argv[i] == "-o") {
+			switch argv[i] {
+			case "-r":
 				root = argv[i+1]
-			} else {
-				options = true
+			case "-j": // inside a running jail: its root, as the storage of the fake lays it out
+				if proj, name, ok := strings.Cut(argv[i+1], "_"); ok {
+					root = "/jailops/projects/" + proj + "/jails/" + name + "/root"
+				}
+			default:
+				// the cache directory is no sign of an image build: installs into a jail root pass it too
+				if !(argv[i] == "-o" && strings.HasPrefix(argv[i+1], "PKG_CACHEDIR=")) {
+					options = true
+				}
 			}
 			i += 2
 		}
@@ -392,6 +457,23 @@ func (e *Env) script() {
 		sub, rest := argv[i], argv[i+1:]
 		switch sub {
 		case "install", "upgrade":
+			if sub == "upgrade" && !options {
+				e.sysmu.Lock()
+				defer e.sysmu.Unlock()
+				for _, a := range rest {
+					if a == "-n" { // the dry run of a package update
+						if e.pkgUpgraded || e.pkgDry == "" {
+							return run.Result{Stdout: []byte("Your packages are up to date.\n")}, nil
+						}
+						return run.Result{Stdout: []byte(e.pkgDry)}, nil
+					}
+				}
+				if e.pkgUpgErr != nil {
+					return run.Result{ExitCode: 1, Stderr: []byte("pkg: repository unreachable\n")}, e.pkgUpgErr
+				}
+				e.pkgUpgraded = true
+				return run.Result{}, nil
+			}
 			if options {
 				e.Files.Put(root+"/bin/sh", []byte("x"))
 				e.Files.Put(root+"/libexec/ld-elf.so.1", []byte("x"))
@@ -415,9 +497,27 @@ func (e *Env) script() {
 					e.Installed = append(e.Installed, root+" "+rest[j])
 					e.sysmu.Unlock()
 					e.Files.Put(root+"/.app-pkgs/"+rest[j], []byte(rest[j]+" "+e.repoVersion()+"\n"))
+					if rest[j] == api.BashPackage { // the jail's shell (docs/shell.md)
+						e.Files.Put(root+api.BashPath, []byte("x"))
+					}
 				}
 			}
 		case "query":
+			if len(rest) == 1 && rest[0] == "%n" { // the installed packages: the base, and what the upgrade dry run names
+				e.sysmu.Lock()
+				dry := e.pkgDry
+				e.sysmu.Unlock()
+				var sb strings.Builder
+				sb.WriteString("FreeBSD-runtime\nFreeBSD-utilities\n")
+				for _, l := range strings.Split(dry, "\n") {
+					if t := strings.TrimSpace(l); strings.Contains(t, " -> ") {
+						if name, _, ok := strings.Cut(t, ":"); ok {
+							sb.WriteString(name + "\n")
+						}
+					}
+				}
+				return run.Result{Stdout: []byte(sb.String())}, nil
+			}
 			if len(rest) == 2 && rest[0] == "%v" { // the version of one package
 				if b, ok := e.Files.Get(root + "/.app-pkgs/" + rest[1]); ok {
 					_, v, _ := strings.Cut(strings.TrimSpace(string(b)), " ")
@@ -541,7 +641,7 @@ func (e *Env) Seed() {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := e.Admin.Images().Create(ctx, api.Image{Metadata: api.ObjectMeta{Name: "fb"}, Spec: api.ImageSpec{
-		OS: api.OSFreeBSD, Release: "15.0-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}, Aliases: []string{"stable"}}}); err != nil {
+		OS: api.OSFreeBSD, Release: "15.1-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}, Aliases: []string{"stable"}}}); err != nil {
 		t.Fatalf("seed image: %v", err)
 	}
 	op, err := e.Admin.Images().Build(ctx, "fb", api.ImageBuild{})

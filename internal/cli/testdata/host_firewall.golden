@@ -37,18 +37,27 @@ dry-run: would
 
 $ jailops host firewall set --ssh-port 0
 ! invalid: ssh port 0 is not a port (1-65535)
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
-$ jailops host firewall set --allow tcp 80 comment web
-! invalid: allow rows need the template custom-rules, not default
-! hint: set template to custom-rules, or leave allow out
+$ jailops host firewall allow add --proto tcp --port 80
+! usage: --comment is required: say what the row is for
+! hint: run 'jailops host firewall allow add --help' for usage
 [exit 2]
 
-$ jailops host firewall set --template custom-rules --allow tcp
-! usage: --allow is "PROTO PORTS [from SOURCE,...] [comment TEXT]", for example "tcp 80,443 from 192.0.2.0/24 comment web", not "tcp"
-! hint: run 'jailops host firewall set --help' for usage
+$ jailops host firewall allow add --proto tcp --comment web
+! usage: --proto and --port are required
+! hint: run 'jailops host firewall allow add --help' for usage
 [exit 2]
+
+$ jailops host firewall allow remove 1
+! not_found: there is no row 1: the firewall has 0
+! hint: jailops host firewall allow list
+[exit 4]
+
+$ jailops host firewall address-set set admins --member 192.0.2.0/24
+! not_found: address set "admins" not found
+! hint: jailops host firewall address-set list
+[exit 4]
 
 $ jailops host firewall set --confirm-within 5
 ! usage: --confirm-within is 10 to 1800 seconds, not "5"
@@ -60,7 +69,7 @@ $ jailops host firewall set --icmp sometimes
 ! hint: run 'jailops host firewall set --help' for usage
 [exit 2]
 
-$ jailops host firewall set --template custom-rules --set admins=192.0.2.0/24,2001:db8:a::/48 --ssh-from @admins --allow tcp 80,443 comment web --allow udp 51820 from 2001:db8:1::/56 --confirm-within 90s
+$ jailops host firewall address-set create admins --member 192.0.2.0/24 --member 2001:db8:a::/48 --confirm-within 90s
 --- /etc/pf.conf
 +++ /etc/pf.conf
 -(the administrator's own pf.conf)
@@ -70,23 +79,130 @@ $ jailops host firewall set --template custom-rules --set admins=192.0.2.0/24,20
 +pass out from any  # everything the host sends, and the replies to it
 +pass in icmp6 from any  # neighbour discovery and router advertisements
 +pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
-+pass in tcp 22 from @admins  # ssh
++pass in tcp 22 from any  # ssh
 +pass in tcp 39110 from any  # JailOps console and API
-+pass in tcp 80, 443 from any  # web
-+pass in udp 51820 from 2001:db8:1::/56
 +pass in icmp, icmp6 from any  # ping (echo requests)
   check the rendered file with pfctl -n
   write /etc/pf.conf
   pfctl -f /etc/pf.conf
   revert in 90 seconds unless confirmed
+warning: ssh is open to the world: narrow ssh allow_from to the addresses you administer from
 host firewall: applied; it REVERTS at 09:01:30Z (in 90 s) unless you confirm it: jailops host confirm --id 00000000f00d0001
 
+$ jailops host confirm
+Pending:     nothing waits for a confirmation
+Last:        firewall change 00000000f00d0001 was confirmed at 2026-03-01 09:00:00Z
+
+$ jailops host firewall address-set create admins --member 192.0.2.0/24
+! already_exists: address set "admins" already exists
+! hint: replace its members with 'jailops host firewall address-set set'
+[exit 5]
+
+$ jailops host firewall set --template custom-rules --ssh-from @admins --confirm-within 90s
+--- /etc/pf.conf
++++ /etc/pf.conf
+-pass in from any  # loopback (lo0 is not filtered)
+-pass in from any  # the jails' own anchors (jailops/*) come first
+-block in from any  # everything not passed below
+-pass out from any  # everything the host sends, and the replies to it
+-pass in icmp6 from any  # neighbour discovery and router advertisements
+-pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
+-pass in tcp 22 from any  # ssh
+-pass in tcp 39110 from any  # JailOps console and API
+-pass in icmp, icmp6 from any  # ping (echo requests)
++pass in from any  # loopback (lo0 is not filtered)
++pass in from any  # the jails' own anchors (jailops/*) come first
++block in from any  # everything not passed below
++pass out from any  # everything the host sends, and the replies to it
++pass in icmp6 from any  # neighbour discovery and router advertisements
++pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
++pass in tcp 22 from @admins  # ssh
++pass in tcp 39110 from any  # JailOps console and API
++pass in icmp, icmp6 from any  # ping (echo requests)
+  check the rendered file with pfctl -n
+  write /etc/pf.conf
+  pfctl -f /etc/pf.conf
+  revert in 90 seconds unless confirmed
+host firewall: applied; it REVERTS at 09:01:30Z (in 90 s) unless you confirm it: jailops host confirm --id 00000000f00d0002
+
+$ jailops host confirm
+Pending:     nothing waits for a confirmation
+Last:        firewall change 00000000f00d0002 was confirmed at 2026-03-01 09:00:00Z
+
+$ jailops host firewall allow add --proto tcp --port 80,443 --comment web --confirm-within 90s
+--- /etc/pf.conf
++++ /etc/pf.conf
+-pass in from any  # loopback (lo0 is not filtered)
+-pass in from any  # the jails' own anchors (jailops/*) come first
+-block in from any  # everything not passed below
+-pass out from any  # everything the host sends, and the replies to it
+-pass in icmp6 from any  # neighbour discovery and router advertisements
+-pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
+-pass in tcp 22 from @admins  # ssh
+-pass in tcp 39110 from any  # JailOps console and API
+-pass in icmp, icmp6 from any  # ping (echo requests)
++pass in from any  # loopback (lo0 is not filtered)
++pass in from any  # the jails' own anchors (jailops/*) come first
++block in from any  # everything not passed below
++pass out from any  # everything the host sends, and the replies to it
++pass in icmp6 from any  # neighbour discovery and router advertisements
++pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
++pass in tcp 22 from @admins  # ssh
++pass in tcp 39110 from any  # JailOps console and API
++pass in tcp 80, 443 from any  # web
++pass in icmp, icmp6 from any  # ping (echo requests)
+  check the rendered file with pfctl -n
+  write /etc/pf.conf
+  pfctl -f /etc/pf.conf
+  revert in 90 seconds unless confirmed
+host firewall: applied; it REVERTS at 09:01:30Z (in 90 s) unless you confirm it: jailops host confirm --id 00000000f00d0003
+
+$ jailops host confirm
+Pending:     nothing waits for a confirmation
+Last:        firewall change 00000000f00d0003 was confirmed at 2026-03-01 09:00:00Z
+
+$ jailops host firewall allow add --proto udp --port 51820 --from 2001:db8:1::/56 --comment WireGuard --confirm-within 90s
+--- /etc/pf.conf
++++ /etc/pf.conf
+-pass in from any  # loopback (lo0 is not filtered)
+-pass in from any  # the jails' own anchors (jailops/*) come first
+-block in from any  # everything not passed below
+-pass out from any  # everything the host sends, and the replies to it
+-pass in icmp6 from any  # neighbour discovery and router advertisements
+-pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
+-pass in tcp 22 from @admins  # ssh
+-pass in tcp 39110 from any  # JailOps console and API
+-pass in tcp 80, 443 from any  # web
+-pass in icmp, icmp6 from any  # ping (echo requests)
++pass in from any  # loopback (lo0 is not filtered)
++pass in from any  # the jails' own anchors (jailops/*) come first
++block in from any  # everything not passed below
++pass out from any  # everything the host sends, and the replies to it
++pass in icmp6 from any  # neighbour discovery and router advertisements
++pass in icmp, icmp6 from any  # path MTU discovery and ICMP errors
++pass in tcp 22 from @admins  # ssh
++pass in tcp 39110 from any  # JailOps console and API
++pass in tcp 80, 443 from any  # web
++pass in udp 51820 from 2001:db8:1::/56  # WireGuard
++pass in icmp, icmp6 from any  # ping (echo requests)
+  check the rendered file with pfctl -n
+  write /etc/pf.conf
+  pfctl -f /etc/pf.conf
+  revert in 90 seconds unless confirmed
+host firewall: applied; it REVERTS at 09:01:30Z (in 90 s) unless you confirm it: jailops host confirm --id 00000000f00d0004
+
+$ jailops host firewall allow list
+#   PROTO   PORTS    FROM              COMMENT
+1   tcp     80,443   -                 web
+2   udp     51820    2001:db8:1::/56   WireGuard
+
 $ jailops host pending
-Pending:     firewall change 00000000f00d0001 (snapshot 20260301T090000Z-901)
-Reverts at:  2026-03-01 09:01:30Z, in 90 s, unless confirmed: jailops host confirm --id 00000000f00d0001
+Pending:     firewall change 00000000f00d0004 (snapshot 20260301T090000Z-904)
+Reverts at:  2026-03-01 09:01:30Z, in 90 s, unless confirmed: jailops host confirm --id 00000000f00d0004
+Last:        firewall change 00000000f00d0003 was confirmed at 2026-03-01 09:00:00Z
 
 $ jailops host firewall set --icmp disable
-! busy: a firewall change (id 00000000f00d0001) waits for its confirmation
+! busy: a firewall change (id 00000000f00d0004) waits for its confirmation
 ! hint: confirm it with `jailops host confirm`, or undo it with `jailops host revert`, then try again
 [exit 5]
 
@@ -96,11 +212,11 @@ $ jailops host confirm --id nothex
 [exit 2]
 
 $ jailops --dry-run host confirm
-dry-run: would confirm the firewall change 00000000f00d0001
+dry-run: would confirm the firewall change 00000000f00d0004
 
 $ jailops host confirm
 Pending:     nothing waits for a confirmation
-Last:        firewall change 00000000f00d0001 was confirmed at 2026-03-01 09:00:00Z
+Last:        firewall change 00000000f00d0004 was confirmed at 2026-03-01 09:00:00Z
 
 $ jailops host firewall show
 ACTION   DIR   PROTO         PORTS     FROM              WHAT
@@ -113,7 +229,7 @@ pass     in    icmp, icmp6   -         any               path MTU discovery and 
 pass     in    tcp           22        @admins           ssh
 pass     in    tcp           39110     any               JailOps console and API
 pass     in    tcp           80, 443   any               web
-pass     in    udp           51820     2001:db8:1::/56   -
+pass     in    udp           51820     2001:db8:1::/56   WireGuard
 pass     in    icmp, icmp6   -         any               ping (echo requests)
 
 Managed:     yes (module firewall)
@@ -137,7 +253,7 @@ $ jailops host firewall apply -f <dir>/fw.yaml --confirm-within 120
 -pass in tcp 22 from @admins  # ssh
 -pass in tcp 39110 from any  # JailOps console and API
 -pass in tcp 80, 443 from any  # web
--pass in udp 51820 from 2001:db8:1::/56
+-pass in udp 51820 from 2001:db8:1::/56  # WireGuard
 -pass in icmp, icmp6 from any  # ping (echo requests)
 +pass in from any  # loopback (lo0 is not filtered)
 +pass in from any  # the jails' own anchors (jailops/*) come first
@@ -151,15 +267,15 @@ $ jailops host firewall apply -f <dir>/fw.yaml --confirm-within 120
   revert in 120 seconds unless confirmed
 warning: ssh is open to the world: narrow ssh allow_from to the addresses you administer from
 warning: the open template passes everything to the host; use it only behind another firewall
-host firewall: applied; it REVERTS at 09:02:00Z (in 120 s) unless you confirm it: jailops host confirm --id 00000000f00d0002
+host firewall: applied; it REVERTS at 09:02:00Z (in 120 s) unless you confirm it: jailops host confirm --id 00000000f00d0005
 
 $ jailops -y host revert
 Pending:     nothing waits for a confirmation
-Last:        firewall change 00000000f00d0002 was reverted at 2026-03-01 09:00:00Z (reverted on request)
+Last:        firewall change 00000000f00d0005 was reverted at 2026-03-01 09:00:00Z (reverted on request)
 
 $ jailops host pending
 Pending:     nothing waits for a confirmation
-Last:        firewall change 00000000f00d0002 was reverted at 2026-03-01 09:00:00Z (reverted on request)
+Last:        firewall change 00000000f00d0005 was reverted at 2026-03-01 09:00:00Z (reverted on request)
 
 $ jailops host revert -y
 ! not_found: no host change waits for a confirmation

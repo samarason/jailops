@@ -23,3 +23,27 @@ func TestQuickPassesBeforeTheAnchorAreFound(t *testing.T) {
 		t.Fatalf("a rule that is not quick was reported: %q", got)
 	}
 }
+
+func TestDefaultBlockAndStatePolicyLine(t *testing.T) {
+	for rules, want := range map[string]bool{
+		"block drop log all\npass out all flags S/SA keep state": true,
+		"block drop in on vtnet0 all":                            true,
+		"block drop in quick on vtnet0 all":                      false,
+		"block drop in log quick inet6 from fe80::/10 to any":    false,
+		"pass all": false,
+	} {
+		if got := defaultBlock(rules); got != want {
+			t.Errorf("%q: %v", rules, got)
+		}
+	}
+	for conf, want := range map[string]bool{
+		"set skip on lo0\nset state-policy if-bound\nblock log all": true,
+		"set state-policy \\\n  if-bound":                           true,
+		"# set state-policy if-bound\nblock log all":                false,
+		"set state-policy floating":                                 false,
+	} {
+		if got := reStatePolicy.MatchString(stripPFComments(conf)); got != want {
+			t.Errorf("%q: %v", conf, got)
+		}
+	}
+}

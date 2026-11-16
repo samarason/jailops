@@ -10,14 +10,12 @@ spec:
   storage: bulk               # the jail's own datasets (root, /usr/local, /var/db) live on the big pool
   network:
     - {name: eth0, network: media, ipv4: auto}
-  firewall: {policy: media-server}
+  firewall: {policies: [media-server]}
   resources: {cpu: 4, memory: 8G}
   volumes:
-    # A dataset JailOps creates under the jail on `bulk`: snapshotted, rolled back and backed up with the jail.
-    - {name: metadata, mount: /var/db/plexdata, quota: 200G}
-  host_mounts:
-    # The archive is NOT JailOps's data: it is a dataset of the pool, mounted with nullfs, read-only. It is not
-    # snapshotted or backed up by JailOps. Setting host_mounts needs a global-admin token, and the source must be below an
-    # `admin-host-mount` directory in the host's priv.conf, or the jail refuses to start.
-    - {source: /tank/archive/movies, target: /mnt/movies, read_only: true}
-    - {source: /tank/archive/music, target: /mnt/music, read_only: true}
+    # A volume of the project (volumes/plexdata.yaml), on `bulk`: it has its own snapshots and outlives the jail.
+    - {volume: plexdata, mount: /var/db/plexdata}
+    # The archive is NOT JailOps's data: two directories of the host (volumes/movies.yaml, music.yaml), mounted
+    # read-only. They are not snapshotted or backed up by JailOps.
+    - {volume: movies, mount: /mnt/movies, read_only: true}
+    - {volume: music, mount: /mnt/music, read_only: true}

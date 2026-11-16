@@ -46,7 +46,7 @@ func TestProjectAnchorIsLoadedBeforeTheJailAnchorAndVerified(t *testing.T) {
 	if len(rep.Drift["web_nginx"]) != 0 {
 		t.Fatalf("%+v", rep.Drift)
 	}
-	if strings.Join(pf.loads, ",") != "jailops/net.lan,jailops/web,jailops/web/nginx" {
+	if strings.Join(pf.loads, ",") != "jailops/web,jailops/web/nginx" {
 		t.Fatalf("load order: %v", pf.loads)
 	}
 	// Rules that were accepted but are not there afterwards are drift, not success.

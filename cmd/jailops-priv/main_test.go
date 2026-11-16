@@ -165,7 +165,7 @@ func TestServeDevAndShutdown(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		done <- run([]string{"-dev", "-config", emptyConfig(t), "-socket", sock, "-pidfile", pid,
-			"-storage-root", "tank/jailops", "-state-dir", filepath.Join(mount, "state"), "-storage-file", filepath.Join(dir, "storage.conf"),
+			"-storage-root", "tank/jailops", "-state-dir", filepath.Join(mount, "state"), "-storage-file", filepath.Join(dir, "priv.d", "storage.conf"),
 			"-conf-dir", filepath.Join(dir, "conf"),
 			"-allow-user", cur.Username, "-group", ""}, &out, &errb, os.Geteuid())
 	}()
@@ -246,8 +246,10 @@ func TestSecondInstanceIsRefused(t *testing.T) {
 func TestCheckConfigPrintsEffectiveConfiguration(t *testing.T) {
 	dir, _ := filepath.EvalSymlinks(t.TempDir())
 	mount := filepath.Join(dir, "jo")
+	os.MkdirAll(mount, 0o700)
 	useFakeSystem(t, map[string]string{"tank/jailops": mount})
-	sf := filepath.Join(dir, "storage.conf")
+	os.MkdirAll(filepath.Join(dir, "priv.d"), 0o700) // the storage file is not in a directory above a root
+	sf := filepath.Join(dir, "priv.d", "storage.conf")
 	os.WriteFile(sf, []byte("root = tank/missing\n"), 0o600)
 	code, out, errs := runArgs(t, 1000, "-config", emptyConfig(t), "-storage-root", "tank/jailops", "-storage-file", sf,
 		"-state-dir", filepath.Join(dir, "st"), "-sysctl", "hw.model", "-admin-allow-flag", "mount.zfs", "check-config")

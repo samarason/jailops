@@ -17,7 +17,7 @@ func TestLayoutListsEveryDatasetWithItsKind(t *testing.T) {
 	for _, d := range lay.Datasets {
 		kinds[strings.TrimPrefix(d.Name, lay.Container)] = d.Kind
 	}
-	for rel, kind := range map[string]string{"": KindContainer, "/root": KindBackupRoot, "/etc": KindPersistent, "/data": KindVolumes, "/data/db": KindVolume} {
+	for rel, kind := range map[string]string{"": KindContainer, "/root": KindBackupRoot, "/etc": KindPersistent} {
 		if kinds[rel] != kind {
 			t.Errorf("%q is %q, want %q (%v)", rel, kinds[rel], kind, kinds)
 		}
@@ -26,8 +26,8 @@ func TestLayoutListsEveryDatasetWithItsKind(t *testing.T) {
 		t.Fatalf("%+v", lay)
 	}
 	for _, d := range lay.Datasets {
-		if d.Kind == KindVolume && d.Props["quota"] != "5G" {
-			t.Errorf("the volume's quota is not recorded for the restore: %v", d.Props)
+		if d.Kind == KindVolume || d.Kind == KindVolumes {
+			t.Errorf("a jail's layout lists a volume: %v", d)
 		}
 		if d.Kind == KindContainer && (d.Props[PropLayout] != string(api.LayoutThin) || d.Props[PropImage] != "fb") {
 			t.Errorf("the container must record layout and image, or a restored jail cannot be observed: %v", d.Props)

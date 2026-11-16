@@ -3,7 +3,6 @@ package auth
 import (
 	"bytes"
 	"crypto/tls"
-	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -252,32 +251,6 @@ func TestTOTPValidate(t *testing.T) {
 	uri := TOTPProvisioningURI("JailOps", "alice@host", sec)
 	if !strings.HasPrefix(uri, "otpauth://totp/JailOps:alice@host?") || !strings.Contains(uri, "secret="+EncodeTOTPSecret(sec)) || !strings.Contains(uri, "issuer=JailOps") {
 		t.Fatal(uri)
-	}
-}
-
-func TestRecoveryCodes(t *testing.T) {
-	codes, hashes, err := GenerateRecoveryCodes(10)
-	if err != nil || len(codes) != 10 || len(hashes) != 10 {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	for i, c := range codes {
-		if len(c) != 11 || c[5] != '-' || seen[c] {
-			t.Fatalf("bad code %q", c)
-		}
-		seen[c] = true
-		if hashes[i] != HashRecoveryCode(c) {
-			t.Fatal("hash mismatch")
-		}
-		if _, err := hex.DecodeString(hashes[i]); err != nil || len(hashes[i]) != 64 {
-			t.Fatal("hash format")
-		}
-		if HashRecoveryCode(strings.ToUpper(strings.Replace(c, "-", " ", 1))) != hashes[i] {
-			t.Fatal("normalisation")
-		}
-	}
-	if HashRecoveryCode("aaaaa-bbbbb") == HashRecoveryCode("aaaaa-bbbbc") {
-		t.Fatal("collision")
 	}
 }
 

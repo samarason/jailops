@@ -40,7 +40,7 @@ type hostBackups struct {
 
 // buildHostBackups builds the host-side backup service from the configuration.
 // It is nil when the configuration has no backup section.
-func buildHostBackups(cfg Config, hostUUID string, z zfs.Client, log *slog.Logger, opts Options, agents hostbackup.Agents) (*hostBackups, error) {
+func buildHostBackups(cfg Config, hostUUID string, z zfs.Client, log *slog.Logger, opts Options, agents hostbackup.Agents, mounts hostbackup.DatasetMounter) (*hostBackups, error) {
 	b := cfg.Backup
 	if b == nil {
 		return nil, nil
@@ -63,8 +63,8 @@ func buildHostBackups(cfg Config, hostUUID string, z zfs.Client, log *slog.Logge
 	}
 	ad := &backupAdapters{late: late, defaultStorage: service.DefaultStorage}
 	deps := hostbackup.Deps{
-		ZFS: z, Jails: ad, Objects: ad, Policies: ad, Host: ad, Catalog: cat,
-		Images: hostbackup.ImagegenImages{Manager: ad.imageManager}, Mounter: opts.BackupMounter, Agents: agents,
+		ZFS: z, Jails: ad, Volumes: ad, Objects: ad, Policies: ad, Host: ad, Catalog: cat,
+		Images: hostbackup.ImagegenImages{Manager: ad.imageManager}, Mounter: opts.BackupMounter, Agents: agents, Datasets: mounts,
 	}
 	svc, err := hostbackup.New(hc, deps)
 	if err != nil {
@@ -106,8 +106,8 @@ func runToAPI(r hostbackup.Run) api.BackupRun {
 		Snapshot: r.Snapshot, Full: r.Full, Bytes: r.Bytes, NewBytes: r.NewBytes, Files: r.Files, Warnings: r.Warnings, Depth: r.Depth, Problems: r.Problems}
 }
 
-func (b backupAdmin) RunPolicy(ctx context.Context, project, policy string) ([]api.BackupRun, error) {
-	runs, err := b.s.RunNow(ctx, project, policy)
+func (b backupAdmin) RunPolicy(ctx context.Context, project, policy string, noVolumes bool) ([]api.BackupRun, error) {
+	runs, err := b.s.RunNowWith(ctx, project, policy, hostbackup.RunOptions{NoVolumes: noVolumes})
 	out := make([]api.BackupRun, 0, len(runs))
 	for _, r := range runs {
 		out = append(out, runToAPI(r))
@@ -144,17 +144,58 @@ func (a *backupAdapters) Jails(ctx context.Context) ([]hostbackup.JailRecord, er
 	out := make([]hostbackup.JailRecord, 0, len(js))
 	for _, j := range js {
 		rec := hostbackup.JailRecord{Name: j.Name, UUID: j.UUID, Project: j.Project, Labels: j.Labels, Spec: j.Spec,
-			Container: j.Layout.Container, Image: j.Image}
+			Container: j.Layout.Container, Image: j.Image, VolumeIDs: j.VolumeIDs}
 		for _, d := range j.Layout.Datasets {
 			hd := hostbackup.Dataset{Name: d.Name, Kind: d.Kind, Mountpoint: d.Mountpoint, Props: d.Props}
-			if d.Locked {
-				hd.Skip = hostbackup.SkipLocked
+			if d.Delegated {
+				hd.Skip = hostbackup.SkipDelegated
 			}
 			rec.Datasets = append(rec.Datasets, hd)
 		}
 		out = append(out, rec)
 	}
 	return out, nil
+}
+
+// Volumes implements hostbackup.VolumeSource: every volume of every project is one record, however many jails attach it.
+func (a *backupAdapters) Volumes(ctx context.Context) ([]hostbackup.JailRecord, error) {
+	s, err := a.late.get()
+	if err != nil {
+		return nil, err
+	}
+	vs, err := s.BackupVolumes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]hostbackup.JailRecord, 0, len(vs))
+	for _, v := range vs {
+		spec := v.Spec
+		d := hostbackup.Dataset{Name: v.Dataset, Kind: hostbackup.KindVolume, Mountpoint: v.Mountpoint}
+		if v.Locked {
+			d.Skip = hostbackup.SkipLocked
+		}
+		out = append(out, hostbackup.JailRecord{Name: v.Name, UUID: v.UUID, Project: v.Project, Labels: v.Labels, Container: v.Dataset,
+			IsVolume: true, Volume: &spec, Datasets: []hostbackup.Dataset{d}})
+	}
+	return out, nil
+}
+
+// RestoreVolume implements hostbackup.VolumeHost.
+func (a *backupAdapters) RestoreVolume(ctx context.Context, project, name string, spec api.VolumeSpec, labels map[string]string, passphrase string) (string, func(context.Context) error, error) {
+	s, err := a.late.get()
+	if err != nil {
+		return "", nil, err
+	}
+	return s.RestoreVolume(ctx, project, name, spec, labels, passphrase)
+}
+
+// CompleteVolume implements hostbackup.VolumeHost.
+func (a *backupAdapters) CompleteVolume(ctx context.Context, project, name string) error {
+	s, err := a.late.get()
+	if err != nil {
+		return err
+	}
+	return s.CompleteRestoredVolume(ctx, project, name)
 }
 
 // Network, Policy and AddressSet implement backup.ObjectSource without a project. There is no default project, so

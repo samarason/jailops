@@ -6,11 +6,11 @@ const form = (o: Partial<AllowForm>): AllowForm => ({ kind: 'jail', jail: '', se
 describe('app access: the source', () => {
   it('accepts IPv4 and IPv6 addresses and prefixes, and nothing else', () => {
     for (const ok of ['192.0.2.7', '192.0.2.0/24', '0.0.0.0/0', '2001:db8::1', '2001:db8::/64', '::/0', '::1', '2001:db8:0:0:0:0:0:1', '::ffff:192.0.2.1', 'fe80::1/10']) expect(isAddressOrPrefix(ok), ok).toBe(true)
-    for (const bad of ['', 'web', '192.0.2', '192.0.2.256', '192.0.2.1/33', '192.0.2.01', '2001:db8::/129', '2001:db8:::1', '1::2::3', '1:2:3:4:5:6:7:8:9', '192.0.2.0/24/1', '@web', '2001:db8::g', '192.0.2.1/']) expect(isAddressOrPrefix(bad), bad).toBe(false)
+    for (const bad of ['', 'web', '192.0.2', '192.0.2.256', '192.0.2.1/33', '192.0.2.01', '2001:db8::/129', '2001:db8:::1', '1::2::3', '1:2:3:4:5:6:7:8:9', '192.0.2.0/24/1', '@web', 'jail:web', '2001:db8::g', '192.0.2.1/']) expect(isAddressOrPrefix(bad), bad).toBe(false)
   })
   it('writes the source the way the server reads it', () => {
-    expect(sourceOf(form({ kind: 'jail', jail: 'web' }))).toBe('@web')
-    expect(sourceOf(form({ kind: 'set', set: 'office' }))).toBe('@office')
+    expect(sourceOf(form({ kind: 'jail', jail: 'web' }))).toBe('jail:web')
+    expect(sourceOf(form({ kind: 'set', set: 'office' }))).toBe('set:office')
     expect(sourceOf(form({ kind: 'cidr', cidr: ' 192.0.2.0/24 ' }))).toBe('192.0.2.0/24')
     expect(sourceOf(form({ kind: 'host' }))).toBe('host')
   })
@@ -52,8 +52,8 @@ describe('app access: the form', () => {
     expect(validateAllow(form({ kind: 'jail', jail: 'web', db: 'Bad' }), true).db).toBe('dbFormat')
   })
   it('sends only what was given', () => {
-    expect(allowBody(form({ kind: 'jail', jail: 'web' }), true)).toEqual({ source: '@web' })
+    expect(allowBody(form({ kind: 'jail', jail: 'web' }), true)).toEqual({ source: 'jail:web' })
     expect(allowBody(form({ kind: 'host', ports: '80 443', db: 'x' }), false, true)).toEqual({ source: 'host', ports: ['80', '443'], dry_run: true })
-    expect(allowBody(form({ kind: 'jail', jail: 'web', db: ' shop ' }), true)).toEqual({ source: '@web', database: 'shop' })
+    expect(allowBody(form({ kind: 'jail', jail: 'web', db: ' shop ' }), true)).toEqual({ source: 'jail:web', database: 'shop' })
   })
 })

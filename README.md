@@ -9,7 +9,7 @@ JailOps targets **FreeBSD 15.1 and later**; older releases are not looked at, an
 What is available today and what comes next: [the roadmap](https://jailops.net/status/).
 
 - Thin jails as ZFS clones of immutable, upgradable pkgbase image generations
-- Managed VNET bridges with deterministic IPv4 and IPv6 allocation. No DHCP, no radvd, no SLAAC
+- Routed VNET networks with deterministic IPv4 and IPv6 allocation, one link per jail. No DHCP, no radvd, no SLAAC
 - PF anchors per jail
 - Encrypted, deduplicated backups to a keyless backup node, with restore and restore tests
 - Local-first: every host has its own API and console. A hub manages many hosts; cluster mode is on the roadmap
@@ -29,11 +29,10 @@ License: BSD-2-Clause.
 ## Install (FreeBSD)
 
     pkg install jailops                    # from pkg.jailops.net: add the repository first, see "Packages" below
-    jailops-priv init -pool zroot          # the user, the datasets and the configuration
-    sysrc jailops_priv_enable=YES jailopsd_enable=YES jailopsd_web=YES    # jailopsd_web: the web console on :39110
-    service jailops_priv start && service jailopsd start
-    jailops doctor
-    jailops user create admin --admin --password-prompt    # then sign in at https://HOST:39110/
+    jailops-setup                          # as root: init, forwarding, pf.conf, services, doctor, first admin
+
+`jailops-setup -n` shows what it would do; it asks before it changes pf, then prints the console's address
+(`https://HOST:39110/`). What it does step by step, and how to do it by hand, is in [docs/install.md](docs/install.md).
 
 ### Packages
 

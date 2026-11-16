@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"jailops.net/jailops/internal/plan"
 	"jailops.net/jailops/internal/render"
@@ -154,7 +155,12 @@ func (PkgBase) sets(s api.ImageSpec) []string {
 	if len(s.Source.Sets) > 0 {
 		return s.Source.Sets
 	}
-	return []string{"FreeBSD-set-minimal-jail"}
+	// The minimal jail set (35 packages) is not enough for software from the FreeBSD ports: a package is built against
+	// a complete base system and does not name the base libraries it needs (PostgreSQL stopped at "libexecinfo.so.1 not
+	// found"), and administrators expect sysrc(8), ssh, ee, ntp, ftp and bmake in a jail. The optional jail set
+	// (about 105 packages, 160 MiB) brings them; the development set (compiler and headers, 570 MiB) is left out: an
+	// image that builds software names FreeBSD-set-devel in source.sets.
+	return []string{"FreeBSD-set-minimal-jail", "FreeBSD-set-optional-jail"}
 }
 
 // pkgArgv builds a `pkg -r <root>` argv with a private repository
@@ -166,7 +172,7 @@ func (p PkgBase) pkgArgv(b *Build, abi string, args ...string) []string {
 	if abi == "" {
 		abi, _ = p.abi(b.Spec)
 	}
-	base := []string{"pkg", "-r", b.Root, "-o", "ABI=" + abi, "-o", "REPOS_DIR=" + path.Join(b.Work, "repos"), "-o", "IGNORE_OSVERSION=yes"}
+	base := []string{"pkg", "-r", b.Root, "-o", "ABI=" + abi, "-o", "REPOS_DIR=" + path.Join(b.Work, "repos"), "-o", "IGNORE_OSVERSION=yes", "-o", "PKG_CACHEDIR=" + b.M.Layout.PkgCache()}
 	return append(base, args...)
 }
 
@@ -183,13 +189,50 @@ func (r *pkgRun) step(name string, args ...string) plan.Step {
 		Name: name, Describe: quote(r.p.pkgArgv(r.b, r.abi, args...)),
 		Do: func(ctx context.Context) error {
 			argv := r.p.pkgArgv(r.b, r.abi, args...)
-			out, err := r.b.M.Exec.Run(ctx, argv)
-			if err != nil {
-				return fmt.Errorf("%s: %w: %s", quote(argv), err, tail(out))
+			var out []byte
+			var err error
+			// A mirror that does not answer for a moment must not fail an image build: pkg keeps what it already
+			// fetched in its cache, so a second try only asks for what is missing.
+			for try := 0; ; try++ {
+				if out, err = r.b.M.Exec.Run(ctx, argv); err == nil {
+					return nil
+				}
+				if try >= fetchRetries || !transientFetch(out) {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("%s: %w: %s", quote(argv), err, tail(out))
+				case <-time.After(fetchBackoff << try):
+				}
 			}
-			return nil
+			return fmt.Errorf("%s: %w: %s", quote(argv), err, tail(out))
 		},
 	}
+}
+
+var (
+	// fetchRetries is how many more times a pkg step is tried when a mirror could not be reached.
+	fetchRetries = 3
+	// fetchBackoff is the wait before the first retry; it doubles each time.
+	fetchBackoff = 5 * time.Second
+)
+
+// transientFetch says whether the output of a failed pkg run is a network failure that a retry can cure: a mirror
+// that cannot be reached or answers with a server error. A signature that does not match, a missing package or an
+// unknown option are never retried.
+func transientFetch(out []byte) bool {
+	low := strings.ToLower(string(out))
+	for _, m := range []string{
+		"no route to host", "operation timed out", "connection timed out", "connection refused", "connection reset",
+		"network is unreachable", "temporary failure in name resolution", "could not resolve", "service unavailable",
+		"bad gateway", "gateway timeout", "http error 5", "502 ", "503 ", "504 ", "try again",
+	} {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // abiStep asks the host's pkg for its ABI. The answer replaces the one
@@ -235,6 +278,7 @@ func (p PkgBase) repoConf(b *Build) plan.Step {
 	m := b.M
 	file := path.Join(b.Work, "repos", "jailops.conf")
 	url := b.Spec.Source.Repo
+	keys := b.Spec.Source.Keys
 	if url == "" {
 		if isRelease(b.Spec.Release) {
 			_, minor, err := parseRelease(b.Spec.Release)
@@ -244,10 +288,14 @@ func (p PkgBase) repoConf(b *Build) plan.Step {
 			}
 			url = fmt.Sprintf("pkg+https://pkg.FreeBSD.org/${ABI}/base_release_%d", minor)
 		} else {
+			// base_latest is signed with the key of the ports repositories, not the pkgbase release keys (verified on
+			// 15.2-PRERELEASE: with pkgbase-15 pkg answers "No trusted public keys found")
 			url = "pkg+https://pkg.FreeBSD.org/${ABI}/base_latest"
+			if keys == "" {
+				keys = "/usr/share/keys/pkg"
+			}
 		}
 	}
-	keys := b.Spec.Source.Keys
 	if keys == "" {
 		keys = "/usr/share/keys/pkgbase-${VERSION_MAJOR}"
 	}
@@ -271,20 +319,66 @@ func (p PkgBase) repoConf(b *Build) plan.Step {
 
 func (p PkgBase) Install(b *Build) ([]plan.Step, error) {
 	r := &pkgRun{p: p, b: b}
-	steps := append([]plan.Step{p.repoConf(b), r.abiStep()}, p.keysSteps(b)...)
+	steps := append([]plan.Step{p.cacheStep(b), p.repoConf(b), r.abiStep()}, p.keysSteps(b)...)
 	steps = append(steps,
 		r.step("pkg-update", "update", "-f", "-r", "jailops"),
-		r.step("pkg-install", append([]string{"install", "-y", "-r", "jailops"}, p.sets(b.Spec)...)...))
+		r.step("pkg-install", append([]string{"install", "-y", "-r", "jailops"}, p.sets(b.Spec)...)...),
+		r.step("pkg-clean", "clean", "-y"),
+		p.rcConfStep(b))
 	return steps, nil
+}
+
+// cacheStep creates the shared package cache dataset (Layout.CacheDS) when it is missing, and removes it again if
+// this build made it and fails: a build leaves nothing behind, and the next one makes it anew.
+func (PkgBase) cacheStep(b *Build) plan.Step {
+	m := b.M
+	ds := m.Layout.CacheDS()
+	made := false
+	return plan.Step{Name: "ensure-cache-dataset", Describe: "zfs create " + ds + " (the package cache, mounted at " + m.Layout.CacheMount() + ") if missing",
+		Do: func(ctx context.Context) error {
+			if ok, err := m.ZFS.Exists(ctx, ds); err != nil || ok {
+				return err
+			}
+			made = true
+			return m.ZFS.Create(ctx, ds, map[string]string{PropManaged: "on", PropKind: "cache", "mountpoint": m.Layout.CacheMount()})
+		},
+		Undo: func(ctx context.Context) error {
+			if ok, err := m.ZFS.Exists(ctx, ds); !made || err != nil || !ok {
+				return err
+			}
+			return m.ZFS.DestroyRecursive(ctx, ds)
+		},
+		UndoOnFail: true}
+}
+
+// jailRcConf is the /etc/rc.conf a new generation starts with (the base ships none): what a jail wants of rc
+// whatever its network is. sendmail would start an MTA in every jail, syslogd would open a network socket, and a
+// jail has nothing to clear in /tmp that the jail's own filesystem does not already start empty.
+const jailRcConf = `# Defaults for a JailOps jail. Change them with sysrc(8); JailOps keeps its own settings in /etc/rc.conf.local.
+sendmail_enable="NONE"
+syslogd_flags="-ss"
+`
+
+// rcConfStep writes jailRcConf, unless the image already has an /etc/rc.conf.
+func (PkgBase) rcConfStep(b *Build) plan.Step {
+	m, dst := b.M, path.Join(b.Root, "etc/rc.conf")
+	return plan.Step{Name: "write-rc-conf", Describe: "write " + dst + " (sendmail off, syslogd without a network socket) unless it exists",
+		Do: func(ctx context.Context) error {
+			if ok, err := m.Files.Exists(ctx, dst); err != nil || ok {
+				return err
+			}
+			return m.Files.WriteAtomic(ctx, dst, []byte(jailRcConf))
+		}}
 }
 
 func (p PkgBase) Upgrade(b *Build) ([]plan.Step, error) {
 	r := &pkgRun{p: p, b: b}
-	steps := append([]plan.Step{p.repoConf(b), r.abiStep()}, p.keysSteps(b)...)
+	steps := append([]plan.Step{p.cacheStep(b), p.repoConf(b), r.abiStep()}, p.keysSteps(b)...)
 	return append(steps,
 		r.step("pkg-update", "update", "-f", "-r", "jailops"),
 		r.step("pkg-upgrade", "upgrade", "-y", "-r", "jailops"),
-		r.step("pkg-install", append([]string{"install", "-y", "-r", "jailops"}, p.sets(b.Spec)...)...)), nil
+		r.step("pkg-install", append([]string{"install", "-y", "-r", "jailops"}, p.sets(b.Spec)...)...),
+		r.step("pkg-clean", "clean", "-y")), nil
 }
 
 func (p PkgBase) Check(b *Build) []plan.Step {
@@ -559,7 +653,8 @@ func (a *alpineRun) configSteps() []plan.Step {
 			if err != nil {
 				return nil, fmt.Errorf("the host's /etc/resolv.conf is needed for apk inside the build: %w", err)
 			}
-			return d, nil
+			// the marker lets a jail made from the image get its own resolv.conf at its first start
+			return append([]byte(render.ResolvMarker+"\n"), d...), nil
 		}),
 		write("write-apk-repositories", "etc/apk/repositories", func(context.Context) ([]byte, error) {
 			return []byte(fmt.Sprintf("%s/v%s/main\n%s/v%s/community\n", alpineMirror, a.branch, alpineMirror, a.branch)), nil
@@ -572,7 +667,7 @@ func (a *alpineRun) configSteps() []plan.Step {
 // when a later one fails, and teardown is idempotent.
 func (a *alpineRun) jailUpSteps() []plan.Step {
 	b, m := a.b, a.m
-	n, _, _ := render.LinuxDevfsRuleset(nil)
+	n := render.BuildDevfsRuleset
 	a.ruleset = n
 	root := strings.TrimSuffix(b.Root, "/")
 	mounts := render.LinuxMounts(root, n, 256<<20)

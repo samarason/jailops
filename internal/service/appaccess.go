@@ -47,27 +47,25 @@ type accessRole struct {
 	DatabaseCreated bool   `json:"database_created,omitempty"`
 	// Login is false after a deny that kept the role.
 	Login bool `json:"login"`
+	// Unfinished: the allow that set its password stopped before the end, so the password was never shown. The
+	// role is in the registry from the moment psql made it; the next allow sets a new password and finishes.
+	Unfinished bool `json:"unfinished,omitempty"`
 }
 
 type accessGrant struct {
-	Source        string `json:"source"`
-	Kind          string `json:"kind"`
-	SourceProject string `json:"source_project,omitempty"`
-	SourceName    string `json:"source_name,omitempty"`
-	// From are the firewall endpoints of the rule; Prefixes what the
-	// client authentication lines name.
-	From     []string `json:"from"`
-	Prefixes []string `json:"prefixes,omitempty"`
-	Ports    []string `json:"ports"`
-	Database string   `json:"database,omitempty"`
-	HBA      []string `json:"hba,omitempty"`
-	// AppAddrs are the app's addresses an outbound rule of a source jail in
-	// another project names.
-	AppAddrs   []string  `json:"app_addrs,omitempty"`
-	SourceGone bool      `json:"source_gone,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at,omitzero"`
-	CreatedBy  string    `json:"created_by,omitempty"`
+	Source     string `json:"source"`
+	Kind       string `json:"kind"`
+	SourceName string `json:"source_name,omitempty"`
+	// From are the firewall endpoints of the rule (jail:web and set:office stay references, read at every render);
+	// Prefixes are what the client authentication lines name, a copy made when the grant was.
+	From      []string  `json:"from"`
+	Prefixes  []string  `json:"prefixes,omitempty"`
+	Ports     []string  `json:"ports"`
+	Database  string    `json:"database,omitempty"`
+	HBA       []string  `json:"hba,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at,omitzero"`
+	CreatedBy string    `json:"created_by,omitempty"`
 }
 
 func (s *Service) accKind() kindStore[accessRecord] {
@@ -158,66 +156,22 @@ func (r accessRecord) role(name string) (accessRole, int) {
 
 // resolved is a source looked up in the project.
 type resolvedSource struct {
-	canonical, kind, project, name string
-	from                           []string
-	prefixes                       []netip.Prefix
+	canonical, kind, name string
+	from                  []string
+	prefixes              []netip.Prefix
 }
 
-// resolveSource looks a parsed source up: a bare @name is a jail of the
-// project or an address set of it (both is ambiguous), @project/jail a jail of
-// a project the caller may use, host the gateway addresses of the app jail's
-// networks.
+// resolveSource looks a parsed source up: jail:NAME is a jail of the project, set:NAME an address set of it, host the
+// gateway addresses of the app jail's networks. The firewall rule keeps jail:NAME or set:NAME, which is read at every
+// render; prefixes are what pg_hba.conf gets, a copy.
 func (s *Service) resolveSource(ctx context.Context, t appTarget, src apps.Source) (resolvedSource, error) {
 	proj := t.p.Meta.Name
-	out := resolvedSource{canonical: src.Canonical(proj), kind: src.Kind}
-	jailSource := func(project, name string) (resolvedSource, error) {
-		if project != proj && !ActorFrom(ctx).CanProject(project) {
-			return out, notFound("project", project)
-		}
-		key, err := validate.QualifiedName(project, name)
-		if err != nil {
-			return out, notFound("jail", name)
-		}
-		j, err := s.jailSnapshot(key)
-		if err != nil {
-			return out, notFound("jail", project+"/"+name)
-		}
-		if key == t.key {
-			return out, invalid("a jail always reaches itself; name another source")
-		}
-		addrs := jailAddrs(s.effective(j))
-		if len(addrs) == 0 {
-			return out, invalid("jail %q has no address to allow", name)
-		}
-		out.kind, out.name = api.AccessSourceJail, name
-		if project != proj {
-			out.project = project
-		}
-		for _, a := range addrs {
-			out.from = append(out.from, a.String())
-			out.prefixes = append(out.prefixes, apps.HostPrefix(a))
-		}
-		return out, nil
-	}
+	out := resolvedSource{canonical: src.Canonical(), kind: src.Kind}
 	switch src.Kind {
 	case api.AccessSourceHost:
-		for _, na := range s.effective(t.jail).Network {
-			n, err := s.netKind.get(na.Network)
-			if err != nil {
-				continue
-			}
-			if n.Spec.IPv4 != nil {
-				if a, ok := parseAddr(n.Spec.IPv4.Gateway); ok {
-					out.from = append(out.from, a.String())
-					out.prefixes = append(out.prefixes, apps.HostPrefix(a))
-				}
-			}
-			if v6 := n.Spec.IPv6; v6 != nil && v6.Mode == api.IPv6Routed {
-				if a, ok := parseAddr(v6.Gateway); ok && !a.IsLinkLocalUnicast() {
-					out.from = append(out.from, a.String())
-					out.prefixes = append(out.prefixes, apps.HostPrefix(a))
-				}
-			}
+		for _, a := range gatewayAddrs(s, &t.jail) {
+			out.from = append(out.from, a.String())
+			out.prefixes = append(out.prefixes, apps.HostPrefix(a))
 		}
 		if len(out.from) == 0 {
 			return out, invalid("the networks of jail %q have no gateway address the host connects from", t.jail.Metadata.Name)
@@ -230,44 +184,80 @@ func (s *Service) resolveSource(ctx context.Context, t appTarget, src apps.Sourc
 		}
 		out.prefixes = []netip.Prefix{src.Prefix}
 		return out, nil
-	case api.AccessSourceJail:
-		return jailSource(src.Project, src.Name)
-	}
-	// a bare @name
-	sets, err := s.allSets(proj)
-	if err != nil {
-		return out, err
-	}
-	_, isSet := sets[src.Name]
-	key, kerr := validate.QualifiedName(proj, src.Name)
-	isJail := false
-	if kerr == nil {
-		_, err := s.jailSnapshot(key)
-		isJail = err == nil
-	}
-	switch {
-	case isSet && isJail:
-		return out, invalid("@%s is both a jail and an address set of project %s", src.Name, proj).
-			WithHint("name the jail as @" + proj + "/" + src.Name + ", or rename the address set")
-	case isJail:
-		return jailSource(proj, src.Name)
-	case isSet:
-		members, err := validate.FlattenSet(src.Name, sets)
+	case api.AccessSourceSet:
+		sets, err := s.allSets(proj)
 		if err != nil {
 			return out, err
 		}
-		out.kind, out.name, out.from = api.AccessSourceSet, src.Name, []string{"@" + src.Name}
-		for _, m := range members {
-			if pf, err := netip.ParsePrefix(m); err == nil {
-				out.prefixes = append(out.prefixes, pf.Masked())
-			} else if a, err := netip.ParseAddr(m); err == nil {
-				out.prefixes = append(out.prefixes, apps.HostPrefix(a))
-			}
+		if _, ok := sets[src.Name]; !ok {
+			return out, api.Errorf(api.CodeNotFound, "address set %q not found in project %s", src.Name, proj).
+				WithHint("jailops firewall address-set list shows the names")
 		}
+		prefixes, err := s.setPrefixes(proj, src.Name)
+		if err != nil {
+			return out, err
+		}
+		out.name, out.from, out.prefixes = src.Name, []string{"set:" + src.Name}, prefixes
 		return out, nil
 	}
-	return out, api.Errorf(api.CodeNotFound, "@%s is neither a jail nor an address set of project %s", src.Name, proj).
-		WithHint("jailops list and jailops firewall address-set list show the names")
+	key, kerr := validate.QualifiedName(proj, src.Name)
+	if kerr != nil {
+		return out, notFound("jail", src.Name)
+	}
+	if _, err := s.jailSnapshot(key); err != nil {
+		return out, api.Errorf(api.CodeNotFound, "jail %q not found in project %s", src.Name, proj).
+			WithHint("jailops list shows the names")
+	}
+	if key == t.key {
+		return out, invalid("a jail always reaches itself; name another source")
+	}
+	prefixes, err := s.jailPrefixes(proj, src.Name)
+	if err != nil {
+		return out, err
+	}
+	if len(prefixes) == 0 {
+		return out, invalid("jail %q has no address to allow", src.Name)
+	}
+	out.name, out.from, out.prefixes = src.Name, []string{"jail:" + src.Name}, prefixes
+	return out, nil
+}
+
+// jailPrefixes are the addresses of a jail of the project as /32 and /128 prefixes.
+func (s *Service) jailPrefixes(project, name string) ([]netip.Prefix, error) {
+	key, err := validate.QualifiedName(project, name)
+	if err != nil {
+		return nil, notFound("jail", name)
+	}
+	j, err := s.jailSnapshot(key)
+	if err != nil {
+		return nil, notFound("jail", name)
+	}
+	var out []netip.Prefix
+	for _, a := range jailAddrs(s.effective(j)) {
+		out = append(out, apps.HostPrefix(a))
+	}
+	return out, nil
+}
+
+// setPrefixes are the members of an address set of the project, jails and other sets followed, as prefixes.
+func (s *Service) setPrefixes(project, name string) ([]netip.Prefix, error) {
+	sets, err := s.allSets(project)
+	if err != nil {
+		return nil, err
+	}
+	members, err := validate.FlattenSet(name, sets, s.projectJailAddrs(project))
+	if err != nil {
+		return nil, err
+	}
+	var out []netip.Prefix
+	for _, m := range members {
+		if pf, err := netip.ParsePrefix(m); err == nil {
+			out = append(out, pf.Masked())
+		} else if a, err := netip.ParseAddr(m); err == nil {
+			out = append(out, apps.HostPrefix(a))
+		}
+	}
+	return out, nil
 }
 
 // grantRules are the inbound rules of a grant in the app's policy: one per protocol.
@@ -281,26 +271,6 @@ func grantRules(g accessGrant) []api.FirewallRule {
 	for _, proto := range sortedKeys(byProto) {
 		out = append(out, api.FirewallRule{Name: apps.AccessRuleName(g.Source, proto), Action: "allow", Direction: "in", Proto: proto,
 			From: slices.Clone(g.From), Ports: byProto[proto]})
-	}
-	return out
-}
-
-// outRules are the rules a grant from a jail of another project puts into
-// that jail's own managed policy: its project's isolation blocks traffic out
-// of it to another project's network unless a rule opens it.
-func outRules(g accessGrant, appProject, appJail string) []api.FirewallRule {
-	if g.SourceProject == "" || len(g.AppAddrs) == 0 {
-		return nil
-	}
-	byProto := map[string][]string{}
-	for _, p := range g.Ports {
-		num, proto, _ := strings.Cut(p, "/")
-		byProto[proto] = append(byProto[proto], num)
-	}
-	var out []api.FirewallRule
-	for _, proto := range sortedKeys(byProto) {
-		out = append(out, api.FirewallRule{Name: apps.AccessOutRuleName(appProject, appJail, proto), Action: "allow", Direction: "out", Proto: proto,
-			To: slices.Clone(g.AppAddrs), Ports: byProto[proto]})
 	}
 	return out
 }
@@ -330,10 +300,9 @@ func (s *Service) accessPolicy(project, jail string) (object[api.FirewallPolicyS
 }
 
 // writeAccessPolicy changes the managed policy of a jail: the rules named in
-// drop go, add comes in (sorted by name), and closed, when set, makes the
-// policy deny by default. A policy with no rule that closes nothing is
-// deleted. It reports whether anything changed.
-func (s *Service) writeAccessPolicy(ctx context.Context, project, jail string, closed bool, drop []string, add []api.FirewallRule, dry bool) (bool, error) {
+// drop go and add comes in (sorted by name). The policy always says its
+// defaults: deny inbound, allow outbound. It reports whether anything changed.
+func (s *Service) writeAccessPolicy(ctx context.Context, project, jail string, drop []string, add []api.FirewallRule, dry bool) (bool, error) {
 	name := apps.AccessPolicyName(jail)
 	if err := validate.Name("policy", name); err != nil {
 		return false, invalid("the jail name %q is too long for its access policy %s", jail, name)
@@ -346,8 +315,9 @@ func (s *Service) writeAccessPolicy(ctx context.Context, project, jail string, c
 	if !ok {
 		next = api.FirewallPolicySpec{}
 	}
-	if closed {
-		next.DefaultIn = "deny"
+	next.DefaultIn, next.DefaultOut = "deny", "allow"
+	if next.Comment == "" {
+		next.Comment = "who may connect to " + jail + " (managed by app access)"
 	}
 	gone := map[string]bool{}
 	for _, n := range drop {
@@ -368,21 +338,11 @@ func (s *Service) writeAccessPolicy(ctx context.Context, project, jail string, c
 	if ok && jsonEq(next, cur.Spec) {
 		return false, nil
 	}
-	if !ok && len(next.Rules) == 0 && next.DefaultIn == "" {
-		return false, nil
-	}
 	if dry {
 		return true, nil
 	}
 	ks := s.polKind.p(project)
-	if len(next.Rules) == 0 && next.DefaultIn == "" {
-		if err := ks.delete(ctx, name, AnyGeneration); err != nil {
-			return false, err
-		}
-		s.kick()
-		return true, nil
-	}
-	sets, err := s.allSets(project)
+	sets, err := s.allRefs(project)
 	if err != nil {
 		return false, err
 	}
@@ -406,7 +366,7 @@ func (s *Service) writeAccessPolicy(ctx context.Context, project, jail string, c
 // closeApp creates the closed policy of a freshly installed app (the
 // installation's step close-firewall).
 func (s *Service) closeApp(ctx context.Context, project, jail string) error {
-	_, err := s.writeAccessPolicy(ctx, project, jail, true, nil, nil, false)
+	_, err := s.writeAccessPolicy(ctx, project, jail, nil, nil, false)
 	return err
 }
 
@@ -517,7 +477,7 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 	acc := t.access()
 	i := findGrant(t.rec.Grants, rs.canonical)
 	now := s.now().UTC()
-	g := accessGrant{Source: rs.canonical, Kind: rs.kind, SourceProject: rs.project, SourceName: rs.name, From: rs.from,
+	g := accessGrant{Source: rs.canonical, Kind: rs.kind, SourceName: rs.name, From: rs.from,
 		CreatedAt: now, CreatedBy: ActorFrom(ctx).Name}
 	for _, p := range ports {
 		g.Ports = append(g.Ports, p.String())
@@ -530,15 +490,11 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 		g.CreatedAt, g.CreatedBy, g.Database = old.CreatedAt, old.CreatedBy, old.Database
 	}
 	appAddrs := jailAddrs(s.effective(t.jail))
-	if rs.project != "" {
-		for _, a := range appAddrs {
-			g.AppAddrs = append(g.AppAddrs, a.String())
-		}
-	}
 	rec := t.rec
 	if !t.has {
 		rec = accessRecord{}
 	}
+	has := t.has // the registry object exists (it is saved once psql made a role)
 	var st []apps.Statement
 	var password string
 	needRestart := false
@@ -583,7 +539,7 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 		case pr.Role && ri < 0:
 			return res, api.Errorf(api.CodeConflict, "role %q exists in the database server and was not made by JailOps", db).
 				WithHint("JailOps never changes a role it did not make: choose another name with --db")
-		case !pr.Role || !role.Login || req.Rotate:
+		case !pr.Role || !role.Login || role.Unfinished || req.Rotate:
 			if password, err = apps.NewPassword(accessRand); err != nil {
 				return res, internal(err)
 			}
@@ -632,11 +588,6 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 		res.Grant.Rules = append(res.Grant.Rules, apps.RuleText(r))
 	}
 	res.Steps = append(res.Steps, fmt.Sprintf("firewall policy %s: %s", apps.AccessPolicyName(jail), strings.Join(res.Grant.Rules, "; ")))
-	if rs.project != "" {
-		for _, r := range outRules(g, proj, jail) {
-			res.Steps = append(res.Steps, fmt.Sprintf("firewall policy %s of project %s: %s", apps.AccessPolicyName(rs.name), rs.project, apps.RuleText(r)))
-		}
-	}
 	if !polOK {
 		res.Notes = append(res.Notes, "jail "+jail+" was open to its network until now (installed before app access); from now on it is closed to every source that is not allowed")
 	}
@@ -690,12 +641,18 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 				role, ri := rec.role(db)
 				created := slices.ContainsFunc(main, func(x apps.Statement) bool { return strings.HasPrefix(x.SQL, "CREATE DATABASE") })
 				if ri < 0 {
-					rec.Roles = append(rec.Roles, accessRole{Name: db, DatabaseCreated: created, Login: true})
+					rec.Roles = append(rec.Roles, accessRole{Name: db, DatabaseCreated: created, Login: true, Unfinished: password != ""})
 				} else {
 					role.Login, role.DatabaseCreated = true, role.DatabaseCreated || created
+					role.Unfinished = role.Unfinished || password != ""
 					rec.Roles[ri] = role
 				}
 				changed = true
+				// the registry knows the role before anything else can fail: a retry finds it as JailOps's own
+				if err := s.saveAccess(ctx, proj, jail, has, rec); err != nil {
+					return res, err
+				}
+				has = true
 			}
 			if len(listenSt) > 0 {
 				if _, err := s.psql(ctx, t.key, "postgres", listenSt); err != nil {
@@ -738,23 +695,16 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 				}
 			}
 			res.ConnectionString = apps.ConnectionString(db, password, host, t.dbPort(), db)
-			res.Notes = append(res.Notes, "the connection string is shown once and stored nowhere; jailops app allow "+jail+" from "+rs.canonical+" --rotate makes a new password")
+			res.Notes = append(res.Notes, "the connection string is shown once and stored nowhere; jailops app allow "+jail+" --from "+rs.canonical+" --rotate makes a new password")
 		} else {
 			res.Notes = append(res.Notes, "role "+db+" exists: its password was shown when it was made; --rotate makes a new one")
 		}
 	}
-	pc, err := s.writeAccessPolicy(ctx, proj, jail, true, drop, rules, false)
+	pc, err := s.writeAccessPolicy(ctx, proj, jail, drop, rules, false)
 	if err != nil {
 		return res, err
 	}
 	changed = changed || pc
-	if rs.project != "" {
-		oc, err := s.writeAccessPolicy(ctx, rs.project, rs.name, false, nil, outRules(g, proj, jail), false)
-		if err != nil {
-			return res, err
-		}
-		changed = changed || oc
-	}
 	if i >= 0 && !grantEqual(t.rec.Grants[i], g) {
 		changed = true
 	}
@@ -768,7 +718,10 @@ func (s *Service) AllowApp(ctx context.Context, name string, req api.AppAllow) (
 		} else {
 			rec.Grants = append(rec.Grants, g)
 		}
-		if err := s.saveAccess(ctx, proj, jail, t.has, rec); err != nil {
+		if _, ri := rec.role(g.Database); ri >= 0 {
+			rec.Roles[ri].Unfinished = false // the password is in this answer
+		}
+		if err := s.saveAccess(ctx, proj, jail, has, rec); err != nil {
 			return res, err
 		}
 	} else {
@@ -834,7 +787,7 @@ func (s *Service) DenyApp(ctx context.Context, name string, req api.AppDeny) (ap
 	}
 	proj, jail := t.p.Meta.Name, t.jail.Metadata.Name
 	res := api.AppDenyResult{Jail: jail, DryRun: req.DryRun}
-	canonical := src.Canonical(proj)
+	canonical := src.Canonical()
 	i := findGrant(t.rec.Grants, canonical)
 	if i < 0 {
 		res.Notes = append(res.Notes, "nothing changed: "+canonical+" has no access to "+jail)
@@ -871,23 +824,13 @@ func (s *Service) DenyApp(ctx context.Context, name string, req api.AppDeny) (ap
 	for _, r := range grantRules(g) {
 		res.Steps = append(res.Steps, "firewall policy "+apps.AccessPolicyName(jail)+": remove "+apps.RuleText(r))
 	}
-	if g.SourceProject != "" {
-		for _, r := range outRules(g, proj, jail) {
-			res.Steps = append(res.Steps, fmt.Sprintf("firewall policy %s of project %s: remove %s", apps.AccessPolicyName(g.SourceName), g.SourceProject, apps.RuleText(r)))
-		}
-	}
 	res.Changed = true
 	if req.DryRun {
 		return res, nil
 	}
 	// the firewall first: nothing gets in from the moment of the deny on
-	if _, err := s.writeAccessPolicy(ctx, proj, jail, true, ruleNames(grantRules(g)), nil, false); err != nil {
+	if _, err := s.writeAccessPolicy(ctx, proj, jail, ruleNames(grantRules(g)), nil, false); err != nil {
 		return res, err
-	}
-	if g.SourceProject != "" && !g.SourceGone {
-		if _, err := s.writeAccessPolicy(ctx, g.SourceProject, g.SourceName, false, ruleNames(outRules(g, proj, jail)), nil, false); err != nil && !api.IsCode(err, api.CodeNotFound) {
-			return res, err
-		}
 	}
 	if g.Database != "" {
 		wrote, err := s.writeHBA(ctx, t.key, rec.HBAFile, hbaLines(rest))
@@ -925,7 +868,7 @@ func (s *Service) DenyApp(ctx context.Context, name string, req api.AppDeny) (ap
 // grantToAPI is a grant as the API shows it; pf are the rendered lines of
 // the jail's anchor, when known.
 func (s *Service) grantToAPI(g accessGrant, rec accessRecord, pf []string) api.AppAccessGrant {
-	out := api.AppAccessGrant{Source: g.Source, SourceKind: g.Kind, SourceProject: g.SourceProject, Addresses: g.Prefixes,
+	out := api.AppAccessGrant{Source: g.Source, SourceKind: g.Kind, Addresses: g.Prefixes,
 		Ports: g.Ports, Database: g.Database, Role: g.Database, HBA: g.HBA, CreatedAt: g.CreatedAt, UpdatedAt: g.UpdatedAt,
 		CreatedBy: g.CreatedBy, PF: pf}
 	if out.Ports == nil {
@@ -984,7 +927,7 @@ func (s *Service) appAccess(ctx context.Context, t appTarget) api.AppAccess {
 	}
 	// the rendered anchor, for the lines each rule became
 	anchor := ""
-	if sets, err := s.allSets(proj); err == nil {
+	if sets, err := s.allRefs(proj); err == nil {
 		if b, err := s.buildJail(ctx, t.jail, sets); err == nil {
 			anchor = b.desired.Ruleset
 		}
@@ -1004,23 +947,33 @@ func (s *Service) appAccess(ctx context.Context, t appTarget) api.AppAccess {
 			pf = append(pf, anchorLines(anchor, r.Name)...)
 		}
 		ag := s.grantToAPI(g, t.rec, pf)
-		ag.Problems = s.grantProblems(g, pol, ok, hba, hbaOK)
+		ag.Problems = s.grantProblems(proj, jail, g, pol, ok, hba, hbaOK)
 		out.Grants = append(out.Grants, ag)
 	}
 	return out
 }
 
-// grantProblems compares a grant with the policy and the file.
-func (s *Service) grantProblems(g accessGrant, pol object[api.FirewallPolicySpec], polOK bool, hba []string, hbaOK bool) []string {
+// grantProblems compares a grant with the policy and the file. The firewall rule of @web or @office follows the jail
+// or the set at every render; the lines of pg_hba.conf are a copy made when the grant was, so a change of the
+// addresses is reported here and repeating the allow refreshes the lines.
+func (s *Service) grantProblems(project, jail string, g accessGrant, pol object[api.FirewallPolicySpec], polOK bool, hba []string, hbaOK bool) []string {
 	var out []string
-	if g.SourceGone {
-		out = append(out, "the source jail no longer exists; its rule was removed: deny the grant to take the rest back")
+	if g.Database != "" && (g.Kind == api.AccessSourceJail || g.Kind == api.AccessSourceSet) {
+		var now []netip.Prefix
+		var err error
+		if g.Kind == api.AccessSourceJail {
+			now, err = s.jailPrefixes(project, g.SourceName)
+		} else {
+			now, err = s.setPrefixes(project, g.SourceName)
+		}
+		if err == nil && !samePrefixes(now, g.Prefixes) {
+			out = append(out, fmt.Sprintf("the addresses of %s are now %s but the pg_hba lines name %s: repeat jailops app allow %s --from %s to refresh them",
+				g.Source, prefixList(now), strings.Join(g.Prefixes, ", "), jail, g.Source))
+		}
 	}
-	if !g.SourceGone {
-		for _, r := range grantRules(g) {
-			if !polOK || !slices.ContainsFunc(pol.Spec.Rules, func(x api.FirewallRule) bool { return jsonEq(x, r) }) {
-				out = append(out, "firewall rule missing from policy "+pol.Meta.Name+": "+apps.RuleText(r))
-			}
+	for _, r := range grantRules(g) {
+		if !polOK || !slices.ContainsFunc(pol.Spec.Rules, func(x api.FirewallRule) bool { return jsonEq(x, r) }) {
+			out = append(out, "firewall rule missing from policy "+pol.Meta.Name+": "+apps.RuleText(r))
 		}
 	}
 	if hbaOK {
@@ -1085,7 +1038,7 @@ func (s *Service) accessDrift(ctx context.Context) ([]string, int, error) {
 		_ = j
 		for _, g := range o.Spec.Grants {
 			n++
-			for _, p := range s.grantProblems(g, pol, ok, hba, hbaOK) {
+			for _, p := range s.grantProblems(o.Meta.Project, o.Meta.Name, g, pol, ok, hba, hbaOK) {
 				out = append(out, o.Meta.Project+"/"+o.Meta.Name+" "+g.Source+": "+p)
 			}
 		}
@@ -1094,8 +1047,8 @@ func (s *Service) accessDrift(ctx context.Context) ([]string, int, error) {
 }
 
 // accessJailGone cleans up after a jail was deleted: its own managed policy
-// and registry go, and the grants that named it as their source lose their
-// firewall rules (the address may be given to another jail) and say so.
+// and registry go. A jail that a grant names as its source is not deleted
+// (noRuleNamesJail), so no grant is left naming a jail that is gone.
 func (s *Service) accessJailGone(ctx context.Context, project, jail string) {
 	if _, ok, err := s.accessPolicy(project, jail); err == nil && ok {
 		if err := s.polKind.p(project).delete(ctx, apps.AccessPolicyName(jail), AnyGeneration); err != nil {
@@ -1105,32 +1058,6 @@ func (s *Service) accessJailGone(ctx context.Context, project, jail string) {
 	if s.accKind().p(project).exists(jail) {
 		if err := s.accKind().p(project).delete(ctx, jail, AnyGeneration); err != nil {
 			s.log.Warn("app access: removing the grants of a deleted jail failed", "project", project, "jail", jail, "err", err)
-		}
-	}
-	objs, err := s.accKind().listAll()
-	if err != nil {
-		return
-	}
-	for _, o := range objs {
-		rec, touched := o.Spec, false
-		for i, g := range rec.Grants {
-			srcProj := g.SourceProject
-			if srcProj == "" {
-				srcProj = o.Meta.Project
-			}
-			if g.Kind != api.AccessSourceJail || g.SourceGone || srcProj != project || g.SourceName != jail {
-				continue
-			}
-			if _, err := s.writeAccessPolicy(ctx, o.Meta.Project, o.Meta.Name, false, ruleNames(grantRules(g)), nil, false); err != nil {
-				s.log.Warn("app access: removing the rule of a deleted source jail failed", "app", o.Meta.Name, "source", g.Source, "err", err)
-				continue
-			}
-			rec.Grants[i].SourceGone, touched = true, true
-		}
-		if touched {
-			if _, err := s.accKind().p(o.Meta.Project).update(ctx, o.Meta.Name, AnyGeneration, nil, nil, rec); err != nil {
-				s.log.Warn("app access: recording a deleted source jail failed", "app", o.Meta.Name, "err", err)
-			}
 		}
 	}
 	s.kick()
@@ -1145,4 +1072,25 @@ func (s *Service) accessRulesFor(project, jail string) (rules []api.FirewallRule
 		return nil, false
 	}
 	return pol.Spec.Rules, pol.Spec.DefaultIn == "deny"
+}
+
+// samePrefixes says whether a list of prefixes is the list of strings, in any order.
+func samePrefixes(now []netip.Prefix, then []string) bool {
+	a := make([]string, 0, len(now))
+	for _, p := range now {
+		a = append(a, p.String())
+	}
+	b := slices.Clone(then)
+	sort.Strings(a)
+	sort.Strings(b)
+	return slices.Equal(a, b)
+}
+
+func prefixList(ps []netip.Prefix) string {
+	var out []string
+	for _, p := range ps {
+		out = append(out, p.String())
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }

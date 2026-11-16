@@ -25,88 +25,36 @@ func installedNames(ctx context.Context, c *sdk.Client) ([]string, error) {
 	return out, err
 }
 
-// completeSource completes the SOURCE of allow and deny: the jails of the
-// project and its address sets as @name, the jails of another project after
-// @project/, and host.
-func (a *app) completeSource() completer {
-	return func(cmd *cobra.Command, args []string, prefix string) ([]string, cobra.ShellCompDirective) {
-		ctx, cancel := context.WithTimeout(cmd.Context(), 3*time.Second)
-		defer cancel()
-		c, err := a.connect(ctx)
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveNoFileComp
-		}
-		var out []string
-		if p, _, ok := strings.Cut(strings.TrimPrefix(prefix, "@"), "/"); ok && strings.HasPrefix(prefix, "@") {
-			pc := c.Project(p)
-			for j, err := range pc.Jails().List(ctx) {
-				if err != nil {
-					break
-				}
-				out = append(out, "@"+p+"/"+j.Metadata.Name)
-			}
-			return out, cobra.ShellCompDirectiveNoFileComp
-		}
-		for j, err := range c.Jails().List(ctx) {
-			if err != nil {
-				break
-			}
-			if len(args) == 0 || j.Metadata.Name != args[0] {
-				out = append(out, "@"+j.Metadata.Name)
-			}
-		}
-		for s, err := range c.Firewall().AddressSets().List(ctx) {
-			if err != nil {
-				break
-			}
-			out = append(out, "@"+s.Metadata.Name)
-		}
-		out = append(out, "host")
-		return out, cobra.ShellCompDirectiveNoFileComp
-	}
-}
+// completeSource completes the SOURCE of allow and deny: jail:, set: and host, then the jails and the address sets of
+// the project.
+func (a *app) completeSource() completer { return a.refCompleter(placeSource) }
 
-// completeAppFromSource completes APP, then the word from, then SOURCE.
-func (a *app) completeAppFromSource() completer {
-	apps := a.completeNames(installedNames)
-	src := a.completeSource()
-	return func(cmd *cobra.Command, args []string, prefix string) ([]string, cobra.ShellCompDirective) {
-		switch len(args) {
-		case 0:
-			return apps(cmd, args, prefix)
-		case 1:
-			return []string{"from"}, cobra.ShellCompDirectiveNoFileComp
-		case 2:
-			return src(cmd, args, prefix)
-		}
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-}
+// completeMember completes a member of an address set, --address of address-set create: jail: and set:, then the
+// jails and the other address sets of the project (not the set being made).
+func (a *app) completeMember() completer { return a.refCompleter(placeMember) }
 
-// appFromArgs checks APP from SOURCE.
-func appFromArgs(cmd *cobra.Command, args []string) error {
-	if len(args) != 3 || args[1] != "from" {
-		return usagef("%s APP from SOURCE", cmd.CommandPath())
-	}
-	return nil
-}
+// completeApp completes APP, the jail an app was installed as.
+func (a *app) completeApp() completer { return a.completeArgs1(a.completeNames(installedNames)) }
+
+// completeArgs1 gives the first argument the completion and no later one any.
+func (a *app) completeArgs1(first completer) completer { return completeArgs(first, completeNone) }
 
 func (a *app) appAllow() *cobra.Command {
 	var ports []string
-	var db string
+	var db, from, proto string
 	var rotate bool
 	cmd := &cobra.Command{
-		Use:   "allow APP from SOURCE",
+		Use:   "allow APP --from SOURCE",
 		Short: "Let a jail, an address set or an address reach an installed app",
 		Long: `An installed app is closed: nothing but the jail itself reaches it until a
 source is allowed. 'allow' adds a rule to the app's firewall policy app-APP
-(managed by app access) for the ports of the definition, or those of --port.
+(managed by app access) for the ports of the definition, or those of --port
+(with --proto udp for UDP ports).
 
-APP is the jail the app was installed as. SOURCE is one of:
-  @JAIL           a jail of the project (its addresses)
-  @PROJECT/JAIL   a jail of another project you may use; its own policy gets the
-                  rule that lets it out to the app
-  @SET            an address set of the project (firewall address-set)
+APP is the jail the app was installed as. --from SOURCE is one of:
+  jail:NAME       a jail of the project: the rule names it, so it follows the jail
+  set:NAME        an address set of the project (firewall address-set); a source in
+                  another project is written as addresses in a set
   ADDRESS, PREFIX an address or a prefix, such as 192.0.2.7 or 192.0.2.0/24
   host            the host itself (the gateway addresses of the app's networks)
 
@@ -122,22 +70,29 @@ or a database it did not make.
 Allowing again changes nothing unless the ports or the source's addresses
 changed. --dry-run prints the rule, the pg_hba line and the SQL, without the
 password, and changes nothing.`,
-		Example: `jailops app allow db from @web
-jailops app allow db from @web --db shop
-jailops app allow db from @shop/api --db api
-jailops app allow cache from 192.0.2.0/24 --port 6379
-jailops app allow web from host
-jailops app allow db from @web --rotate
-jailops app allow db from @web --dry-run`,
-		Args:              appFromArgs,
-		ValidArgsFunction: a.completeAppFromSource(),
+		Example: `jailops app allow db --from jail:web
+jailops app allow db --from jail:web --db shop
+jailops app allow db --from set:office --db staff
+jailops app allow cache --from 192.0.2.0/24 --port 6379
+jailops app allow web --from host
+jailops app allow db --from jail:web --rotate
+jailops app allow db --from jail:web --dry-run`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: a.completeApp(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			if from == "" {
+				return usagef("--from is required: who may connect (jail:NAME, set:NAME, an address or prefix, or host)")
+			}
+			apiPorts, err := appPorts(ports, proto)
+			if err != nil {
+				return err
+			}
 			c, err := a.connect(ctx)
 			if err != nil {
 				return err
 			}
-			res, err := c.Apps().Allow(ctx, args[0], api.AppAllow{Source: args[2], Ports: ports, Database: db, Rotate: rotate, DryRun: a.dryRun})
+			res, err := c.Apps().Allow(ctx, args[0], api.AppAllow{Source: from, Ports: apiPorts, Database: db, Rotate: rotate, DryRun: a.dryRun})
 			if err != nil {
 				return err
 			}
@@ -149,7 +104,11 @@ jailops app allow db from @web --dry-run`,
 		},
 	}
 	f := cmd.Flags()
-	f.StringSliceVar(&ports, "port", nil, "port N or N/tcp or N/udp to open, repeatable (default: the ports of the definition)")
+	f.StringVar(&from, "from", "", "who may connect: jail:NAME, set:NAME, an address or prefix, or host (required)")
+	f.StringSliceVar(&ports, "port", nil, "port to open, repeatable or comma separated (default: the ports of the definition)")
+	f.StringVar(&proto, "proto", "tcp", "protocol of --port: tcp or udp")
+	_ = cmd.RegisterFlagCompletionFunc("from", a.completeSource())
+	enumFlag(cmd, "proto", "tcp", "udp")
 	f.StringVar(&db, "db", "", "database and role of a postgresql grant (default: the source jail's name)")
 	f.BoolVar(&rotate, "rotate", false, "give the grant's role a new password, printed once")
 	return cmd
@@ -210,8 +169,9 @@ func printAllowed(w io.Writer, jail string, res api.AppAllowResult) {
 
 func (a *app) appDeny() *cobra.Command {
 	var dropRole bool
+	var from string
 	cmd := &cobra.Command{
-		Use:   "deny APP from SOURCE",
+		Use:   "deny APP --from SOURCE",
 		Short: "Take back what 'app allow' gave a source",
 		Long: `Remove the firewall rule of a grant from the app's policy and, for a
 postgresql app, its lines from the managed block of pg_hba.conf. The role
@@ -219,23 +179,26 @@ JailOps made for it loses its login and password and keeps its database;
 --drop-role drops the role instead (what it owned goes to postgres, the
 database is kept). A role another grant uses, or one JailOps did not make, is
 left as it is. Denying a source that has no grant changes nothing.`,
-		Example: `jailops app deny db from @web
-jailops app deny db from @web --drop-role
-jailops app deny cache from 192.0.2.0/24 --dry-run`,
-		Args:              appFromArgs,
-		ValidArgsFunction: a.completeAppFromSource(),
+		Example: `jailops app deny db --from jail:web
+jailops app deny db --from jail:web --drop-role
+jailops app deny cache --from 192.0.2.0/24 --dry-run`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: a.completeApp(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			if from == "" {
+				return usagef("--from is required: the source to take back (jail:NAME, set:NAME, an address or prefix, or host)")
+			}
 			c, err := a.connect(ctx)
 			if err != nil {
 				return err
 			}
 			if dropRole && !a.dryRun {
-				if err := a.confirm("Drop the role of " + args[2] + " in " + args[0] + "? Its objects are given to postgres."); err != nil {
+				if err := a.confirm("Drop the role of " + from + " in " + args[0] + "? Its objects are given to postgres."); err != nil {
 					return err
 				}
 			}
-			res, err := c.Apps().Deny(ctx, args[0], api.AppDeny{Source: args[2], DropRole: dropRole, DryRun: a.dryRun})
+			res, err := c.Apps().Deny(ctx, args[0], api.AppDeny{Source: from, DropRole: dropRole, DryRun: a.dryRun})
 			if err != nil {
 				return err
 			}
@@ -262,6 +225,8 @@ jailops app deny cache from 192.0.2.0/24 --dry-run`,
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&from, "from", "", "the source to take back: jail:NAME, set:NAME, an address or prefix, or host (required)")
+	_ = cmd.RegisterFlagCompletionFunc("from", a.completeSource())
 	cmd.Flags().BoolVar(&dropRole, "drop-role", false, "drop the role JailOps made for the grant (its objects go to postgres; the database is kept)")
 	return cmd
 }
@@ -354,7 +319,7 @@ func printAccess(w io.Writer, acc api.AppAccess) {
 		fprintln(w, "Warning: "+x)
 	}
 	if len(acc.Grants) == 0 {
-		fprintln(w, "No grants. Allow one with: jailops app allow "+acc.Jail+" from SOURCE")
+		fprintln(w, "No grants. Allow one with: jailops app allow "+acc.Jail+" --from SOURCE")
 		return
 	}
 	for _, g := range acc.Grants {
@@ -385,4 +350,22 @@ func printAccess(w io.Writer, acc api.AppAccess) {
 		lines("pg_hba", g.HBA)
 		lines("Problem", g.Problems)
 	}
+}
+
+// appPorts is the ports of --port for the API: N for TCP, N/udp for UDP.
+func appPorts(ports []string, proto string) ([]string, error) {
+	if proto != "tcp" && proto != "udp" {
+		return nil, usagef("--proto is tcp or udp, not %q", proto)
+	}
+	out := make([]string, 0, len(ports))
+	for _, p := range ports {
+		if strings.Contains(p, "/") {
+			return nil, usagef("--port %q: give the port number and say the protocol with --proto", p)
+		}
+		if proto == "udp" {
+			p += "/udp"
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }

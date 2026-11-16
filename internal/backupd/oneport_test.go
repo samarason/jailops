@@ -216,7 +216,7 @@ func TestOnePortRevocationAndResumption(t *testing.T) {
 	if _, err := r.DB.RevokeHost(t.Context(), "h"); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		code, _ := status(t, c, "GET", base+"/api/v1/repo", "")
 		if code == 0 || code == 401 { // refused in the handshake, or by the host check

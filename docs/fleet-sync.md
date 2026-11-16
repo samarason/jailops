@@ -37,16 +37,16 @@ Every declarative object a user can create with the CLI has a file kind. Nothing
 
 | By CLI | In the repository | Notes |
 |---|---|---|
-| `jailops project create/set` | `projects/<name>.yaml` (Project) | networks granted, storage granted with quotas (`fast=500G` is `{storage: fast, quota: 500G}`), `quotas`, the mandatory `firewall` policy, the `images` allow-list, and `hosts` (a project spans hosts and has the same UUID on each). Removing a grant revokes it |
+| `jailops project create/set` | `projects/<name>.yaml` (Project) | networks granted, storage granted with quotas (`fast=500G` is `{storage: fast, quota: 500G}`), `quotas`, the mandatory policies (`firewall_policies`, a list), the `images` allow-list, and `hosts` (a project spans hosts and has the same UUID on each). Removing a grant revokes it |
 | `jailops network grant/revoke` | the project's `networks:` list | a network belongs to **one** project: `validate` refuses a second grant |
 | `jailops network create` | `shared/networks/*.yaml` (or `hosts/<h>/networks/`) | every field of the API: IPv4, IPv6 `routed`, `proxy` and `none`, uplink, `private`, DNS, MTU, exclusions. See below for the CLI flags |
 | `jailops wireguard create --mode server`, `peer add` | `hosts/<host>/wireguard/*.yaml` (WireGuard) | servers only, public parts only; see "WireGuard" below |
 | `jailops storage create` | `hosts/<host>/storage/*.yaml` (Storage) | a dataset on any pool, a big HDD pool included; `compression`. Datasets may not be equal or nested |
 | `jailops image create`, `image build` | `shared/images/*.yaml` (Image) | `aliases` are in the spec. `build: true` builds the **first** generation when the host has none (a fresh host has none and a jail cannot be created from an image without one). Later generations are an operation, not a declaration: `jailops image build`, or a rollout |
-| `jailops create` | `projects/<p>/jails/*.yaml` (Jail) | the whole spec: network and storage (explicit), `volumes`, `host_mounts`, `proxy`, `devfs`, `resources`, `boot`, `update` schedule, `firewall`, `env` with `secret:` references, `provision`, `labels`. `start: true` and `after:` hooks (start, restart, snapshot, exec) run once, after creation |
-| `jailops firewall policy/address-set create` | `projects/<p>/firewall-policies/`, `address-sets/` | the project's mandatory policy is set in a second write once the policy exists |
+| `jailops create` | `projects/<p>/jails/*.yaml` (Jail) | the whole spec: network and storage (explicit), `volumes`, `proxy`, `devfs`, `resources`, `boot`, `update` schedule, `firewall` (`policies`, a list, and `tags`), `env` with `secret:` references, `provision`, `labels`. `start: true` and `after:` hooks (start, restart, snapshot, exec) run once, after creation |
+| `jailops firewall policy/address-set create` | `projects/<p>/firewall-policies/`, `address-sets/` | the project's mandatory policies are set in a second write once the policies exist |
 | `jailops backup target create` | `shared/backup-targets/*.yaml` (BackupTarget) | `kind: node` needs `address` and a pinned `fingerprint` |
-| `jailops backup policy create` | `projects/<p>/backup-policies/*.yaml` (BackupPolicy) | selector, targets, `schedule`, retention, `verify_schedule`, `verify_mode` |
+| `jailops backup policy create` | `projects/<p>/backup-policies/*.yaml` (BackupPolicy) | selector, targets, `schedule`, retention, `include_state`, `exclude_volumes`, `verify_schedule`, `verify_mode` |
 | `jailops profile create` | `profiles/` or `projects/<p>/profiles/` (Profile) | see "Profiles" below |
 | secrets in a jail's environment | `secret:<name>` and `secret:<dotted.path>` | age and SOPS, see "Secrets" |
 | `jailops app install` | `projects/<p>/apps/*.yaml` (App) | installed once, never changed or deleted; see "Apps and who may reach them" |
@@ -55,9 +55,10 @@ Every declarative object a user can create with the CLI has a file kind. Nothing
 Because the specs are the wire types of the API (decoded strictly: a misspelled key is an error), a field the daemon gains is
 declarable the day it exists. `validate` also checks, offline, what the daemon would refuse at apply time: the name rules of
 jails, networks, policies, address sets and WireGuard tunnels, overlapping subnets and storage datasets, the IPv6 proxy and routed prefix limits,
-the proxy gateway and uplink, reserved fields (`encrypted`, `packages`), and that a **profile cannot carry `host_mounts` or
-`zfs_delegation`**. It warns about a volume with `encrypted: true`: its passphrase is typed by a person, so create that jail
-with `jailops jail create` ([storage.md](storage.md#encrypted-volumes)); sync manages it from then on.
+the proxy gateway and uplink, reserved fields (`encrypted`, `packages`), that a jail's `volumes` name a volume (`kind: Volume`, `projects/<p>/volumes/`), and that a **profile cannot carry `host_mounts` or
+`zfs_delegation`**. It refuses a `Volume` with `encrypted: true`: its passphrase is typed by a person, so create that volume
+with `jailops volume create --encrypted` ([storage.md](storage.md#encrypted-volumes)); a jail of the repository can then
+attach it, and `validate` warns that a volume a jail names is not declared.
 
 **IPv6, CLI flags and YAML.** `--ipv6-mode routed` and `--ipv6-mode proxy` fill in what a file spells out:
 
@@ -67,8 +68,7 @@ with `jailops jail create` ([storage.md](storage.md#encrypted-volumes)); sync ma
 | `--ipv6 2001:db8:1:2:100::/80 --ipv6-mode proxy` | `mode: proxy`, `subnet: 2001:db8:1:2:100::/80`, `gateway: fe80::1`, `range: <first>-<last>` and `uplink: vtnet0` on the network |
 | `--ipv4 10.50.0.1/24` | `ipv4: {subnet: 10.50.0.0/24, gateway: 10.50.0.1, range: 10.50.0.2-10.50.0.254}` |
 
-Proxy mode also needs the host operator's `ndp-proxy` line in `priv.conf`; that is root's decision and not something an API
-call can make. Complete files are in `examples/ipv6-switched-cloud` and `examples/ipv6-routed-hetzner`.
+Complete files are in `examples/ipv6-switched-cloud` and `examples/ipv6-routed-hetzner`.
 
 **WireGuard.** A tunnel belongs to one host (its endpoint and its keys are that host's), so it is declared under
 `hosts/<host>/wireguard/` and never under `shared/`. A file carries the spec of a **server**: `mode: server`, `interface`,
@@ -115,7 +115,7 @@ strict decoding refuses one:
   reproduced from a file; sync's own access is the token or certificate you give it (`secrets set`, `remote bootstrap`).
 - Backup keys and the backup node itself: `jailops backup key create/escrow` produce key material that must not be in git, and the
   node (`jailops-backupd`) is configured by its own `backupd.yaml`. Targets and policies are declarable; see `examples/web-stack`.
-- `priv.conf` (`ndp-proxy`, `admin-host-mount`, ...) and `jailopsd.yaml`: they are the host operator's boundary, on purpose out of
+- `priv.conf` (`admin-host-mount`, ...) and `jailopsd.yaml`: they are the host operator's boundary, on purpose out of
   reach of the API. `examples/provisioning/bootstrap.sh` writes them when it installs a host.
 - Runtime actions and data: snapshots (use the `snapshot` hook), backups and restores, exec, updates, generations after the first.
 - Provisioning **files**: `provision.files` copies from `<state_dir>/project-files/<project>/` on the host. Sync does not upload
@@ -136,18 +136,18 @@ command's flags name:
       app: postgresql                    # the definition in the host's catalog
       network: shop                      # default: the project's only network
       storage: default                   # default: the project's only storage
-      image: freebsd-15@stable           # default: the only FreeBSD image with the alias stable
+      image: freebsd-15-1                # default: the host's FreeBSD image of the newest release it can run
       limits: {memory: 2G, disk: 20G, cpu: 2}   # replace the definition's resource hints
 
 `plan` shows `create` when the jail does not exist, and `sync --apply` installs it and waits for the installation. After
 that sync **never reinstalls, changes or deletes** it: the jail is the app's data, an installation is not repeatable as an
 update, and the API gives an installed jail no ownership marker, so `--prune` never applies to apps (remove one with
-`jailops delete`). A jail of that name that was not installed from the catalog, or runs another app, is a refusal (the
+`jailops delete`, which shows what it destroys and asks for the name). A jail of that name that was not installed from the catalog, or runs another app, is a refusal (the
 label `jailops.app` differs) and nothing is applied. An App and a Jail document of the same name are a `validate` error. The
 `limits`, `network` and the rest are read only at the installation; a later change of the document is not drift.
 
 An **AppAccess** document is the list of sources allowed to reach one installed app (metadata.name is the app's jail). An
-installed app is closed to everything else; each entry is what `jailops app allow APP from SOURCE` is given:
+installed app is closed to everything else; each entry is what `jailops app allow APP --from SOURCE` is given:
 
     apiVersion: jailops/v1
     kind: AppAccess
@@ -155,15 +155,13 @@ installed app is closed to everything else; each entry is what `jailops app allo
     hosts: [db1]
     spec:
       grants:
-        - {source: "@web", database: shop}           # a jail of the project; database and role shop
-        - {source: "@other/api", database: api}      # a jail of another project
-        - {source: "@office"}                        # an address set of the project
+        - {source: "jail:web", database: shop}           # a jail of the project; database and role shop
+        - {source: "set:office"}                        # an address set of the project
         - {source: 192.0.2.0/24, ports: ["5432"]}    # an address or a prefix
         - {source: host}                             # the host itself
 
 `ports` are `N` or `N/udp` (default: the ports of the definition), `database` names the database and role of a
-PostgreSQL grant (default: the source jail's name). Sources compare in the form the host stores them (`@shop/web` in project
-`shop` is `@web`, `192.0.2.7/32` is `192.0.2.7`), so `validate` refuses a source listed twice. `plan` compares the list with
+PostgreSQL grant (default: the source jail's name). Sources compare in the form the host stores them (`192.0.2.7/32` is `192.0.2.7`), so `validate` refuses a source listed twice. `plan` compares the list with
 `GET .../access`: a missing grant is `create`, changed ports or a grant the host reports drift for (a missing firewall rule
 or `pg_hba.conf` line) is `update`, both applied with `jailops app allow`. A changed `database` of an existing grant is a plan
 error: deny it first. A grant the host has and the document does not list is `delete`, applied only with `--prune`, as for
@@ -174,14 +172,14 @@ grants of an app. A deny never drops a role: it loses its login and keeps its da
 (`postgres://ROLE:PASSWORD@HOST:5432/DB?sslmode=disable`) once, in the answer of the allow, and keeps only the existence of
 the role. `sync --apply` prints it **once, in its own output**, under the change that made it:
 
-      ok       db1 AppAccess/shop/db from @web (create)
-        connection string for @web on shop/db (shown once, stored nowhere; ...):
+      ok       db1 AppAccess/shop/db from jail:web (create)
+        connection string for jail:web on shop/db (shown once, stored nowhere; ...):
           postgres://shop:...@<address of db>:5432/shop?sslmode=disable
 
 It is not in the plan, not in the JSONL apply log, not in the state directory and never written into the repository. Copy
 it into the application's secret store at once; `watch --apply` prints it to wherever its output goes, so make the first
 apply of a new grant by hand. Re-applying never makes a new password (sync never asks for a rotation);
-`jailops app allow APP from SOURCE --rotate` does, and prints the new string.
+`jailops app allow APP --from SOURCE --rotate` does, and prints the new string.
 
 **Order.** Apps come after every stored kind of the host (images, networks, storage, projects, policies, jails), and
 grants after the apps: a grant's app is installed and its source jails exist when it is allowed. `validate` warns about a
@@ -246,8 +244,8 @@ does not reach every jail at once.
 
 ## Naming rules
 
-File name equals `metadata.name`. Jails, networks and firewall policies use the daemon's rule (`^[a-z][a-z0-9-]{0,62}$`), address
-sets `^[a-z][a-z0-9_]{0,23}$` (they become PF tables, so `web_tier`, not `web-tier`); `validate` says so before the daemon would.
+File name equals `metadata.name`. Every kind uses the daemon's one rule (`^[a-z]([a-z0-9-]*[a-z0-9])?$`, hyphens only, at most 63 characters; an address
+set 29, because its name becomes a PF table with the hyphens written as underscores); `validate` says so before the daemon would.
 
 ## Plain http
 
@@ -266,6 +264,6 @@ Tested with fakes only (in-memory hosts, `internal/fleet/e2e`): `build: true` fo
 and then planning to zero (a WireGuard server with a listed peer included), and the eight example repositories. **UNVERIFIED on a real host:** `build: true` (the first image build
 and then planning to zero, and the nine example repositories. Apps and their grants (`examples/app-access-fleet`) are tested against the
 in-memory host's catalog only: **UNVERIFIED on a real host:** an App installed and an AppAccess applied by sync (the same calls as the CLI). **UNVERIFIED on a real host:** `build: true` (the first image build
-through sync), an IPv6 proxy or routed network created by sync (the same objects created by the CLI are verified), a host mount applied by
+through sync), an IPv6 proxy or routed network created by sync (the same objects created by the CLI are verified), a host-directory volume applied by
 sync with a global-admin token, and `jailops-sync` over the network with a CA-signed server certificate (a pinned self-signed one is
 verified).

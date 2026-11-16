@@ -101,3 +101,13 @@ func (f *FirewallClient) Policies() *Resource[api.FirewallPolicy] {
 func (f *FirewallClient) AddressSets() *Resource[api.AddressSet] {
 	return newResource[api.AddressSet](f.c, "/api/v1/firewall/address-sets")
 }
+
+// Test asks whether a new connection would pass the firewall, and which rule decides at each anchor it meets
+// (POST /api/v1/firewall/test).
+func (f *FirewallClient) Test(ctx context.Context, req api.FirewallTestRequest) (api.FirewallTestResult, error) {
+	if err := f.c.need("firewall_test"); err != nil {
+		return api.FirewallTestResult{}, err
+	}
+	out, _, err := send[api.FirewallTestResult](ctx, f.c, request{method: http.MethodPost, path: "/api/v1/firewall/test", body: req})
+	return out, err
+}

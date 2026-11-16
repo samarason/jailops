@@ -18,7 +18,7 @@ install JailOps, set the host up, start the services, and let `jailops-sync` app
 What it does, in order (each step is idempotent):
 
 1. refuses anything older than FreeBSD 15.1, and a pool that does not exist;
-2. loads `if_bridge`, `if_epair`, `nullfs`, `pf` now and at boot;
+2. loads `if_epair`, `nullfs`, `pf` now and at boot;
 3. installs the packages (`jailops-client`, `jailops`) from `JAILOPS_PKG_DIR` with `pkg add`, or `pkg install jailops` from a
    repository you configured. **`pkg.jailops.net` is not live yet**: build the packages with `just build-freebsd` and
    `scripts/pkg-build.sh` (see `packaging/pkg/README.md`);
@@ -26,8 +26,7 @@ What it does, in order (each step is idempotent):
    pf **without restarting a running one** (a restart cuts an ssh session);
 5. turns on IPv4 and IPv6 forwarding (JailOps never does);
 6. `jailops-priv init -pool $JAILOPS_POOL -web`: the user and groups, the datasets, the directories, `priv.conf` and `jailopsd.yaml`, and the web console on port 39110 (`JAILOPS_WEB=no` leaves it off);
-7. writes what the host operator approves into `priv.conf`: `JAILOPS_NDP_PROXY` (IPv6 proxy mode),
-   `JAILOPS_HOST_MOUNTS` (`admin-host-mount`);
+7. writes what the host operator approves into `priv.conf`: `JAILOPS_HOST_MOUNTS` (`admin-host-mount`);
 8. starts `jailops_priv` and `jailopsd`, waits for the socket and fails if `jailops doctor` shows a `FAIL`, and creates the
    JailOps administrator `JAILOPS_ADMIN_USER` when given (password from `JAILOPS_ADMIN_PASSWORD_FILE`, else generated into `/root/jailops-admin-password`, mode 0600);
 9. clones the fleet repository (`JAILOPS_FLEET_REPO`), installs the age key that opens its SOPS secrets

@@ -222,6 +222,28 @@ func applyEqual(a, b ApplyReq) bool {
 	return fmt.Sprint(a) == fmt.Sprint(b)
 }
 
+// WGRename implements Host.
+func (f *Fake) WGRename(_ context.Context, q RenameReq) error {
+	for _, n := range []string{q.From, q.To} {
+		if err := ValidName("name", n); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.note("rename %s %s", q.From, q.To)
+	o := f.objs[q.From]
+	if o == nil {
+		return nil
+	}
+	if f.objs[q.To] != nil {
+		return api.Errorf(api.CodeAlreadyExists, "wireguard %q already has keys on this host", q.To)
+	}
+	f.objs[q.To] = o
+	delete(f.objs, q.From)
+	return nil
+}
+
 // WGRemove implements Host.
 func (f *Fake) WGRemove(_ context.Context, q RemoveReq) error {
 	if err := ValidName("name", q.Name); err != nil {

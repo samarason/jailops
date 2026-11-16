@@ -28,7 +28,9 @@ type WireGuard struct {
 
 // WireGuardSpec is the desired state of a tunnel.
 type WireGuardSpec struct {
-	Mode WireGuardMode `json:"mode"`
+	// Comment is what the object is for: one line of free text.
+	Comment string        `json:"comment,omitempty"`
+	Mode    WireGuardMode `json:"mode"`
 	// Interface is the interface name, default "wg-<name>" (at most 15 characters, starting with "wg").
 	Interface string `json:"interface,omitempty"`
 	// Address lists the addresses of the interface with their prefix (10.99.0.1/24, fd99::1/64); IPv4 and IPv6.

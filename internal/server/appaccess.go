@@ -27,7 +27,7 @@ func (s *Server) appAccessRoutes() []route {
 				return err
 			}
 			c.object = "/api/v1/jails/" + c.pathArg("name") + "/access"
-			c.detail = "allow source=" + in.Source + " ports=" + strings.Join(in.Ports, ",") + " db=" + in.Database
+			c.detail = "allow source=" + auditValue(in.Source) + " ports=" + auditValue(strings.Join(in.Ports, ",")) + " db=" + auditValue(in.Database)
 			v, err := svc.AllowApp(c.r.Context(), c.pathArg("name"), in)
 			if err != nil {
 				return err
@@ -41,7 +41,7 @@ func (s *Server) appAccessRoutes() []route {
 				return err
 			}
 			c.object = "/api/v1/jails/" + c.pathArg("name") + "/access"
-			c.detail = "deny source=" + in.Source
+			c.detail = "deny source=" + auditValue(in.Source)
 			v, err := svc.DenyApp(c.r.Context(), c.pathArg("name"), in)
 			if err != nil {
 				return err

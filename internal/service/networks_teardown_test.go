@@ -13,8 +13,8 @@ import (
 	"jailops.net/jailops/sdk/api"
 )
 
-// Every network has an anchor (the pass of its gateway port), not only the ones with NAT; deleting the network takes
-// it away so nothing is left that names an interface another network can be given later.
+// Deleting a network takes its anchor away, with or without NAT, so that no translation rule is left for another
+// network that is given the subnet later.
 func TestDeletingANetworkFlushesItsAnchorWithoutNAT(t *testing.T) {
 	st, err := state.Open(t.TempDir(), state.Options{})
 	if err != nil {
@@ -32,12 +32,12 @@ func TestDeletingANetworkFlushesItsAnchorWithoutNAT(t *testing.T) {
 	t.Cleanup(func() { s.Close(); db.Close(); st.Close() })
 
 	anchor := render.NetAnchor("plain")
-	if err := pf.Load(bg, anchor, "pass quick on jo21ga all no state\n"); err != nil {
+	if err := pf.Load(bg, anchor, "match out on em0 inet from 10.21.0.0/24 to ! 10.21.0.0/24 nat-to (em0:0)\n"); err != nil {
 		t.Fatal(err)
 	}
 	s.teardownNetwork(bg, object[api.NetworkSpec]{
 		Meta: api.ObjectMeta{Name: "plain"},
-		Spec: api.NetworkSpec{Bridge: "jo21"},
+		Spec: api.NetworkSpec{},
 	})
 	if got, _ := pf.Read(bg, anchor); got != "" {
 		t.Errorf("the anchor of the deleted network is still loaded:\n%s", got)
@@ -46,7 +46,7 @@ func TestDeletingANetworkFlushesItsAnchorWithoutNAT(t *testing.T) {
 
 func TestDoctorReportsAProxyNetworkThatIsNotAnswering(t *testing.T) {
 	s := newSvc(t)
-	spec := api.NetworkSpec{Bridge: "jo40", Uplink: "vtnet0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80"}}
+	spec := api.NetworkSpec{Uplink: "vtnet0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80"}}
 	if _, err := s.netKind.create(bg, api.ObjectMeta{Name: "sw"}, spec); err != nil {
 		t.Fatalf("cannot create the network: %v", err)
 	}
@@ -84,8 +84,8 @@ func TestNetworksWithOverlappingSubnetsAreRefused(t *testing.T) {
 	v4 := func(subnet, gw, rng string) api.NetworkSpec {
 		return api.NetworkSpec{IPv4: &api.IPv4Net{Subnet: subnet, Gateway: gw, Range: rng}}
 	}
-	v6 := func(subnet, gw, rng string) api.NetworkSpec {
-		return api.NetworkSpec{IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: subnet, Gateway: gw, Range: rng}}
+	v6 := func(subnet, _, rng string) api.NetworkSpec {
+		return api.NetworkSpec{IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: subnet, Range: rng}}
 	}
 	base := []api.NetworkSpec{
 		v4("10.20.0.0/24", "10.20.0.1", "10.20.0.2-10.20.0.9"),
@@ -144,21 +144,10 @@ func TestScrubDetection(t *testing.T) {
 	}
 }
 
-func TestGatewaysWithoutStaticARP(t *testing.T) {
-	ifs := []ifconfig.Iface{
-		{Name: "jo0gb", Flags: []string{"UP", "STATICARP"}},
-		{Name: "jo1gb", Flags: []string{"UP"}},
-	}
-	got := gatewaysWithoutStaticARP(ifs, []string{"jo0", "jo1", "jo2"})
-	if len(got) != 1 || got[0] != "jo1gb" {
-		t.Fatalf("%v", got)
-	}
-}
-
 // A Linux image build in progress counts like a Linux jail for the host pass: the first build needs the Linux modules
 // before any jail exists, and the state goes away again when the build is over.
 func TestALinuxImageBuildAssertsTheLinuxModules(t *testing.T) {
-	if got := hostModules(true); len(got) < 5 || got[3] != "linux64" {
+	if got := hostModules(true); len(got) < 5 || got[2] != "linux64" {
 		t.Fatalf("%v", got)
 	}
 	st, err := state.Open(t.TempDir(), state.Options{})
@@ -193,9 +182,21 @@ func TestALinuxImageBuildAssertsTheLinuxModules(t *testing.T) {
 	}
 }
 
-func TestNetworksWithoutDNS(t *testing.T) {
-	got := networksWithoutDNS(map[string][]string{"a": nil, "b": {"1.1.1.1"}, "c": nil, "d": nil}, map[string]bool{"a": true, "b": true, "c": true})
-	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
-		t.Fatalf("%v", got)
+// A proxy that answers but dropped solicitations over its limits in the last hour is a warning that names the count.
+func TestDoctorWarnsWhenTheProxyDroppedSolicitations(t *testing.T) {
+	s := newSvc(t)
+	spec := api.NetworkSpec{Uplink: "vtnet0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80"}}
+	if _, err := s.netKind.create(bg, api.ObjectMeta{Name: "sw"}, spec); err != nil {
+		t.Fatalf("cannot create the network: %v", err)
+	}
+	s.NetworkStatus("sw", api.NetworkStatus{Conditions: []api.Condition{
+		{Type: "NDPProxy", Status: api.ConditionTrue},
+		{Type: "NDPFlood", Status: api.ConditionFalse, Reason: "Flooded", Message: "4321 solicitation(s) on vtnet0 were dropped over the proxy's limits in the last hour"},
+	}})
+	c := &checkSet{}
+	s.doctorNDPProxy(c)
+	if len(c.list) != 1 || c.list[0].Name != "network.ndproxy" || c.list[0].Status != api.DoctorWarn ||
+		!strings.Contains(c.list[0].Message, "4321") || c.list[0].Hint == "" {
+		t.Fatalf("%+v", c.list)
 	}
 }

@@ -1,18 +1,16 @@
-# Managed by JailOps. Do not edit; changes are overwritten.
-[jailops_devfs_37885=37885]
-add hide
-add path 'null' unhide
-add path 'zero' unhide
-add path 'full' unhide
-add path 'random' unhide
-add path 'urandom' unhide
-add path 'tty' unhide
-add path 'ptmx' unhide
-add path 'pts' unhide
-add path 'pts/*' unhide
-add path 'fd' unhide
-add path 'fd/*' unhide
-add path 'stdin' unhide
-add path 'stdout' unhide
-add path 'stderr' unhide
-add path 'console' unhide
+devfs rule -s 5128 add hide
+devfs rule -s 5128 add path null unhide
+devfs rule -s 5128 add path zero unhide
+devfs rule -s 5128 add path full unhide
+devfs rule -s 5128 add path random unhide
+devfs rule -s 5128 add path urandom unhide
+devfs rule -s 5128 add path tty unhide
+devfs rule -s 5128 add path ptmx unhide
+devfs rule -s 5128 add path pts unhide
+devfs rule -s 5128 add path pts/* unhide
+devfs rule -s 5128 add path fd unhide
+devfs rule -s 5128 add path fd/* unhide
+devfs rule -s 5128 add path stdin unhide
+devfs rule -s 5128 add path stdout unhide
+devfs rule -s 5128 add path stderr unhide
+devfs rule -s 5128 add path console unhide

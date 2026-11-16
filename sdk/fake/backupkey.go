@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 
 	"jailops.net/jailops/sdk/api"
 )
@@ -119,6 +121,7 @@ func (s *Server) handleBackupRun(w http.ResponseWriter, r *http.Request) {
 				runs = append(runs, api.BackupRun{ID: "run-" + snap, Kind: "backup", Policy: req.Policy, Target: b.Spec.Target, Project: j.Metadata.Project, Jail: j.Metadata.Name,
 					JailUUID: j.Metadata.UUID, Started: now, Finished: now, OK: true, Snapshot: snap})
 			}
+			runs = append(runs, s.backupVolumes(pol, *req, runs)...)
 			return runs, nil
 		})
 		_ = rc
@@ -191,4 +194,44 @@ func decodeOptional[T any](r *http.Request) (T, *api.Error) {
 		return v, api.Errorf(api.CodeInvalid, "invalid request body: %v", err)
 	}
 	return v, nil
+}
+
+// backupVolumes backs up the volumes of a policy run like the daemon does: the volumes the selected jails attach and
+// the volumes whose labels match the selector, each once, unless the policy or the run leaves them out. The runs of the
+// jails are given to find the selected ones. s.mu is held.
+func (s *Server) backupVolumes(pol *api.BackupPolicy, req api.BackupRunRequest, jailRuns []api.BackupRun) []api.BackupRun {
+	if pol.Spec.ExcludeVolumes || req.NoVolumes {
+		return nil
+	}
+	attached := map[string]bool{}
+	for _, r := range jailRuns {
+		if j := s.jails.items[s.jails.keyIn(r.Project, r.Jail)]; j != nil {
+			for _, v := range j.Spec.Volumes {
+				attached[r.Project+"/"+v.Name] = true
+			}
+		}
+	}
+	var out []api.BackupRun
+	for _, k := range slices.Sorted(maps.Keys(s.volumes.items)) {
+		v := s.volumes.items[k]
+		if v.Metadata.Project != pol.Metadata.Project {
+			continue
+		}
+		if !attached[k] && !fakeSelects(pol.Spec.Selector, v.Metadata.Labels) {
+			continue
+		}
+		now := s.now()
+		snap := now.Format("20060102150405") + "-" + randHex(4)
+		spec := v.Spec
+		b := &api.Backup{Metadata: api.ObjectMeta{Name: snap, Project: v.Metadata.Project},
+			Spec: api.BackupSpec{Kind: "volume", Volume: &spec, Jail: v.Metadata.Name, JailUUID: v.Metadata.UUID, HostUUID: s.uuid, Policy: req.Policy,
+				Snapshot: snap, KeyDomain: s.bkDomain}}
+		if len(pol.Spec.Targets) > 0 {
+			b.Spec.Target = pol.Spec.Targets[0]
+		}
+		s.backups.insert(b, true)
+		out = append(out, api.BackupRun{ID: "run-" + snap, Kind: "backup", Policy: req.Policy, Target: b.Spec.Target, Project: v.Metadata.Project, Jail: v.Metadata.Name,
+			JailUUID: v.Metadata.UUID, Started: now, Finished: now, OK: true, Snapshot: snap})
+	}
+	return out
 }

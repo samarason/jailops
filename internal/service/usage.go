@@ -54,8 +54,8 @@ func (s *Service) accounting(ctx context.Context, key string) *api.JailAccountin
 }
 
 // diskUsage lists the container with used and referenced in one call: the
-// root is the root dataset, the data are the persistent datasets and the
-// volumes parent (its used counts the volumes below it).
+// root is the root dataset and the data are the persistent datasets; the
+// volumes a jail attaches belong to the project and are not counted.
 func (s *Service) diskUsage(ctx context.Context, key string) api.JailDiskUsage {
 	if s.d.ZClient == nil {
 		return api.JailDiskUsage{Error: "no ZFS client"}
@@ -76,7 +76,7 @@ func (s *Service) diskUsage(ctx context.Context, key string) api.JailDiskUsage {
 				return api.JailDiskUsage{Error: "zfs reports no used or referenced for " + r.Name}
 			}
 			d.RootBytes, d.RootReferencedBytes, seenRoot = used, ref, true
-		case r.Props[lifecycle.PropKind] == lifecycle.KindPersistent || r.Name == container+"/data":
+		case r.Props[lifecycle.PropKind] == lifecycle.KindPersistent:
 			if !uok {
 				return api.JailDiskUsage{Error: "zfs reports no used for " + r.Name}
 			}

@@ -45,7 +45,7 @@ spec:
   image: freebsd-15@stable
   storage: default
   network: [{network: internal}]
-  firewall: {policy: web}
+  firewall: {policies: [web]}
   env:
     DB_PASSWORD: "secret:db-pass"
     MODE: production

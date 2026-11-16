@@ -214,7 +214,7 @@ func TestUpgradeImageIsAGlobalAdminsOperationAndHonoursTheProjectFilter(t *testi
 	wantCode(t, err, api.CodeNotFound)
 	// An image without a generation says what to run first.
 	if _, err := s.CreateImage(host, api.Image{Metadata: api.ObjectMeta{Name: "empty"}, Spec: api.ImageSpec{
-		OS: api.OSFreeBSD, Release: "15.0-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}}}); err != nil {
+		OS: api.OSFreeBSD, Release: "15.1-RELEASE", Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}}}); err != nil {
 		t.Fatal(err)
 	}
 	_, err = s.UpgradeImage(host, "empty", api.ImageUpgrade{})
@@ -262,5 +262,72 @@ func TestUpgradeImageIsAGlobalAdminsOperationAndHonoursTheProjectFilter(t *testi
 	}
 	if gen, _ := generationOf(t, s, "beta", "api"); gen != "fb#g2" {
 		t.Fatalf("no_jails moved a jail to %s", gen)
+	}
+}
+
+func TestImageReleaseOlderThan151IsRefused(t *testing.T) {
+	_, s := tickingEnv(t)
+	host := as(globalAdmin, "")
+	for _, r := range []string{"15.0-RELEASE", "14.3-RELEASE", "bogus"} {
+		_, err := s.CreateImage(host, api.Image{Metadata: api.ObjectMeta{Name: "old"}, Spec: api.ImageSpec{
+			OS: api.OSFreeBSD, Release: r, Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}}})
+		wantCode(t, err, api.CodeInvalid)
+	}
+	for i, r := range []string{"15.1-RELEASE", "15.2-PRERELEASE", "16.0-CURRENT"} {
+		if _, err := s.CreateImage(host, api.Image{Metadata: api.ObjectMeta{Name: "ok" + string(rune('a'+i))}, Spec: api.ImageSpec{
+			OS: api.OSFreeBSD, Release: r, Arch: "amd64", Source: api.ImageSource{Type: "pkgbase"}}}); err != nil {
+			t.Fatalf("%s: %v", r, err)
+		}
+	}
+}
+
+// A run that stopped at a failing jail leaves the jails after it on the old generation. The next run builds nothing
+// (the package set did not change) but still moves them to the newest generation.
+func TestUpgradeImageMovesJailsThatAreBehindWhenNothingNewWasBuilt(t *testing.T) {
+	e, s := tickingEnv(t)
+	twoProjectJails(t, e, s)
+	host := as(globalAdmin, "")
+	e.SetRepoVersion("15.0p2")
+	e.Jails.SetExecFn(func(_ string, o jailos.ExecOpts) (run.Result, error) {
+		if strings.Join(o.Argv, " ") == "/bin/true" {
+			return run.Result{Stderr: []byte("not healthy")}, errors.New("exit status 1")
+		}
+		return run.Result{}, nil
+	})
+	res := upgradeImage(t, s, host, "fb", api.ImageUpgrade{})
+	if res.Generation == nil || res.Generation.Number != 2 {
+		t.Fatalf("%+v", res)
+	}
+	for _, c := range []struct{ project, name string }{{"alpha", "web"}, {"alpha", "db"}, {"beta", "api"}} {
+		if gen, _ := generationOf(t, s, c.project, c.name); gen != "fb#g1" {
+			t.Fatalf("%s/%s is on %s after a failed run", c.project, c.name, gen)
+		}
+	}
+
+	e.Jails.SetExecFn(func(string, jailos.ExecOpts) (run.Result, error) { return run.Result{}, nil })
+	res = upgradeImage(t, s, host, "fb", api.ImageUpgrade{})
+	if !res.Unchanged || res.Generation != nil {
+		t.Fatalf("a generation was built again: %+v", res)
+	}
+	moved := 0
+	for _, j := range res.Jails {
+		if j.Status == api.ImageUpgradeUpgraded && j.To == "fb#g2" {
+			moved++
+		}
+	}
+	if moved != 3 {
+		t.Fatalf("%+v", res.Jails)
+	}
+	for _, c := range []struct{ project, name string }{{"alpha", "web"}, {"alpha", "db"}, {"beta", "api"}} {
+		if gen, _ := generationOf(t, s, c.project, c.name); gen != "fb#g2" {
+			t.Fatalf("%s/%s is on %s", c.project, c.name, gen)
+		}
+	}
+	// And a third run has nothing left to do.
+	res = upgradeImage(t, s, host, "fb", api.ImageUpgrade{})
+	for _, j := range res.Jails {
+		if j.Status == api.ImageUpgradeUpgraded {
+			t.Fatalf("%+v", j)
+		}
 	}
 }

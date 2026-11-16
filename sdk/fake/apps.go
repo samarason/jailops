@@ -313,36 +313,14 @@ func (s *Server) handleAppInstall(w http.ResponseWriter, r *http.Request) {
 		}
 		image := req.Image
 		if image == "" {
-			// the only FreeBSD image with the alias stable, as the server does
-			var all, found []string
-			for n, im := range s.images.items {
-				all = append(all, n)
-				if im.Spec.OS == api.OSFreeBSD && slices.Contains(im.Spec.Aliases, "stable") {
-					found = append(found, n)
-				}
+			var err *api.Error
+			if image, err = s.defaultAppImage(); err != nil {
+				return reply{err: err}
 			}
-			if len(found) != 1 {
-				slices.Sort(all)
-				slices.Sort(found)
-				example := "freebsd-15@stable"
-				if len(found) > 1 {
-					example = found[0] + "@stable"
-				}
-				yours := "you have no images"
-				if len(all) > 0 {
-					yours = "your images: " + strings.Join(all, ", ")
-				}
-				msg := "no image named, and no FreeBSD image has the alias stable to default to"
-				if len(found) > 1 {
-					msg = fmt.Sprintf("no image named, and %d FreeBSD images have the alias stable (%s), so there is no default", len(found), strings.Join(found, ", "))
-				}
-				return reply{err: api.Errorf(api.CodeInvalid, "%s", msg).WithHint("name an image with --image, for example " + example + "; " + yours)}
-			}
-			image = found[0] + "@stable"
 		}
 		im := s.images.items[imageName(image)]
 		if im == nil {
-			return reply{err: notFound("image", imageName(image)).WithHint("create or import the image first")}
+			return reply{err: notFound("image", imageName(image)).WithHint(s.imageCreateHint(image))}
 		}
 		if !releaseAtLeast(im.Spec.Release, app.Image.ReleaseMin) {
 			return reply{err: api.Errorf(api.CodeInvalid, "image %q is release %s; app %s needs %s or later", imageName(image), im.Spec.Release, name, app.Image.ReleaseMin).
@@ -355,19 +333,34 @@ func (s *Server) handleAppInstall(w http.ResponseWriter, r *http.Request) {
 		if req.Limits != nil {
 			limits = *req.Limits
 		}
-		var vols []api.VolumeMount
+		var vols []api.VolumeAttach
 		for _, d := range app.Data {
-			vols = append(vols, api.VolumeMount{Name: volumeName(d.Path), Mount: d.Path})
+			n := volumeName(jail, d.Path)
+			for i := 2; slices.ContainsFunc(vols, func(v api.VolumeAttach) bool { return v.Name == n }); i++ {
+				n = volumeName(jail, d.Path+"-"+strconv.Itoa(i))
+			}
+			vols = append(vols, api.VolumeAttach{Name: n, Mount: d.Path})
+		}
+		for _, v := range vols {
+			if s.volumes.items[rc.project+"/"+v.Name] != nil {
+				return reply{err: api.Errorf(api.CodeAlreadyExists, "volume %q already exists", v.Name).
+					WithHint("an earlier jail of this name left it: delete it with jailops volume delete " + v.Name)}
+			}
 		}
 		j := &api.Jail{Metadata: api.ObjectMeta{Name: jail, Project: rc.project, Labels: map[string]string{api.LabelApp: name, api.LabelAppHash: entry.detail.Hash}},
 			Spec: api.JailSpec{Image: image, OS: api.OSFreeBSD, Storage: storage, Hostname: jail, Layout: api.LayoutThin,
 				Network: []api.NetworkAttach{{Network: network}}, Volumes: vols, Resources: limits, SysVIPC: app.SysVIPC}}
-		steps := []string{"01 create-jail: create thin jail " + jail + " from " + image, "02 start-jail: start " + jail}
-		n := 3
+		var steps []string
+		n := 1
 		step := func(name, what string) {
 			steps = append(steps, fmt.Sprintf("%02d %s: %s", n, name, what))
 			n++
 		}
+		for _, v := range vols {
+			step("create-volume-"+v.Name, "create volume "+v.Name+" for "+v.Mount)
+		}
+		step("create-jail", "create thin jail "+jail+" from "+image)
+		step("start-jail", "start "+jail)
 		// one step per repository, the FreeBSD one first, as the daemon does
 		var ports, jailops []string
 		for _, p := range app.Packages {
@@ -398,8 +391,9 @@ func (s *Server) handleAppInstall(w http.ResponseWriter, r *http.Request) {
 		if app.Health != nil {
 			step("health-check", "the health check of the definition")
 		}
-		step("close-firewall", "firewall policy app-"+jail+" (managed by app access): deny every inbound connection until jailops app allow "+jail+" from SOURCE")
+		step("close-firewall", "firewall policy app-"+jail+" (managed by app access): deny every inbound connection until jailops app allow "+jail+" --from SOURCE")
 		step("snapshot", "snapshot every dataset of "+jail+" as app-installed")
+		step("enable-autostart", "boot.autostart of "+jail+": start with the host")
 		res := api.AppInstallResult{App: name, Hash: entry.detail.Hash, Data: app.Data, Config: app.Config, Logs: app.Logs, Notes: app.Notes, Steps: steps, DryRun: req.DryRun}
 		desc := "Install app " + name + " as jail " + jail
 		if req.DryRun {
@@ -414,6 +408,10 @@ func (s *Server) handleAppInstall(w http.ResponseWriter, r *http.Request) {
 			}
 			if e := s.assignJail(j, nil); e != nil {
 				return nil, e
+			}
+			for _, a := range vols {
+				s.volumes.insert(&api.Volume{Metadata: api.ObjectMeta{Name: a.Name, Project: rc.project, Labels: map[string]string{api.LabelApp: name}},
+					Spec: api.VolumeSpec{Storage: storage, Mode: "0755", Comment: "data of " + jail + " (" + name + "): " + a.Mount}}, false)
 			}
 			s.initJailStatus(j)
 			s.jails.insert(j, false)
@@ -455,8 +453,9 @@ func (s *Server) handleAppInstall(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, rp)
 }
 
-// volumeName names the dataset of a data path the way the daemon does.
-func volumeName(p string) string {
+// volumeName is <jail>-<what the path is called>, within the 32 characters of a volume name, the way the daemon names
+// the volume of a data path.
+func volumeName(jail, p string) string {
 	var b strings.Builder
 	dash := true
 	for _, r := range strings.ToLower(strings.Trim(p, "/")) {
@@ -468,12 +467,13 @@ func volumeName(p string) string {
 			dash = true
 		}
 	}
-	n := strings.TrimRight(b.String(), "-")
-	if len(n) > 40 {
-		n = strings.TrimRight(n[:40], "-")
+	base := strings.TrimRight(b.String(), "-")
+	if base == "" {
+		base = "data"
 	}
-	if n == "" {
-		n = "data"
+	n := jail + "-" + base
+	if len(n) > 32 {
+		n = strings.TrimRight(n[:32], "-")
 	}
 	return n
 }
@@ -493,4 +493,47 @@ func releaseAtLeast(release, minimum string) bool {
 	ra, rb, ok1 := num(release)
 	ma, mb, ok2 := num(minimum)
 	return ok1 && ok2 && (ra > ma || ra == ma && rb >= mb)
+}
+
+// defaultAppImage is the image an app is installed from when the request names none, as the server picks it: of the
+// FreeBSD images, the one of the highest release the host runs, the first by name on a tie, by its bare name.
+func (s *Server) defaultAppImage() (string, *api.Error) {
+	host := api.BaseRelease(s.release)
+	var all []string
+	best, bestRel, freebsd := "", "", 0
+	for n, im := range s.images.items {
+		all = append(all, n)
+		if im.Spec.OS != api.OSFreeBSD {
+			continue
+		}
+		freebsd++
+		if !releaseAtLeast(im.Spec.Release, "0.0") || host != "" && releaseAtLeast(host, "0.0") && !releaseAtLeast(host, im.Spec.Release) {
+			continue
+		}
+		newer := best == "" || !releaseAtLeast(bestRel, im.Spec.Release)
+		tie := best != "" && releaseAtLeast(bestRel, im.Spec.Release) && releaseAtLeast(im.Spec.Release, bestRel)
+		if newer || tie && n < best {
+			best, bestRel = n, im.Spec.Release
+		}
+	}
+	if best != "" {
+		return best, nil
+	}
+	slices.Sort(all)
+	yours := "you have no images"
+	if len(all) > 0 {
+		yours = "your images: " + strings.Join(all, ", ")
+	}
+	if freebsd == 0 {
+		hint := api.ImageCreateHint("the base image", "", "", host)
+		if len(all) > 0 {
+			hint += "; " + yours
+		}
+		return "", api.Errorf(api.CodeInvalid, "no image named, and there is no FreeBSD image yet").WithHint(hint)
+	}
+	msg := "no image named, and no FreeBSD image has a release this host can run"
+	if host != "" {
+		msg = fmt.Sprintf("no image named, and every FreeBSD image is of a newer release than this host (%s)", host)
+	}
+	return "", api.Errorf(api.CodeInvalid, "%s", msg).WithHint("name an image with --image; " + yours)
 }

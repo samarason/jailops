@@ -5,9 +5,9 @@ metadata:
 spec:
   hosts: [web1, web2]
   networks:
-    - {network: br-db}
+    - {network: db}
   storage:
     - {storage: fast, quota: 500G}
   quotas: {jails: 4}
-  firewall: base
+  firewall_policies: [base]
   images: [freebsd-15]

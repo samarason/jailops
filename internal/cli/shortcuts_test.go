@@ -27,7 +27,7 @@ func TestTopLevelShortcuts(t *testing.T) {
 	if code != 5 || !strings.HasPrefix(errs, "busy:") {
 		t.Fatalf("a stopped jail must answer busy, never fall back: %d %s", code, errs)
 	}
-	tr.ok("delete", "-y", "nginx")
+	tr.ok("delete", "--confirm-data-loss", "nginx")
 	// The jail group keeps every form as an alias.
 	tr.ok("jail", "create", "web", "--image", "freebsd-15@stable", "--network", "lan", "--storage", "default")
 	tr.ok("jail", "list", "-o", "name")
@@ -126,7 +126,7 @@ func TestKeyCompletion(t *testing.T) {
 	h := newHarness(t)
 	h.seed()
 	h.run("", "create", "nginx", "--image", "freebsd-15@stable", "--network", "lan", "--storage", "default")
-	h.run("", "project", "create", "web", "--storage", "default")
+	h.run("", "project", "create", "web")
 	out, _, _ := h.run("", "__complete", "config", "set", "nginx", "limits.")
 	if !strings.Contains(out, "limits.memory") || !strings.Contains(out, "limits.cpu") {
 		t.Fatalf("keys: %q", out)
@@ -159,9 +159,13 @@ func TestKeyCompletion(t *testing.T) {
 	if !strings.Contains(out, "lan") {
 		t.Fatalf("network flag: %q", out)
 	}
-	out, _, _ = h.run("", "__complete", "project", "set", "web", "--network", "")
+	out, _, _ = h.run("", "__complete", "network", "grant", "")
 	if !strings.Contains(out, "lan") {
-		t.Fatalf("project set network: %q", out)
+		t.Fatalf("network grant: %q", out)
+	}
+	out, _, _ = h.run("", "__complete", "storage", "grant", "")
+	if !strings.Contains(out, "default") {
+		t.Fatalf("storage grant: %q", out)
 	}
 	_ = json.Valid
 }
@@ -170,7 +174,7 @@ func TestProfiles(t *testing.T) {
 	h := newHarness(t)
 	h.seed()
 	tr := h.transcript()
-	tr.ok("profile", "create", "base", "--description", "defaults", "--set", "limits.memory=1G", "--set", "boot.autostart=true")
+	tr.ok("profile", "create", "base", "--comment", "defaults", "--set", "limits.memory=1G", "--set", "boot.autostart=true")
 	tr.ok("profile", "create", "web", "--set", "limits.memory=4G", "--set", "nic.eth1=lan")
 	tr.do("", "profile", "create", "bad", "--set", "hostname=x")
 	tr.do("", "profile", "create", "bad2", "--set", "nonsense=1")
@@ -181,10 +185,10 @@ func TestProfiles(t *testing.T) {
 	tr.ok("config", "set", "nginx", "limits.memory", "8G")
 	tr.ok("config", "show", "nginx", "--expanded")
 	tr.ok("config", "show", "nginx")
-	tr.ok("profile", "edit", "base", "-f", writeFile(t, h.dir, "p.yaml", "description: defaults\nconfig:\n  limits.memory: 2G\n  boot.priority: \"5\"\n", 0o644))
+	tr.ok("profile", "edit", "base", "-f", writeFile(t, h.dir, "p.yaml", "comment: defaults\nconfig:\n  limits.memory: 2G\n  boot.priority: \"5\"\n", 0o644))
 	tr.ok("config", "show", "nginx", "--expanded", "-o", "json")
 	tr.do("", "profile", "delete", "-y", "base") // in use
-	tr.ok("delete", "-y", "nginx")
+	tr.ok("delete", "--confirm-data-loss", "nginx")
 	tr.ok("profile", "delete", "-y", "base")
 	tr.ok("--project", "host", "profile", "list")
 	tr.golden("profiles")

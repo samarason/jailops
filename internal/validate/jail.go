@@ -17,6 +17,9 @@ const MaxAttachments = 16
 
 // JailSpec validates a jail name and spec.
 func JailSpec(name string, s api.JailSpec) error {
+	if err := api.CheckComment(s); err != nil {
+		return err
+	}
 	if err := JailName(name); err != nil {
 		return err
 	}
@@ -56,21 +59,29 @@ func JailSpec(name string, s api.JailSpec) error {
 			return Invalid("shell", "shell %q must be an absolute path inside the jail, without spaces", s.Shell)
 		}
 	}
+	if s.Prompt != "" {
+		if err := api.CheckPrompt(s.Prompt); err != nil {
+			return Invalid("prompt", "prompt: %v", err)
+		}
+	}
 	if s.Provision != nil {
 		if err := provision(*s.Provision); err != nil {
 			return err
 		}
 	}
 	if s.Resources.CPU < 0 || s.Resources.CPU > 4096 {
-		return Invalid("resources.cpu", "cpu must be between 0 and 4096")
+		return Invalid("resources.cpu", "the CPU limit must be between 0 and 4096 cores (--cpu)")
 	}
 	if s.Resources.PIDs < 0 {
-		return Invalid("resources.pids", "pids must not be negative")
+		return Invalid("resources.pids", "the process limit must not be negative (--pids)")
 	}
-	for f, v := range map[string]string{"resources.memory": s.Resources.Memory, "resources.disk": s.Resources.Disk} {
-		if v != "" {
-			if _, err := ParseSize(v); err != nil {
-				return Invalid(f, "%s %q is not a size such as 512M or 2G", f, v)
+	if s.Resources.States < 0 || s.Resources.States > 10000000 {
+		return Invalid("resources.states", "the state limit must be between 0 and 10000000")
+	}
+	for _, r := range []struct{ field, flag, v string }{{"resources.memory", "memory", s.Resources.Memory}, {"resources.disk", "disk", s.Resources.Disk}} {
+		if r.v != "" {
+			if _, err := ParseSize(r.v); err != nil {
+				return Invalid(r.field, "%s %q is not a size such as 512M or 2G (--%s)", r.flag, r.v, r.flag)
 			}
 		}
 	}
@@ -85,10 +96,8 @@ func JailSpec(name string, s api.JailSpec) error {
 	if err := devices(s); err != nil {
 		return err
 	}
-	if p := s.Firewall.Policy; p != "" {
-		if err := Name("firewall.policy", p); err != nil {
-			return err
-		}
+	if err := PolicyNames("firewall.policies", s.Firewall.Policies); err != nil {
+		return err
 	}
 	seenTag := map[string]bool{}
 	for i, t := range s.Firewall.Tags {
@@ -102,26 +111,9 @@ func JailSpec(name string, s api.JailSpec) error {
 		seenTag[t] = true
 	}
 	seenName, seenMount := map[string]bool{}, map[string]bool{}
-	seenHost := map[string]bool{}
-	for i, m := range s.HostMounts {
-		f := fmt.Sprintf("host_mounts[%d]", i)
-		if err := AbsPath(f+".source", m.Source); err != nil {
-			return err
-		}
-		if err := AbsPath(f+".target", m.Target); err != nil {
-			return err
-		}
-		if m.Target == "/" {
-			return Invalid(f+".target", "a host directory cannot be mounted on /")
-		}
-		if seenHost[m.Target] {
-			return Invalid(f+".target", "duplicate mount point %q", m.Target)
-		}
-		seenHost[m.Target] = true
-	}
 	for i, v := range s.Volumes {
 		f := fmt.Sprintf("volumes[%d]", i)
-		if err := Name(f+".name", v.Name); err != nil {
+		if err := Name(f+".volume", v.Name); err != nil {
 			return err
 		}
 		if err := AbsPath(f+".mount", v.Mount); err != nil {
@@ -130,21 +122,27 @@ func JailSpec(name string, s api.JailSpec) error {
 		if v.Mount == "/" {
 			return Invalid(f+".mount", "a volume cannot be mounted on /")
 		}
-		if v.Quota != "" {
-			if _, err := ParseSize(v.Quota); err != nil {
-				return Invalid(f+".quota", "quota %q is not a size", v.Quota)
-			}
-		}
 		if seenName[v.Name] {
-			return Invalid(f+".name", "duplicate volume %q", v.Name)
+			return Invalid(f+".volume", "volume %q is attached twice", v.Name)
 		}
-		if seenMount[v.Mount] || seenHost[v.Mount] {
+		if seenMount[v.Mount] {
 			return Invalid(f+".mount", "duplicate mount point %q", v.Mount)
 		}
 		seenName[v.Name], seenMount[v.Mount] = true, true
 	}
+	// nothing is mounted below a volume: a link in the first volume would carry the second mount elsewhere
+	for i, a := range s.Volumes {
+		for j, b := range s.Volumes {
+			if i != j && strings.HasPrefix(b.Mount, strings.TrimSuffix(a.Mount, "/")+"/") {
+				return Invalid(fmt.Sprintf("volumes[%d].mount", j), "mount point %q is inside the mount point %q of volume %q: nothing is mounted below a volume", b.Mount, a.Mount, a.Name)
+			}
+		}
+	}
 	if s.Boot.Priority < -1000 || s.Boot.Priority > 1000 {
 		return Invalid("boot.priority", "priority must be between -1000 and 1000")
+	}
+	if s.Boot.StopTimeout < 0 || s.Boot.StopTimeout > api.MaxStopTimeout {
+		return Invalid("boot.stop_timeout", "stop timeout must be between 0 and %d seconds", api.MaxStopTimeout)
 	}
 	for i, d := range s.Boot.Depends {
 		f := fmt.Sprintf("boot.depends[%d]", i)
@@ -173,8 +171,6 @@ func JailSpec(name string, s api.JailSpec) error {
 	return nil
 }
 
-var deviceRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
-
 // devices validates the named devices of a jail: unique names per kind, the
 // devfs allow-list, proxy listeners and profile names.
 func devices(s api.JailSpec) error {
@@ -185,8 +181,8 @@ func devices(s api.JailSpec) error {
 		if name == "" {
 			name = fmt.Sprintf("eth%d", i)
 		}
-		if !deviceRE.MatchString(name) {
-			return Invalid(f+".name", "device name %q must match %s", name, deviceRE)
+		if !api.IsName(name, 31) {
+			return Invalid(f+".name", "device name %q must follow the name rule (%s, at most 31 characters)", name, api.NamePattern)
 		}
 		if seen[name] {
 			return Invalid(f+".name", "duplicate network device %q", name)
@@ -195,11 +191,14 @@ func devices(s api.JailSpec) error {
 		if n.MTU != 0 && (n.MTU < 576 || n.MTU > 9216) {
 			return Invalid(f+".mtu", "mtu must be 0 or between 576 and 9216")
 		}
-		for fld, v := range map[string]string{"ingress": n.Ingress, "egress": n.Egress} {
-			if v != "" {
-				if _, err := ParseSize(v); err != nil {
-					return Invalid(f+"."+fld, "%s %q is not a rate in bits per second such as 10M", fld, v)
-				}
+		if n.Egress != "" {
+			if _, err := ParseRate(n.Egress); err != nil {
+				return Invalid(f+".egress", "egress %q is not a rate in bits per second such as 10M", n.Egress)
+			}
+		}
+		if n.Ingress != "" {
+			if _, err := ParseRate(n.Ingress); err != nil {
+				return Invalid(f+".ingress", "ingress %q is not a rate in bits per second such as 10M", n.Ingress)
 			}
 		}
 	}
@@ -210,8 +209,8 @@ func devices(s api.JailSpec) error {
 	dseen := map[string]bool{}
 	for i, d := range s.Devfs {
 		f := fmt.Sprintf("devfs[%d]", i)
-		if !deviceRE.MatchString(d.Name) {
-			return Invalid(f+".name", "device name %q must match %s", d.Name, deviceRE)
+		if !api.IsName(d.Name, 31) {
+			return Invalid(f+".name", "device name %q must follow the name rule (%s, at most 31 characters)", d.Name, api.NamePattern)
 		}
 		if !allowed[d.Device] {
 			return Invalid(f+".device", "%q is not on the devfs allow-list (%s)", d.Device, strings.Join(api.DevfsAllowList, ", "))
@@ -224,8 +223,8 @@ func devices(s api.JailSpec) error {
 	pseen := map[string]bool{}
 	for i, p := range s.Proxy {
 		f := fmt.Sprintf("proxy[%d]", i)
-		if !deviceRE.MatchString(p.Name) {
-			return Invalid(f+".name", "device name %q must match %s", p.Name, deviceRE)
+		if !api.IsName(p.Name, 31) {
+			return Invalid(f+".name", "device name %q must follow the name rule (%s, at most 31 characters)", p.Name, api.NamePattern)
 		}
 		if pseen[p.Name] {
 			return Invalid(f+".name", "duplicate proxy device %q", p.Name)

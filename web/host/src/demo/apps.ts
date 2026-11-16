@@ -57,7 +57,7 @@ export const definitions: App[] = [
     health: { exec: ['/usr/local/bin/pg_isready', '-U', 'postgres'], wait_seconds: 60 },
     resources: { memory: '1G', disk: '10G', cpu: '1' },
     access: { type: 'postgresql', port: 'postgres', service: 'postgresql', hba_file: '/var/db/postgres/data18/pg_hba.conf' },
-    notes: "Connect from inside the jail with: jailops exec NAME -- su -l postgres -c psql\nThe jail accepts no connection from outside until you allow one:\njailops app allow NAME from @web makes a role and a database for the jail\nweb, lets its address in and prints the connection string once.\n",
+    notes: "Connect from inside the jail with: jailops exec NAME -- su -l postgres -c psql\nThe jail accepts no connection from outside until you allow one:\njailops app allow NAME --from jail:web makes a role and a database for the jail\nweb, lets its address in and prints the connection string once.\n",
   },
   {
     version: 1, name: 'valkey', title: 'Valkey', summary: 'In-memory key-value store under the BSD license.',
@@ -113,7 +113,7 @@ export const definitions: App[] = [
     category: "security", homepage: "https://github.com/unidoc/isms", license: "Apache-2.0", icon: "isms.svg", image: IMAGE,
     packages: [{ name: "isms", repo: "jailops", version: "0.8.1" }, { name: "openssh-portable", repo: "ports" }],
     services: [{ name: "isms", start: false }],
-    ports: [{ name: "http", port: 8080, proto: "tcp", description: "The web interface and the API (UNVERIFIED port); put a TLS proxy in front.", expose: true }],
+    ports: [{ name: "http", port: 8080, proto: "tcp", description: "The web interface and the API; put a TLS proxy in front.", expose: true }],
     data: [{ path: "/var/db/isms", description: "The per-organisation git repositories, file blobs, templates and the signing key." }],
     config: [{ path: "/usr/local/etc/isms/server.env", description: "KEY=VALUE settings with the database URL and the master secret; mode 0600, owner isms.", restart: "isms" }],
     logs: [{ name: "server", path: "/var/log/isms.log", description: "What the program prints, written by daemon(8)." }],
@@ -125,7 +125,7 @@ export const definitions: App[] = [
       ["/bin/chmod", "0600", "/usr/local/etc/isms/server.env"],
     ],
     resources: { memory: "1G", disk: "10G", cpu: "1" },
-    notes: "isms is enabled but not started. Until server.env is complete, a restart of\nthe jail starts it and it exits again every 5 seconds; /var/log/isms.log says\nwhy. Do these steps once (DB is a postgresql jail, ADDR this jail's address):\n1. In DB: jailops shell DB, then su -l postgres -c psql and run\n   CREATE ROLE isms LOGIN PASSWORD 'PW'; CREATE DATABASE isms OWNER isms;\n   Set listen_addresses = '*' in postgresql.conf, add to pg_hba.conf\n   host isms isms ADDR/32 scram-sha-256\n   and run service postgresql restart.\n2. In this jail (jailops shell NAME), edit /usr/local/etc/isms/server.env:\n   DATABASE_URL=\"postgres://isms:PW@DB_ADDRESS:5432/isms?sslmode=disable\",\n   ISMS_BASE_URL (the https URL users open) and ISMS_SIGNING_EMAIL.\n3. Set the master secret once and back it up; never change it later:\n   sed -i '' \"s|^ISMS_SECRET=.*|ISMS_SECRET=$(openssl rand -hex 32)|\" /usr/local/etc/isms/server.env\n4. Create the signing key (your ISMS_SIGNING_EMAIL as the comment):\n   su -m isms -c 'ssh-keygen -q -t ed25519 -N \"\" -C you@example.com -f /var/db/isms/private/isms_key'\n5. Apply the schema:\n   env ISMS_SERVER_ENV=/usr/local/etc/isms/server.env su -m isms -c '/usr/local/bin/isms server migrate'\n6. service isms start\nThe web interface is on port 8080 (UNVERIFIED); serve it over https through\nthe nginx app. A coming version wires apps together with jailops app allow\n(role, password and DATABASE_URL made for you); until then, these steps.\n",
+    notes: "isms is enabled but not started. Until server.env is complete, a restart of\nthe jail starts it and it exits again every 5 seconds; /var/log/isms.log says\nwhy. Do these steps once (DB is a postgresql jail, ADDR this jail's address):\n1. In DB: jailops shell DB, then su -l postgres -c psql and run\n   CREATE ROLE isms LOGIN PASSWORD 'PW'; CREATE DATABASE isms OWNER isms;\n   Set listen_addresses = '*' in postgresql.conf, add to pg_hba.conf\n   host isms isms ADDR/32 scram-sha-256\n   and run service postgresql restart.\n2. In this jail (jailops shell NAME), edit /usr/local/etc/isms/server.env:\n   DATABASE_URL=\"postgres://isms:PW@DB_ADDRESS:5432/isms?sslmode=disable\",\n   ISMS_BASE_URL (the https URL users open) and ISMS_SIGNING_EMAIL.\n3. Set the master secret once and back it up; never change it later:\n   sed -i '' \"s|^ISMS_SECRET=.*|ISMS_SECRET=$(openssl rand -hex 32)|\" /usr/local/etc/isms/server.env\n4. Create the signing key (your ISMS_SIGNING_EMAIL as the comment):\n   su -m isms -c 'ssh-keygen -q -t ed25519 -N \"\" -C you@example.com -f /var/db/isms/private/isms_key'\n5. Apply the schema:\n   env ISMS_SERVER_ENV=/usr/local/etc/isms/server.env su -m isms -c '/usr/local/bin/isms server migrate'\n6. service isms start\nThe web interface is on port 8080; serve it over https through\nthe nginx app. A coming version wires apps together with jailops app allow\n(role, password and DATABASE_URL made for you); until then, these steps.\n",
   },
   {
     version: 1, name: "nsd", title: "NSD", summary: "Authoritative DNS server for your own zones, as a primary or a secondary.",
@@ -258,8 +258,9 @@ export function installSteps(a: App, jail: string, project: string, image: strin
   ]
   const h = a.health
   if (h) out.push(['health-check', h.http ? `GET http://<first address>:${h.http.port}${h.http.path} until it answers ${h.http.status ?? 200}, at most ${h.wait_seconds ?? 60} attempts` : h.tcp ? `connect to <first address>:${h.tcp} until it accepts, at most ${h.wait_seconds ?? 60} attempts` : `in the jail: ${h.exec?.join(' ')} until it exits 0, at most ${h.wait_seconds ?? 60} attempts`])
-  out.push(['close-firewall', `firewall policy app-${jail} (managed by app access): deny every inbound connection until jailops app allow ${jail} from SOURCE`])
+  out.push(['close-firewall', `firewall policy app-${jail} (managed by app access): deny every inbound connection until jailops app allow ${jail} --from SOURCE`])
   out.push(['snapshot', `snapshot every dataset of ${jail} as app-installed`])
+  out.push(['enable-autostart', `boot.autostart of ${jail}: start with the host`])
   return out.map(([n, d], i) => `${String(i + 1).padStart(2, '0')} ${n}: ${d}`)
 }
 

@@ -6,7 +6,8 @@ import { useLoad } from '@jailops/shared/composables/load'
 import { runOp } from '@jailops/shared/composables/ops'
 import { session } from '@jailops/shared/composables/session'
 import { ApiError } from '@jailops/shared/api/client'
-import { bytes, stamp, ago } from '@jailops/shared/lib/format'
+import { bytes, stamp } from '@jailops/shared/lib/format'
+import TimeStamp from '@jailops/shared/components/TimeStamp.vue'
 import Icon from '@jailops/shared/components/Icon.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
 import Modal from '@jailops/shared/components/Modal.vue'
@@ -77,17 +78,17 @@ function cancel(x: Snapshot): void {
         </ul>
         <section class="panel" :data-snapshots-of="group">
           <header>
-            <div class="row"><h2 class="mono">{{ group }}</h2><span v-if="cur" class="faint">{{ cur.host_name }} · {{ s.snapshots.snapshots(cur.snapshots) }}<template v-if="cur.latest"> · {{ s.snapshots.latest }} {{ ago(cur.latest) }}</template></span></div>
+            <div class="row"><h2 class="mono">{{ group }}</h2><span v-if="cur" class="faint">{{ cur.host_name }} · {{ s.snapshots.snapshots(cur.snapshots) }}<template v-if="cur.latest"> · {{ s.snapshots.latest }} <TimeStamp :ts="cur.latest" /></template></span></div>
           </header>
           <LoadState :loading="snaps.loading.value" :error="snaps.error.value" :has-data="!!snaps.data.value" @retry="snaps.reload">
             <p v-if="!rows.length" class="empty">{{ s.snapshots.empty }}</p>
-            <div v-else class="table-wrap"><table>
-              <thead><tr><th>{{ s.snapshots.id }}</th><th class="num">{{ s.snapshots.chunks }}</th><th class="num hide-sm">{{ s.snapshots.index }}</th><th>{{ s.snapshots.state }}</th><th><span class="sr-only">Actions</span></th></tr></thead>
+            <div v-else class="table-wrap"><table class="rtable">
+              <thead><tr><th>{{ s.snapshots.id }}</th><th class="num">{{ s.snapshots.chunks }}</th><th class="num hide-sm">{{ s.snapshots.index }}</th><th>{{ s.snapshots.state }}</th><th><span class="sr-only">{{ s.snapshots.actions }}</span></th></tr></thead>
               <tbody><tr v-for="x in rows" :key="x.snapshot_id" :class="{ drift: failed(x) }" :data-snapshot="x.snapshot_id">
-                <td><span class="mono">{{ x.snapshot_id }}</span><br /><span class="faint">{{ stamp(x.committed_at) }}<span v-if="x.source"> · {{ x.source }}</span></span></td>
-                <td class="num mono">{{ x.chunk_count.toLocaleString('en') }}</td>
-                <td class="num mono hide-sm nowrap">{{ bytes(x.index_bytes) }}</td>
-                <td>
+                <td :data-label="s.snapshots.id"><span class="mono">{{ x.snapshot_id }}</span><br /><span class="faint"><TimeStamp :ts="x.committed_at" /><span v-if="x.source">{{ s.snapshots.committedSource(x.source) }}</span></span></td>
+                <td class="num mono" :data-label="s.snapshots.chunks">{{ x.chunk_count.toLocaleString('en') }}</td>
+                <td class="num mono hide-sm nowrap" :data-label="s.snapshots.index">{{ bytes(x.index_bytes) }}</td>
+                <td :data-label="s.snapshots.state">
                   <span v-if="failed(x)" class="pill danger" data-test="failed">{{ s.snapshots.failed }}</span>
                   <span v-else-if="x.verify_state === 'ok'" class="pill ok" data-test="verified">{{ s.snapshots.verified }}</span>
                   <span v-else class="pill warn">{{ s.snapshots.unverified }}</span>
@@ -96,11 +97,11 @@ function cancel(x: Snapshot): void {
                   <div v-if="x.pending_deletion_after" class="faint">{{ s.snapshots.pendingAfter(stamp(x.pending_deletion_after), x.pending_deletion_by ?? '-') }}</div>
                   <ul v-if="failed(x) && x.verify_problems?.length" class="plain faint mono" style="font-size: 12px"><li v-for="p in x.verify_problems" :key="p">{{ p }}</li></ul>
                 </td>
-                <td class="nowrap">
+                <td class="actions"><div class="row-actions">
                   <button class="btn btn-sm" type="button" :disabled="!operate" data-test="protect" :aria-label="`${x.protected ? s.snapshots.unprotect : s.snapshots.protect} ${x.snapshot_id}`" @click="toggleProtect(x)">{{ x.protected ? s.snapshots.unprotect : s.snapshots.protect }}</button>
                   <button v-if="x.pending_deletion_after" class="btn btn-sm" type="button" :disabled="!operate" @click="cancel(x)" :aria-label="`${s.snapshots.cancelDelete} ${x.snapshot_id}`">{{ s.snapshots.cancelDelete }}</button>
                   <button v-else class="btn btn-sm btn-danger" type="button" :disabled="!operate || x.protected" :title="x.protected ? s.snapshots.protectedHint : ''" data-test="request" :aria-label="`${s.snapshots.requestDelete} ${x.snapshot_id}`" @click="open(x)">{{ s.snapshots.requestDelete }}</button>
-                </td>
+                </div><p v-if="x.protected && operate" class="faint why-row">{{ s.snapshots.protectedHint }}</p></td>
               </tr></tbody></table></div>
           </LoadState>
         </section>
@@ -123,6 +124,7 @@ function cancel(x: Snapshot): void {
 .picker { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 4px; }
 .picker .btn { width: 100%; justify-content: flex-start; text-align: left; }
 .picker .btn .grow { text-align: left; }
+.why-row { margin: 4px 0 0; font-size: 12px; max-width: 30ch; }
 .picker .btn.sel { background: var(--accent-soft); font-weight: 600; }
 @media (max-width: 800px) { .grp-layout { grid-template-columns: minmax(0, 1fr); } }
 </style>

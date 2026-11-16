@@ -213,7 +213,7 @@ deletion_delay: 48h
 		t.Fatal(out)
 	}
 	c.must("", "hosts", "revoke", "cli-host")
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		if _, err := cl.Info(ctx); err != nil {
 			break

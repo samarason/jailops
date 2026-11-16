@@ -1,14 +1,20 @@
 #!/bin/sh
 #
 # PROVIDE: jailopsd
-# REQUIRE: jailops_priv NETWORKING pf syslogd
+# REQUIRE: jailops_priv NETWORKING pf syslogd local_unbound
 # KEYWORD: shutdown
 #
 # "pf" is required even when pf_enable is NO (rcorder only orders the scripts; a disabled service still runs and
-# exits at once): without it, rcorder gives no guarantee that pf.conf (with the three anchor lines of the setup
-# guide) is loaded before jailopsd creates bridges and starts jails, and an anchor call that resolves to nothing
+# exits at once): without it, rcorder gives no guarantee that pf.conf (with the anchor line of the setup
+# guide) is loaded before jailopsd starts jails, and an anchor call that resolves to nothing
 # yet falls through to whatever the administrator's own ruleset does next (design 18, the boot-time audit).
+# "local_unbound": the names of the jails are written for the resolver (docs/dns.md), which should be up when the first
+# jail starts, so that they exist after a reboot (an unknown or disabled service is ignored by rcorder, as with pf).
 # "syslogd": the daemon logs to syslog, and in appliance mode the setup token goes there too.
+# "jailops_priv": the helper starts first at boot, and "shutdown" stops jailopsd before it. The two are one service
+# (the helper is the part that runs as root): run by hand, `service jailopsd start` starts the helper first when it is
+# not running, as rc.subr's force_depend does for the scripts of /etc/rc.d, and `stop` stops it after the daemon, so
+# `service jailopsd restart` restarts both. `service jailops_priv` alone still works on the helper only.
 #
 # Add to /etc/rc.conf:
 #   jailopsd_enable="YES"
@@ -20,10 +26,13 @@
 #                            manages those modules besides host.manage.modules of jailopsd.yaml (the helper's own list
 #                            decides what it changes). While no administrator exists, every start prints a new one-time
 #                            setup token and the console's addresses on the system console and to syslog (authpriv,
-#                            /var/log/auth.log); `jailops-priv setup-token` (as root) prints another.
+#                            /var/log/auth.log); `service jailopsd setuptoken` (as root) prints another.
 # jailopsd runs as the unprivileged user jailops; everything that needs root is done by jailops_priv.
 # Configuration: /usr/local/etc/jailops/jailopsd.yaml
 #   service jailopsd checkconfig   validate the configuration
+#   service jailopsd setuptoken   print the one-time token for the console's first-run setup (appliance mode)
+#   service jailopsd status        the process runs (and whether the helper does); GET /readyz says whether it can
+#                                  serve (docs/operations.md)
 # There is no reload: the configuration is read at start (SIGHUP is ignored by design) and a renewed TLS
 # certificate is picked up without a restart. Output goes to syslog (tag jailopsd).
 
@@ -33,17 +42,25 @@ name="jailopsd"
 rcvar="jailopsd_enable"
 desc="JailOps daemon"
 
-pidfile="/var/run/jailops/jailopsd.pid"
-supervisor_pidfile="/var/run/jailops/jailopsd-daemon.pid"
+# daemon(8) writes both pid files as root, before it runs jailopsd as jailops: they live in /var/run, not in
+# /var/run/jailops, which jailops may write to.
+pidfile="/var/run/jailopsd.pid"
+supervisor_pidfile="/var/run/jailopsd-daemon.pid"
 procname="/usr/local/sbin/jailopsd"
 command="/usr/sbin/daemon"
 jailopsd_helper="/usr/local/libexec/jailops-priv"
+jailopsd_helper_pidfile="/var/run/jailops-priv.pid"
+jailopsd_helper_rc="/usr/local/etc/rc.d/jailops_priv"
 jailopsd_console="/dev/console"
 
-extra_commands="checkconfig"
+extra_commands="checkconfig setuptoken"
 checkconfig_cmd="jailopsd_checkconfig"
+setuptoken_cmd="jailopsd_setup_token"
 start_precmd="jailopsd_precmd"
 start_postcmd="jailopsd_poststart"
+status_postcmd="jailopsd_helper_status"
+stop_cmd="jailopsd_stop"
+stop_postcmd="jailopsd_stop_helper"
 
 # jailops_appliance_args prints the flag that passes jailops_appliance_modules on, nothing when appliance mode is off.
 jailops_appliance_args()
@@ -59,13 +76,73 @@ jailops_appliance_args()
 	echo "-appliance-modules ${_mods}"
 }
 
+# service jailopsd setuptoken: the one-time token of the first-run setup (appliance mode), a new one on every call
+jailopsd_setup_token()
+{
+	${jailopsd_helper} setup-token
+}
+
 jailopsd_checkconfig()
 {
 	su -m ${jailopsd_runas} -c "${procname} -config ${jailopsd_config} ${jailopsd_extra} -check-config"
 }
 
+# jailopsd_helper_replaced succeeds when the running helper's executable is no longer the file on disk: pkg(8) installs
+# a new file under the name (a new inode), and the old one runs on until the helper restarts.
+jailopsd_helper_replaced()
+{
+	_pid=$(check_pidfile ${jailopsd_helper_pidfile} ${jailopsd_helper})
+	[ -n "${_pid}" ] || return 1
+	_run=$(fstat -p ${_pid} 2>/dev/null | awk '$4 == "text" { print $6 }')
+	_disk=$(stat -f %i ${jailopsd_helper} 2>/dev/null)
+	[ -n "${_run}" ] && [ -n "${_disk}" ] && [ "${_run}" != "${_disk}" ]
+}
+
+# jailopsd_force_depend is rc.subr's force_depend for a script of /usr/local/etc/rc.d (the one of rc.subr looks in
+# /etc/rc.d only): the helper is started when it is not running, and not when rcorder has started it at boot.
+jailopsd_force_depend()
+{
+	[ -n "${rc_fast}" ] && ! checkyesno always_force_depends && checkyesno jailops_priv_enable && return 0
+	${jailopsd_helper_rc} forcestatus >/dev/null 2>&1 && return 0
+	info "${name} depends on jailops_priv, which will be forced to start."
+	if ! ${jailopsd_helper_rc} forcestart; then
+		warn "Unable to force jailops_priv; start it: service jailops_priv start"
+		return 1
+	fi
+}
+
+# Stop: TERM to the supervisor (daemon(8) passes it to jailopsd and exits without a restart), then wait for both.
+jailopsd_stop()
+{
+	_sup=$(check_pidfile ${supervisor_pidfile} /usr/sbin/daemon)
+	_pid=$(check_pidfile ${pidfile} ${procname})
+	if [ -z "${_sup}${_pid}" ]; then
+		echo "${name} not running? (check ${pidfile})."
+		return 1
+	fi
+	[ -z "${_sup}" ] || kill -TERM ${_sup}
+	[ -z "${_pid}" ] || [ -n "${_sup}" ] || kill -TERM ${_pid}
+	wait_for_pids ${_sup} ${_pid}
+}
+
+# The two are one service: the helper exists to do for the daemon what needs root. Stopping the daemon stops the helper
+# too, so that `restart` restarts both (a new package has a new binary of each), and `start` starts it again.
+# (Jails are kernel jails: stopping the daemon leaves them running. At shutdown jailops_shutdown, which requires this
+# script and so is stopped before it, stops the jails first.) At shutdown the helper's own script finds it stopped.
+jailopsd_stop_helper()
+{
+	${jailopsd_helper_rc} onestatus >/dev/null 2>&1 || return 0
+	${jailopsd_helper_rc} onestop || warn "Unable to stop jailops_priv; service jailops_priv stop"
+	return 0
+}
+
 jailopsd_precmd()
 {
+	# the daemon is useless without the helper, and would wait 30 seconds for its socket and exit
+	jailopsd_force_depend || return 1
+	if jailopsd_helper_replaced; then
+		warn "jailops_priv runs a binary that has been replaced since it started (a package upgrade?): service jailopsd restart"
+	fi
 	install -d -m 1771 -o root -g jailops /var/run/jailops
 	# refuse to start with a configuration that does not validate
 	jailopsd_checkconfig >/dev/null || return 1
@@ -81,6 +158,13 @@ jailopsd_poststart()
 	[ -n "${rc_fast}" ] || echo "${_out}"
 }
 
+# status: the daemon without the helper runs, but changes nothing on the host
+jailopsd_helper_status()
+{
+	service jailops_priv onestatus || echo "${name} cannot change anything on the host until the helper runs: service jailops_priv start"
+	return 0
+}
+
 # (not jailopsd_user: rc.subr would run the whole command as that user with su)
 # rc.conf may set jailopsd_config and jailopsd_runas: read them before anything is derived from them
 load_rc_config $name
@@ -88,7 +172,9 @@ load_rc_config $name
 : ${jailopsd_config:="/usr/local/etc/jailops/jailopsd.yaml"}
 : ${jailopsd_runas:="jailops"}
 
-# -p: pid of jailopsd itself (rc status and stop use it); -P: the supervisor, which exits with it.
+# -p: pid of jailopsd itself (rc status uses it); -P: the supervisor. -R 10: when jailopsd exits without being stopped (a
+# crash, the kernel killing it for memory), the supervisor starts it again after 10 seconds, no faster. A stop therefore goes
+# to the supervisor first (jailopsd_stop), which stops jailopsd and exits without starting it again.
 jailopsd_extra=""
 case "${jailopsd_web:-}" in
 [Yy][Ee][Ss]) jailopsd_extra="-web" ;;
@@ -96,7 +182,7 @@ case "${jailopsd_web:-}" in
 esac
 jailopsd_appliance=$(jailops_appliance_args) || err 1 "invalid jailops_appliance_modules"
 jailopsd_extra="${jailopsd_extra} ${jailopsd_appliance}"
-command_args="-f -S -T jailopsd -u ${jailopsd_runas} -p ${pidfile} -P ${supervisor_pidfile} ${procname} -config ${jailopsd_config} ${jailopsd_extra}"
+command_args="-f -S -T jailopsd -R 10 -u ${jailopsd_runas} -p ${pidfile} -P ${supervisor_pidfile} ${procname} -config ${jailopsd_config} ${jailopsd_extra}"
 required_files="${jailopsd_config}"
 
 run_rc_command "$1"

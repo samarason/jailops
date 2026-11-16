@@ -78,7 +78,7 @@ spec:
   image: freebsd-15@stable
   storage: default
   network: [{network: internal}]
-  firewall: {policy: web}
+  firewall: {policies: [web]}
   env:
     DB_PASSWORD: "secret:app.db_password"
     MODE: production
@@ -318,7 +318,7 @@ func TestRemoteBootstrapAndConnect(t *testing.T) {
 	if strings.Contains(r.all(), "PRIVATE KEY") {
 		t.Fatal("the private key was printed")
 	}
-	contains(t, r.err, "jailops cert create jailops-sync-web1 --pem CERT.pem --permission admin --global")
+	contains(t, r.err, "jailops cert create jailops-sync-web1 --pem CERT.pem --role admin --global")
 	raw := readFile(t, e, "hosts/web1/remote.sops.yaml")
 	if strings.Contains(raw, "BEGIN CERTIFICATE") || strings.Contains(raw, "PRIVATE KEY") || !strings.Contains(raw, "url: "+ts.URL) {
 		t.Fatalf("remote file:\n%s", raw)

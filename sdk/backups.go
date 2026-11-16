@@ -64,16 +64,29 @@ func (b *BackupClient) Restore(ctx context.Context, req api.RestoreRequest) (*Op
 	return op, err
 }
 
+// RestoreVolume restores a volume backup as a new volume of the project (POST /api/v1/restores). Like Restore it
+// does not run the preflight; Preflight does. The passphrase of an encrypted volume is req.Passphrase.
+func (b *BackupClient) RestoreVolume(ctx context.Context, req api.RestoreRequest) (*Operation[api.Volume], error) {
+	req.DryRun = false
+	op, _, err := sendOp[api.Volume](ctx, b.c, request{method: http.MethodPost, path: "/api/v1/restores", body: req}, nil)
+	return op, err
+}
+
 // Run starts a backup policy now, outside its schedule, for every jail it
 // selects (POST /api/v1/backups/run, admin only). The result lists one run per
 // jail and target; a failed job is a run with OK false. It needs the
 // "backup_run" extension, which a server advertises when it has a backup
 // backend.
 func (b *BackupClient) Run(ctx context.Context, policy string) (*Operation[[]api.BackupRun], error) {
+	return b.RunWith(ctx, api.BackupRunRequest{Policy: policy})
+}
+
+// RunWith is Run with the options of the request (NoVolumes leaves the volumes out of this run).
+func (b *BackupClient) RunWith(ctx context.Context, req api.BackupRunRequest) (*Operation[[]api.BackupRun], error) {
 	if err := b.c.need("backup_run"); err != nil {
 		return nil, err
 	}
-	op, _, err := sendOp[[]api.BackupRun](ctx, b.c, request{method: http.MethodPost, path: "/api/v1/backups/run", body: api.BackupRunRequest{Policy: policy}}, nil)
+	op, _, err := sendOp[[]api.BackupRun](ctx, b.c, request{method: http.MethodPost, path: "/api/v1/backups/run", body: req}, nil)
 	return op, err
 }
 

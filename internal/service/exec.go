@@ -82,6 +82,27 @@ type ExecStart struct {
 // DefaultShell is the shell of a jail that names none.
 const DefaultShell = "/bin/sh"
 
+// ShellPATH is the PATH of a shell session: the default path of login.conf(5), so what packages install in
+// /usr/local is found as in a login on the jail. The helper starts every command with /sbin:/bin:/usr/sbin:/usr/bin.
+const ShellPATH = "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
+
+// shellSessionEnv is the environment a shell session starts with, before the jail's and the caller's: PATH, and HOME
+// for root (the user of a session that names none), so cd and ~ work. jexec passes no HOME of its own.
+func shellSessionEnv(user string) []string {
+	env := []string{"PATH=" + ShellPATH}
+	if user == "" || user == "root" {
+		env = append(env, "HOME=/root")
+	}
+	return env
+}
+
+func shellMissingHint(name, sh string) string {
+	if sh == api.BashPath {
+		return "install it with `jailops jail shell-setup " + name + "`, or use FreeBSD's own shell: `jailops set " + name + " shell sh`"
+	}
+	return "install it, or choose another with `jailops set " + name + " shell <path>`"
+}
+
 // StartExec starts a command in a jail of the request's project: the same
 // project rules as every jail route (a project the caller may not use, or a
 // jail of another project, is not_found), a running jail, at most
@@ -103,7 +124,8 @@ func (s *Service) StartExec(ctx context.Context, name string, req api.ExecReques
 		return nil, api.Errorf(api.CodeBusy, "jail %q is not running", name).WithHint("start it first")
 	}
 	argv := req.Argv
-	if req.Shell || len(argv) == 0 {
+	shellSession := req.Shell || len(argv) == 0
+	if shellSession {
 		sh := req.ShellPath
 		if sh == "" {
 			sh = j.Spec.Shell
@@ -116,7 +138,7 @@ func (s *Service) StartExec(ctx context.Context, name string, req api.ExecReques
 		}
 		if ok, _ := s.d.Files.Exists(ctx, path.Join(s.rootMount(key), sh)); !ok {
 			return nil, api.Errorf(api.CodeNotFound, "the shell %s does not exist in jail %q", sh, name).
-				WithHint("install it, or choose another with `jailops set " + name + " shell <path>`")
+				WithHint(shellMissingHint(name, sh))
 		}
 		argv = []string{sh}
 	}
@@ -134,7 +156,7 @@ func (s *Service) StartExec(ctx context.Context, name string, req api.ExecReques
 	s.execMu.Lock()
 	if s.installing[key] {
 		s.execMu.Unlock()
-		return nil, api.Errorf(api.CodeBusy, "jail %q is busy: the app is being installed", name).
+		return nil, api.Errorf(api.CodeBusy, "jail %q is busy: packages are being installed or updated", name).
 			WithHint("wait for the installation to end; `jailops op list` shows it")
 	}
 	if s.execN[key] >= lim.PerJail {
@@ -147,7 +169,9 @@ func (s *Service) StartExec(ctx context.Context, name string, req api.ExecReques
 	release := func() {
 		once.Do(func() {
 			s.execMu.Lock()
-			s.execN[key]--
+			if s.execN[key]--; s.execN[key] <= 0 {
+				delete(s.execN, key) // no entry stays for a jail that once ran a command
+			}
 			s.execMu.Unlock()
 		})
 	}
@@ -158,8 +182,13 @@ func (s *Service) StartExec(ctx context.Context, name string, req api.ExecReques
 		release()
 		return nil, err
 	}
-	// what the caller names wins over what the jail declares
-	sess, err := s.d.Execer.Exec(ctx, key, argv, ExecOpts{TTY: req.TTY, Rows: req.Rows, Cols: req.Cols, Env: append(jenv, req.Env...), User: req.User})
+	// what the caller names wins over what the jail declares, and both over the defaults of a shell session
+	var env []string
+	if shellSession {
+		env = shellSessionEnv(req.User)
+	}
+	env = append(append(env, jenv...), req.Env...)
+	sess, err := s.d.Execer.Exec(ctx, key, argv, ExecOpts{TTY: req.TTY, Rows: req.Rows, Cols: req.Cols, Env: env, User: req.User})
 	if err != nil {
 		release()
 		return nil, err

@@ -86,7 +86,7 @@ async function send(dry: boolean): Promise<void> {
             <input id="acc-filter" v-model="filter" type="search" autocomplete="off" data-test="allow-filter" />
             <p v-if="!matching.length" class="faint">{{ s.appAccess.noJails }}</p>
             <div v-else class="acc-list" role="radiogroup" :aria-label="s.appAccess.kindJail" data-test="allow-jails">
-              <label v-for="n in matching" :key="n" class="acc-pick" :class="{ on: f.jail === n }"><input v-model="f.jail" type="radio" name="acc-jail" :value="n" /><span class="mono">@{{ n }}</span></label>
+              <label v-for="n in matching" :key="n" class="acc-pick" :class="{ on: f.jail === n }"><input v-model="f.jail" type="radio" name="acc-jail" :value="n" /><span class="mono">jail:{{ n }}</span></label>
             </div>
             <span v-if="shown('source')" class="field-error" role="alert">{{ shown('source') }}</span>
           </div>
@@ -95,7 +95,7 @@ async function send(dry: boolean): Promise<void> {
             <p v-if="!sets.length" class="faint">{{ s.appAccess.noSets }}</p>
             <select v-else id="acc-set" v-model="f.set" data-test="allow-set">
               <option value="">-</option>
-              <option v-for="n in sets" :key="n" :value="n">@{{ n }}</option>
+              <option v-for="n in sets" :key="n" :value="n">set:{{ n }}</option>
             </select>
             <span v-if="shown('source')" class="field-error" role="alert">{{ shown('source') }}</span>
           </div>

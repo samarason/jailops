@@ -32,6 +32,10 @@ const MaxAgents = 16
 // AgentSubcommand is the argument that makes the helper binary serve as an agent.
 const AgentSubcommand = "fsagent"
 
+// AgentSpecialFlag lets a write agent make device nodes and setuid and setgid files: it is given only for a tree a
+// jail controls (jailTreeDepth), never for a jail's container or another dataset.
+const AgentSpecialFlag = "-special"
+
 type agentArgs struct {
 	Mode string `json:"mode"`
 	Root string `json:"root"`
@@ -75,7 +79,7 @@ func (l *Local) checkAgentRoot(ctx context.Context, mode, root string) (dataset 
 		return "", invalid("agent mode must be %s or %s", AgentRead, AgentWrite)
 	}
 	if !l.cfg.inMounts(mp) {
-		return "", forbidden("path %q is not below %s", mp, l.cfg.mountBaseDesc())
+		return "", l.cfg.notBelowMount(mp)
 	}
 	// which dataset is mounted there: the one in the storage root that holds the path
 	var root0 string
@@ -119,6 +123,14 @@ func (l *Local) checkAgentRoot(ctx context.Context, mode, root string) (dataset 
 	return dataset, nil
 }
 
+// agentSpecial reports whether a write agent in root may make device nodes and setuid or setgid files: root is a
+// tree a jail controls (a jail's root, root.new and the like, or a volume mounted inside one), below a storage
+// mount of mode 0700, so such a file is in reach of the jail and of root only, as the jail's own files are.
+func (l *Local) agentSpecial(root string) bool {
+	r := l.cfg.mountRel(root)
+	return r.root != "" && r.rel != "." && jailTreeDepth(r.rel) > 0
+}
+
 var agentsRunning atomic.Int32
 
 // FSAgent starts an agent: a copy of the helper binary that changes its root directory to root and serves the
@@ -129,6 +141,10 @@ const MaxAgentLifetime = 12 * time.Hour
 func (l *Local) FSAgent(ctx context.Context, mode, root string) (*os.File, error) {
 	if _, err := l.checkAgentRoot(ctx, mode, root); err != nil {
 		return nil, err
+	}
+	args := []string{AgentSubcommand, "-mode", mode, "-root", root}
+	if mode == AgentWrite && l.agentSpecial(root) {
+		args = append(args, AgentSpecialFlag)
 	}
 	if agentsRunning.Add(1) > MaxAgents {
 		agentsRunning.Add(-1)
@@ -146,7 +162,7 @@ func (l *Local) FSAgent(ctx context.Context, mode, root string) (*os.File, error
 	}
 	// An agent that outlives any backup or restore (a client that stopped talking but never closed) is killed.
 	actx, cancel := context.WithTimeout(context.Background(), MaxAgentLifetime)
-	cmd := exec.CommandContext(actx, self, AgentSubcommand, "-mode", mode, "-root", root)
+	cmd := exec.CommandContext(actx, self, args...)
 	cmd.ExtraFiles = []*os.File{theirs} // fd 3
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	cmd.Stderr = &agentLog{l: l, mode: mode, root: root}

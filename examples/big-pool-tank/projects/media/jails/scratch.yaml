@@ -9,7 +9,7 @@ spec:
   storage: bulk
   network:
     - {name: eth0, network: media, ipv4: auto}
-  firewall: {policy: closed}
+  firewall: {policies: [closed]}
   resources: {cpu: 2, memory: 4G}
   volumes:
-    - {name: work, mount: /work, quota: 4T}
+    - {volume: work, mount: /work}

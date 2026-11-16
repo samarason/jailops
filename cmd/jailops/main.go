@@ -15,7 +15,8 @@ import (
 var version = "dev"
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// a signal ends the context: a command stops, and exec and shell put the terminal back before they exit
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	env := cli.DefaultEnv()
 	env.Version = version
 	code := cli.Execute(ctx, env, os.Args[1:])

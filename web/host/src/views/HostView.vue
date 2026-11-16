@@ -5,7 +5,8 @@ import { api } from '@/api/endpoints'
 import { useLoad } from '@jailops/shared/composables/load'
 import { runOp } from '@jailops/shared/composables/ops'
 import { ApiError } from '@jailops/shared/api/client'
-import { ago, stamp } from '@jailops/shared/lib/format'
+import { snapshotLabel } from '@jailops/shared/lib/format'
+import TimeStamp from '@jailops/shared/components/TimeStamp.vue'
 import Icon from '@jailops/shared/components/Icon.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
 import CopyField from '@jailops/shared/components/CopyField.vue'
@@ -188,7 +189,8 @@ const lines = computed(() => diffLines(preview.value?.change.diff ?? ''))
               <button class="btn" type="submit" :disabled="!canWrite || busy || errors.length > 0" data-test="host-preview-btn">{{ s.host.preview }}</button>
               <button class="btn btn-primary" type="button" :disabled="!canWrite || busy || !previewCurrent || !preview?.change.changed" data-test="host-apply" @click="apply">{{ s.host.apply }}</button>
               <button v-if="dirty" class="btn btn-ghost" type="button" @click="reset">{{ s.app.cancel }}</button>
-              <span v-if="canWrite && !previewCurrent" class="faint">{{ s.host.previewFirst }}</span>
+              <span v-if="canWrite && errors.length" class="why-disabled" data-test="host-why">{{ s.form.fixFirst(errors[0].message) }}</span>
+              <span v-else-if="canWrite && !previewCurrent" class="why-disabled">{{ s.host.previewFirst }}</span>
             </div>
           </form>
         </section>
@@ -202,14 +204,13 @@ const lines = computed(() => diffLines(preview.value?.change.diff ?? ''))
           <div class="body"><p class="muted">{{ s.host.snapshotsText }}</p></div>
           <LoadState :loading="snaps.loading.value" :error="snaps.error.value" :has-data="!!snaps.data.value" @retry="snaps.reload">
             <p v-if="!snaps.data.value?.length" class="empty">{{ s.host.noSnapshots }}</p>
-            <div v-else class="table-wrap"><table>
-              <thead><tr><th>{{ s.host.name }}</th><th>{{ s.host.time }}</th><th class="hide-sm">{{ s.host.reason }}</th><th class="hide-sm">{{ s.host.filesCol }}</th><th><span class="sr-only">{{ s.host.restore }}</span></th></tr></thead>
+            <div v-else class="table-wrap"><table class="rtable">
+              <thead><tr><th>{{ s.host.time }}</th><th>{{ s.host.reason }}</th><th>{{ s.host.filesCol }}</th><th><span class="sr-only">{{ s.host.restore }}</span></th></tr></thead>
               <tbody><tr v-for="x in snaps.data.value" :key="x.name" :data-snapshot="x.name">
-                <td class="mono">{{ x.name }}</td>
-                <td :title="stamp(x.time)">{{ ago(x.time) }}</td>
-                <td class="hide-sm">{{ s.host.reasons[x.reason ?? 'apply'] ?? x.reason }}</td>
-                <td class="hide-sm"><span v-for="f in x.files" :key="f" class="chip mono">{{ f }}</span></td>
-                <td><button class="btn" type="button" :disabled="!canWrite" data-test="host-restore" @click="restoring = x">{{ s.host.restore }}</button></td>
+                <td :data-label="s.host.time" :title="x.name"><TimeStamp :ts="x.time" /></td>
+                <td :data-label="s.host.reason">{{ s.host.reasons[x.reason ?? 'apply'] ?? x.reason }}</td>
+                <td :data-label="s.host.filesCol"><span v-for="f in x.files" :key="f" class="chip mono">{{ f }}</span></td>
+                <td class="actions"><button class="btn btn-sm" type="button" :disabled="!canWrite" data-test="host-restore" :aria-label="`${s.host.restore} ${snapshotLabel(x.name)}`" @click="restoring = x">{{ s.host.restore }}</button></td>
               </tr></tbody>
             </table></div>
           </LoadState>
@@ -217,7 +218,7 @@ const lines = computed(() => diffLines(preview.value?.change.diff ?? ''))
       </div>
     </LoadState>
 
-    <ConfirmDialog :open="!!restoring" :title="s.host.restoreTitle(restoring?.name ?? '')" :confirm-label="s.host.restore" danger :run="restore" @close="restoring = null">
+    <ConfirmDialog :open="!!restoring" :title="s.host.restoreTitle(snapshotLabel(restoring?.name ?? ''))" :confirm-label="s.host.restore" danger :run="restore" @close="restoring = null">
       <p>{{ s.host.restoreText }}</p>
       <ul class="plain mono" style="margin-top: 8px"><li v-for="f in restoring?.files" :key="f">{{ f }}</li></ul>
     </ConfirmDialog>

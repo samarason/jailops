@@ -3,14 +3,18 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"jailops.net/jailops/internal/service"
@@ -41,7 +45,8 @@ type consoleEvent struct {
 }
 
 type consoleSession struct {
-	id      string
+	id string
+	// owner is the identity that opened the session: the kind of its credential and its name.
 	owner   string
 	project string
 	jail    string
@@ -96,6 +101,36 @@ func (r *consoleRegistry) remove(id string) {
 	r.mu.Unlock()
 }
 
+// consoleRef stands for a session id in logs, audit entries and errors: whoever holds the id may drive the session
+// (with the owner's credential), so only a short hash of it is written down.
+func consoleRef(id string) string {
+	h := sha256.Sum256([]byte(id))
+	return "#" + hex.EncodeToString(h[:4])
+}
+
+// consoleObject is the audit object of a request about a console session.
+func consoleObject(jail, id string) string {
+	return "/api/v1/jails/" + jail + "/console/" + consoleRef(id)
+}
+
+// redactConsolePath replaces the session id in a console path by its reference, for the request log.
+func redactConsolePath(p string) string {
+	rest, ok := strings.CutPrefix(p, "/api/v1/jails/")
+	if !ok {
+		return p
+	}
+	jail, after, ok := strings.Cut(rest, "/console/")
+	if !ok || strings.Contains(jail, "/") || after == "" {
+		return p
+	}
+	id, tail, _ := strings.Cut(after, "/")
+	out := consoleObject(jail, id)
+	if tail != "" {
+		out += "/" + tail
+	}
+	return out
+}
+
 func newConsoleID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
@@ -127,9 +162,10 @@ func (cs *consoleSession) touch() {
 // consoleFor returns the session of the request: it must exist, belong to the caller and to this jail and project.
 func (s *Server) consoleFor(c *rc) (*consoleSession, error) {
 	cs := s.consoles.get(c.pathArg("id"))
-	if cs == nil || cs.owner != c.actor.Name || cs.jail != c.pathArg("name") {
+	c.object = consoleObject(c.pathArg("name"), c.pathArg("id"))
+	if cs == nil || cs.owner != identityKey(c.actor) || cs.jail != c.pathArg("name") || cs.project != service.ProjectFrom(c.r.Context()) {
 		// the same answer for a session that does not exist and for somebody else's
-		return nil, api.Errorf(api.CodeNotFound, "console session %q does not exist", c.pathArg("id"))
+		return nil, api.Errorf(api.CodeNotFound, "console session %s does not exist", consoleRef(c.pathArg("id")))
 	}
 	return cs, nil
 }
@@ -153,7 +189,7 @@ func (s *Server) handleConsoleOpen(c *rc) error {
 		cancel()
 		return err
 	}
-	cs := &consoleSession{id: newConsoleID(), owner: c.actor.Name, project: st.Project, jail: name, st: st, cancel: cancel, last: time.Now()}
+	cs := &consoleSession{id: newConsoleID(), owner: identityKey(c.actor), project: st.Project, jail: name, st: st, cancel: cancel, last: time.Now()}
 	cs.cond = sync.NewCond(&cs.mu)
 	if err := s.consoles.add(cs); err != nil {
 		_ = st.Session.Signal(9)
@@ -164,7 +200,10 @@ func (s *Server) handleConsoleOpen(c *rc) error {
 	argv := fmt.Sprintf("%q", st.Argv)
 	c.detail = "console argv=" + argv
 	s.svc.Audit(context.WithoutCancel(c.r.Context()), storeEntry(c, "EXEC", st.Project, "console start argv="+argv))
-	go s.runConsole(cs)
+	go func() {
+		defer func() { supervise.Report(nil, "console-session", recover()) }()
+		s.runConsole(cs)
+	}()
 	c.sync(200, map[string]string{"id": cs.id}, 0)
 	return nil
 }
@@ -250,7 +289,7 @@ func (s *Server) handleConsoleOutput(c *rc) error {
 	_ = http.NewResponseController(c.w).SetWriteDeadline(time.Time{})
 	h := c.w.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-store")
 	h.Set("X-Accel-Buffering", "no")
 	c.w.WriteHeader(http.StatusOK)
 	c.status = 200
@@ -262,8 +301,19 @@ func (s *Server) handleConsoleOutput(c *rc) error {
 	defer stop()
 	ka := time.NewTicker(s.cfg.KeepAlive)
 	defer ka.Stop()
+	var revoked atomic.Bool
 	go func() {
-		for range ka.C {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ka.C:
+			}
+			// a credential revoked or changed since the session began ends the stream and the session
+			if !s.stillAuthorized(c) {
+				revoked.Store(true)
+				_ = cs.st.Session.Signal(9)
+			}
 			cs.mu.Lock()
 			cs.cond.Broadcast()
 			cs.mu.Unlock()
@@ -277,6 +327,10 @@ func (s *Server) handleConsoleOutput(c *rc) error {
 				if e.seq > after {
 					batch = append(batch, e)
 				}
+			}
+			if revoked.Load() {
+				cs.mu.Unlock()
+				return nil
 			}
 			if len(batch) > 0 || ctx.Err() != nil {
 				break

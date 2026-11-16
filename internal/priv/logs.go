@@ -89,7 +89,7 @@ func (c Config) logRef(p string) (logRef, error) {
 		}
 	}
 	if mount == "" {
-		return logRef{}, forbidden("path %q is not below %s", p, c.mountBaseDesc())
+		return logRef{}, c.notBelowMount(p)
 	}
 	segs := strings.Split(strings.TrimPrefix(p, strings.TrimSuffix(mount, "/")+"/"), "/")
 	if len(segs) < 7 || segs[0] != "projects" || segs[2] != "jails" || segs[4] != "root" || segs[5] != "var" || segs[6] != "log" {
@@ -141,7 +141,7 @@ func (ref logRef) openLogDir() (*os.Root, error) {
 			return nil, forbidden("%s/%s is not a directory", ref.mount, d)
 		}
 	}
-	jr, err := sr.OpenRoot(ref.jail)
+	jr, err := openBelow(sr, ref.jail)
 	if err != nil {
 		return nil, mapFSErr(err)
 	}
@@ -170,7 +170,9 @@ func (ref logRef) openLogDir() (*os.Root, error) {
 			return nil, forbidden("%s/%s/%s is not a plain directory", ref.mount, ref.jail, d)
 		}
 	}
-	lr, err := jr.OpenRoot("var/log")
+	// opened segment by segment and compared with what was checked: a var or var/log swapped for a symlink after
+	// the check (to .. or to /etc of the jail) is refused
+	lr, err := openBelow(jr, "var/log")
 	if err != nil {
 		return nil, mapFSErr(err)
 	}

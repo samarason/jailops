@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 
-	"jailops.net/jailops/internal/ipam"
 	"jailops.net/jailops/internal/sys/ifconfig"
 	"jailops.net/jailops/sdk/api"
 )
@@ -95,88 +94,4 @@ func hasScrub(rules string) bool {
 		}
 	}
 	return false
-}
-
-// gatewaysWithoutStaticARP lists the gateway interfaces of networks with an IPv4 subnet that exist but do not have
-// the staticarp flag: the host would ask jails for addresses they gave themselves. The flag is set when the first jail
-// of the network starts after this version was installed.
-func gatewaysWithoutStaticARP(ifs []ifconfig.Iface, bridges []string) []string {
-	var out []string
-	for _, br := range bridges {
-		gw := ipam.GatewayIface(br)
-		for _, i := range ifs {
-			if i.Name == gw && !slices.Contains(i.Flags, "STATICARP") {
-				out = append(out, gw)
-			}
-		}
-	}
-	return out
-}
-
-// doctorStaticARP warns about gateway interfaces that still resolve addresses with ARP while a jail runs on them.
-func (s *Service) doctorStaticARP(ctx context.Context, c *checkSet) {
-	if s.d.Net == nil {
-		return
-	}
-	nets, _ := s.netKind.list()
-	used := map[string]bool{}
-	s.mu.RLock()
-	for _, e := range s.jails {
-		for _, a := range e.jail.Spec.Network {
-			used[a.Network] = true
-		}
-	}
-	s.mu.RUnlock()
-	var bridges []string
-	for _, o := range nets {
-		if o.Spec.IPv4 != nil && used[o.Meta.Name] {
-			bridges = append(bridges, o.Spec.Bridge)
-		}
-	}
-	if len(bridges) == 0 {
-		return
-	}
-	ifs, err := s.d.Net.List(ctx)
-	if err != nil {
-		return
-	}
-	if bad := gatewaysWithoutStaticARP(ifs, bridges); len(bad) > 0 {
-		c.add("network.staticarp", api.DoctorWarn, "the gateway interface(s) "+strings.Join(bad, ", ")+" still resolve addresses with ARP: a jail started before this version has its old addressing",
-			"restart the jails of those networks (jailops restart) so they get /32 addresses, pinned MAC addresses and the host's static ARP entries")
-		return
-	}
-	c.add("network.staticarp", api.DoctorOK, "the gateway interfaces of networks in use only use static ARP entries", "")
-}
-
-// networksWithoutDNS names the networks that have no nameserver although jails use them: the jails' resolv.conf is
-// empty and they cannot resolve names (the flag form of `network create` has no dns option; use a file or `network edit`).
-func networksWithoutDNS(nets map[string][]string, used map[string]bool) []string {
-	var out []string
-	for name, dns := range nets {
-		if len(dns) == 0 && used[name] {
-			out = append(out, name)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
-func (s *Service) doctorDNS(c *checkSet) {
-	nets, _ := s.netKind.list()
-	used := map[string]bool{}
-	s.mu.RLock()
-	for _, e := range s.jails {
-		for _, a := range e.jail.Spec.Network {
-			used[a.Network] = true
-		}
-	}
-	s.mu.RUnlock()
-	m := map[string][]string{}
-	for _, o := range nets {
-		m[o.Meta.Name] = o.Spec.DNS
-	}
-	if bad := networksWithoutDNS(m, used); len(bad) > 0 {
-		c.add("network.dns", api.DoctorWarn, "no nameserver on network(s) "+strings.Join(bad, ", ")+": jails there have an empty resolv.conf and cannot resolve names",
-			"add `dns: [1.1.1.1, 2606:4700:4700::1111]` to the network (`jailops network edit NAME`)")
-	}
 }

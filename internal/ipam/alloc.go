@@ -4,7 +4,6 @@ import (
 	"math/big"
 	"net/netip"
 	"sort"
-	"strings"
 
 	"jailops.net/jailops/sdk/api"
 )
@@ -20,12 +19,6 @@ type Allocator struct {
 	excl     []Range // merged
 	reserved map[netip.Addr]bool
 	used     map[netip.Addr]string
-	// sub is the project's sub-range (valid when hasSub); fixed addresses
-	// must lie in it. scopeEx are other projects' ranges, which a project
-	// without a sub-range must not take fixed addresses from.
-	sub     Range
-	hasSub  bool
-	scopeEx []Range
 }
 
 // New builds an Allocator. gateway may be invalid (none) or outside the
@@ -53,16 +46,25 @@ func New(prefix netip.Prefix, gateway netip.Addr, rng Range, exclude []Range, in
 		// The all-ones end of an IPv6 subnet is kept back as broadcast-like (nothing uses it, and some stacks treat it
 		// as special). In a /64 the reserved subnet anycast identifiers of RFC 2526 are reserved too: the highest 128
 		// interface identifiers, and the same 128 with the universal/local bit cleared (fdff:ffff:ffff:ff80 to
-		// fdff:ffff:ffff:ffff, the form the RFC writes for EUI-64 interfaces). Other prefix lengths have no such rule.
+		// fdff:ffff:ffff:ffff, the form the RFC writes for EUI-64 interfaces), whenever they lie inside the prefix (a /64,
+		// or a longer prefix at the end of its /64: the proxy mode hands out /80s). A prefix shorter than a /64 has no
+		// such rule.
 		last := lastOf(prefix)
 		a.reserved[last] = true
-		if prefix.Bits() == 64 {
+		if prefix.Bits() >= 64 {
+			// the 128 identifiers are the top of the /64 that holds the prefix: a /80 at the end of its /64 has them
+			// inside it, and a prefix elsewhere in the /64 has none
+			last64 := lastOf(netip.PrefixFrom(prefix.Addr(), 64))
 			for i := 0; i < 128; i++ {
-				c := last.As16()
+				c := last64.As16()
 				c[15] = byte(0x80 + i)
-				a.reserved[netip.AddrFrom16(c)] = true
+				if x := netip.AddrFrom16(c); prefix.Contains(x) {
+					a.reserved[x] = true
+				}
 				c[8] &^= 0x02
-				a.reserved[netip.AddrFrom16(c)] = true
+				if x := netip.AddrFrom16(c); prefix.Contains(x) {
+					a.reserved[x] = true
+				}
 			}
 		}
 	}
@@ -78,39 +80,21 @@ func New(prefix netip.Prefix, gateway netip.Addr, rng Range, exclude []Range, in
 
 // NewV4 builds an Allocator from the network's IPv4 configuration.
 func NewV4(n *api.IPv4Net, inUse []netip.Addr) (*Allocator, error) {
-	return NewV4In(n, Scope{}, inUse)
-}
-
-// Scope narrows an allocator to one project. Sub is the project's sub-range
-// ("a-b" or "a"; empty means the whole network range). Exclude lists the
-// sub-ranges of other projects; it applies only when Sub is empty.
-type Scope struct {
-	Sub     string
-	Exclude []string
-}
-
-// NewV4In is NewV4 restricted to a project's scope.
-func NewV4In(n *api.IPv4Net, sc Scope, inUse []netip.Addr) (*Allocator, error) {
 	if n == nil {
 		return nil, invalid("ipv4", "network has no IPv4 configuration")
 	}
-	return fromStrings("ipv4", n.Subnet, n.Gateway, n.Range, n.Exclude, sc, inUse)
+	return fromStrings("ipv4", n.Subnet, n.Gateway, n.Range, n.Exclude, inUse)
 }
 
 // NewV6 builds an Allocator from the network's IPv6 configuration.
 func NewV6(n *api.IPv6Net, inUse []netip.Addr) (*Allocator, error) {
-	return NewV6In(n, Scope{}, inUse)
-}
-
-// NewV6In is NewV6 restricted to a project's scope.
-func NewV6In(n *api.IPv6Net, sc Scope, inUse []netip.Addr) (*Allocator, error) {
 	if n == nil || n.Mode == api.IPv6None {
 		return nil, invalid("ipv6", "network has no IPv6 configuration")
 	}
-	return fromStrings("ipv6", n.Subnet, n.Gateway, n.Range, n.Exclude, sc, inUse)
+	return fromStrings("ipv6", n.Subnet, "", n.Range, n.Exclude, inUse)
 }
 
-func fromStrings(field, subnet, gw, rng string, excl []string, sc Scope, inUse []netip.Addr) (*Allocator, error) {
+func fromStrings(field, subnet, gw, rng string, excl []string, inUse []netip.Addr) (*Allocator, error) {
 	p, err := netip.ParsePrefix(subnet)
 	if err != nil {
 		return nil, invalid(field+".subnet", "bad subnet %q", subnet)
@@ -129,56 +113,7 @@ func fromStrings(field, subnet, gw, rng string, excl []string, sc Scope, inUse [
 	if err != nil {
 		return nil, err
 	}
-	var sub Range
-	hasSub := strings.TrimSpace(sc.Sub) != ""
-	var scopeEx []Range
-	if hasSub {
-		if sub, err = ParseRange(sc.Sub); err != nil {
-			return nil, err
-		}
-		if sub.First.BitLen() != r.First.BitLen() {
-			return nil, invalid("range", "the project's range %q has the wrong address family", sc.Sub)
-		}
-		lo, hi := r.First, r.Last
-		if lo.Less(sub.First) {
-			lo = sub.First
-		}
-		if sub.Last.Less(hi) {
-			hi = sub.Last
-		}
-		if hi.Less(lo) {
-			return nil, invalid("range", "the project's range is outside the network's allocation range")
-		}
-		r = Range{lo, hi}
-	} else if len(sc.Exclude) > 0 {
-		if scopeEx, err = ParseExclusions(sc.Exclude); err != nil {
-			return nil, err
-		}
-		ex = append(ex, scopeEx...)
-	}
-	a, err := New(p, g, r, ex, inUse)
-	if err != nil {
-		return nil, err
-	}
-	a.sub, a.hasSub, a.scopeEx = sub, hasSub, merge(scopeEx)
-	return a, nil
-}
-
-// ParseSub parses a project's sub-range and checks that it lies inside the
-// network's allocation range netRange.
-func ParseSub(sub, netRange string) (Range, error) {
-	s, err := ParseRange(sub)
-	if err != nil {
-		return Range{}, err
-	}
-	n, err := ParseRange(netRange)
-	if err != nil {
-		return Range{}, err
-	}
-	if s.First.BitLen() != n.First.BitLen() || s.First.Less(n.First) || n.Last.Less(s.Last) {
-		return Range{}, invalid("range", "range %s-%s is outside the network's range %s-%s", s.First, s.Last, n.First, n.Last)
-	}
-	return s, nil
+	return New(p, g, r, ex, inUse)
 }
 
 // Overlap reports whether two ranges of one family share an address.
@@ -187,26 +122,6 @@ func Overlap(a, b Range) bool {
 		return false
 	}
 	return !a.Last.Less(b.First) && !b.Last.Less(a.First)
-}
-
-// scopeCheck refuses a fixed address outside the project's scope.
-func (a *Allocator) scopeCheck(x netip.Addr) error {
-	forbid := func(why string) error {
-		return api.Errorf(api.CodeForbidden, "address %s is %s", x, why).
-			WithDetail("address", x.String()).WithDetail("range", why)
-	}
-	if a.hasSub {
-		if !a.sub.Contains(x) {
-			return forbid("outside the project's range " + a.sub.First.String() + "-" + a.sub.Last.String())
-		}
-		return nil
-	}
-	for _, r := range a.scopeEx {
-		if r.Contains(x) {
-			return forbid("in a range reserved for another project")
-		}
-	}
-	return nil
 }
 
 // Prefix returns the subnet.
@@ -227,9 +142,6 @@ func (a *Allocator) Release(addr netip.Addr) { delete(a.used, norm(addr)) }
 // used under owner.
 func (a *Allocator) Allocate(preferred netip.Addr, owner string) (netip.Addr, error) {
 	if preferred.IsValid() {
-		if err := a.scopeCheck(norm(preferred)); err != nil {
-			return netip.Addr{}, err
-		}
 		return a.take(norm(preferred), owner)
 	}
 	cand := a.rng.First

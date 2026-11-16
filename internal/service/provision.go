@@ -85,6 +85,7 @@ func (s *Service) forgetProvisioned(key string) {
 	if s.d.StateDir != "" {
 		_ = os.Remove(s.provPath(key))
 	}
+	s.forgetShell(key)
 	s.upd.forget(key)
 }
 

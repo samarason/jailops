@@ -21,6 +21,8 @@ type BackupTarget struct {
 
 // BackupTargetSpec describes a backup destination.
 type BackupTargetSpec struct {
+	// Comment is what the object is for: one line of free text.
+	Comment string `json:"comment,omitempty"`
 	// Kind is "node" (a jailopsd in backup role over HTTPS) or "directory".
 	Kind    string `json:"kind"`
 	Address string `json:"address,omitempty"`
@@ -38,6 +40,8 @@ type BackupPolicy struct {
 // BackupPolicySpec is the desired backup behaviour. Backups are always
 // encrypted on the host before they leave it.
 type BackupPolicySpec struct {
+	// Comment is what the object is for: one line of free text.
+	Comment string `json:"comment,omitempty"`
 	// Selector matches jails by label. An empty selector matches none; use
 	// the label "all" explicitly to match every jail.
 	Selector map[string]string `json:"selector,omitempty"`
@@ -48,6 +52,9 @@ type BackupPolicySpec struct {
 	Retention RetentionPolicy `json:"retention"`
 	// IncludeState also backs up the host's state dataset.
 	IncludeState bool `json:"include_state,omitempty"`
+	// ExcludeVolumes leaves the volumes out. By default a policy also backs up the volumes the jails it selects
+	// attach, and the volumes whose own labels match the selector, each volume once however many jails attach it.
+	ExcludeVolumes bool `json:"exclude_volumes,omitempty"`
 	// FullEvery forces a full read of the data (still deduplicated) when
 	// the last full read is older than this many days. Zero uses the default.
 	FullEvery int `json:"full_every,omitempty"`
@@ -78,11 +85,16 @@ type Backup struct {
 
 // BackupSpec identifies what was backed up.
 type BackupSpec struct {
+	// Kind is "jail" (the default) or "volume". A volume is a backup of its own: Jail and JailUUID then name the
+	// volume and its UUID, and Volume holds what restore needs to make it again.
+	Kind     string `json:"kind,omitempty"`
 	Jail     string `json:"jail"`
 	JailUUID string `json:"jail_uuid"`
-	HostUUID string `json:"host_uuid"`
-	Policy   string `json:"policy,omitempty"`
-	Target   string `json:"target,omitempty"`
+	// Volume is the spec of the volume of a volume backup (never the passphrase of an encrypted one).
+	Volume   *VolumeSpec `json:"volume,omitempty"`
+	HostUUID string      `json:"host_uuid"`
+	Policy   string      `json:"policy,omitempty"`
+	Target   string      `json:"target,omitempty"`
 	// Snapshot is the repository snapshot id (YYYYMMDDHHMMSS-xxxxxxxx).
 	Snapshot string `json:"snapshot"`
 	// ZFSSnapshot is the name of the consistent snapshot the capture read.
@@ -144,6 +156,10 @@ type RestoreBundle struct {
 	Policies        []FirewallPolicySpec `json:"policies,omitempty"`
 	AddressSets     []AddressSetSpec     `json:"address_sets,omitempty"`
 	Volumes         []string             `json:"volumes,omitempty"`
+	// VolumeIDs maps the name of each volume the jail attached to the volume's UUID. A restore brings back a volume
+	// the project lacks only from a backup of that very volume, never from a newer one of another volume that had the
+	// name.
+	VolumeIDs map[string]string `json:"volume_ids,omitempty"`
 	// SecretRefs name sealed secrets; the secrets are never in the bundle.
 	SecretRefs []string `json:"secret_refs,omitempty"`
 }
@@ -166,6 +182,12 @@ type RestoreRequest struct {
 	KeepIP     bool              `json:"keep_ip,omitempty"`
 	// DryRun returns the preflight report and changes nothing.
 	DryRun bool `json:"dry_run,omitempty"`
+	// NoVolumes restores a jail with no volume attachments at all (attach them afterwards). By default the volumes
+	// the project lacks are restored from their newest backup first and the others are attached as they are.
+	NoVolumes bool `json:"no_volumes,omitempty"`
+	// Passphrase is the passphrase of the restored volume when the backup holds an encrypted volume; it is used once
+	// to make the volume and never stored.
+	Passphrase string `json:"passphrase,omitempty"`
 }
 
 // RestorePreflight is the report produced before any restore changes state.
@@ -212,6 +234,8 @@ type BackupKeyEscrow struct {
 // now for every jail it selects.
 type BackupRunRequest struct {
 	Policy string `json:"policy"`
+	// NoVolumes leaves the volumes out of this run.
+	NoVolumes bool `json:"no_volumes,omitempty"`
 }
 
 // BackupVerifyRequest is the body of POST /api/v1/backups/{id}/verify. Depth is

@@ -22,7 +22,7 @@ func TestTokensCertsUsers(t *testing.T) {
 	tr := h.transcript()
 
 	// The secret goes to stdout alone, the warning to stderr.
-	out, errs, code := tr.do("", "token", "create", "ci", "--permission", "operator", "--projects", "main", "--expires", "720h", "--allow-from", "10.0.0.0/8")
+	out, errs, code := tr.do("", "token", "create", "ci", "--role", "operator", "--projects", "main", "--expires", "720h", "--allow-from", "10.0.0.0/8")
 	if code != 0 || !strings.HasPrefix(strings.TrimSpace(out), "jot_") || strings.Count(strings.TrimSpace(out), "\n") != 0 {
 		t.Fatalf("token create: %d %q", code, out)
 	}
@@ -40,24 +40,24 @@ func TestTokensCertsUsers(t *testing.T) {
 	tr.do("", "token", "create", "noscope")
 	tr.do("", "token", "create", "both", "--global", "--projects", "main")
 	tr.do("", "token", "create", "ghost", "--projects", "nope")
-	tr.do("", "token", "create", "weird", "--permission", "", "--global")
-	tr.ok("token", "delete", "-y", "ci", "j")
+	tr.do("", "token", "create", "weird", "--role", "", "--global")
+	tr.ok("token", "revoke", "-y", "ci", "j")
 
 	pemFile := writeCert(t, h.dir)
-	tr.ok("cert", "create", "laptop", "--pem", pemFile, "--permission", "operator", "--projects", "main")
-	tr.ok("cert", "add", "hostb", "--kind", "host", "--fingerprint", "AB:CD:"+strings.Repeat("00", 30), "--permission", "admin", "--global")
+	tr.ok("cert", "create", "laptop", "--pem", pemFile, "--role", "operator", "--projects", "main")
+	tr.ok("cert", "create", "hostb", "--kind", "host", "--fingerprint", "AB:CD:"+strings.Repeat("00", 30), "--role", "admin", "--global")
 	tr.do("", "cert", "create", "bad", "--fingerprint", "xyz", "--global")
 	tr.do("", "cert", "create", "noscope", "--fingerprint", strings.Repeat("ab", 32))
 	tr.ok("cert", "list")
-	tr.ok("cert", "delete", "-y", "hostb")
+	tr.ok("cert", "revoke", "-y", "hostb")
 
-	out, errs, code = tr.do("", "user", "create", "alice", "--permission", "operator", "--projects", "main")
+	out, errs, code = tr.do("", "user", "create", "alice", "--role", "operator", "--projects", "main")
 	if code != 0 || strings.TrimSpace(out) == "" || !strings.Contains(errs, "shown only once") {
 		t.Fatalf("user create: %d %q %q", code, out, errs)
 	}
 	tr.ok("user", "list")
-	tr.do("", "user", "create", "bob", "--password-stdin", "--global") // stdin empty
-	out, errs, code = tr.do("hunter2-hunter2\n", "user", "create", "bob", "--password-stdin", "--global")
+	tr.do("", "user", "create", "bob", "--password-file", "-", "--global") // stdin empty
+	out, errs, code = tr.do("hunter2-hunter2\n", "user", "create", "bob", "--password-file", "-", "--global")
 	if code != 0 || strings.Contains(out, "hunter2") || !strings.Contains(out, "user/bob created") || errs != "" {
 		t.Fatalf("user with password: %d %q %q", code, out, errs)
 	}
@@ -166,15 +166,15 @@ func TestUserIdentityManagement(t *testing.T) {
 	if code != 0 || !strings.Contains(shown, "permission: admin") || !strings.Contains(shown, "global: true") {
 		t.Fatalf("admin: %d %s", code, shown)
 	}
-	if _, _, code := h.run("", "user", "create", "x", "--admin", "--permission", "operator"); code == 0 {
-		t.Fatal("--admin with --permission accepted")
+	if _, _, code := h.run("", "user", "create", "x", "--admin", "--role", "operator"); code == 0 {
+		t.Fatal("--admin with --role accepted")
 	}
 	if _, _, code := h.run("", "user", "create", "x", "--admin", "--global"); code == 0 {
 		t.Fatal("--admin with --global accepted")
 	}
 	// a password prompt, asked twice and compared
 	h.secrets = []string{"correct horse battery staple", "correct horse battery staple"}
-	if out, errs, code := h.run("", "user", "create", "carol", "--permission", "operator", "--projects", "main", "--password-prompt"); code != 0 || strings.Contains(out+errs, "correct horse") {
+	if out, errs, code := h.run("", "user", "create", "carol", "--role", "operator", "--projects", "main", "--password-prompt"); code != 0 || strings.Contains(out+errs, "correct horse") {
 		t.Fatalf("prompted create: %d %q %q", code, out, errs)
 	}
 	h.secrets = []string{"one", "two"}
@@ -182,11 +182,11 @@ func TestUserIdentityManagement(t *testing.T) {
 		t.Fatal("mismatching passwords accepted")
 	}
 	h.secrets = nil
-	// without a terminal and without --password-stdin it refuses instead of reading a password from anywhere else
-	if _, errs, code := h.run("", "user", "set-password", "carol"); code == 0 || !strings.Contains(errs, "--password-stdin") {
+	// without a terminal and without --password-file - it refuses instead of reading a password from anywhere else
+	if _, errs, code := h.run("", "user", "set-password", "carol"); code == 0 || !strings.Contains(errs, "--password-file -") {
 		t.Fatalf("no terminal: %d %q", code, errs)
 	}
-	out, errs, code = h.run("a long new passphrase\n", "user", "set-password", "carol", "--password-stdin")
+	out, errs, code = h.run("a long new passphrase\n", "user", "set-password", "carol", "--password-file", "-")
 	if code != 0 || strings.Contains(out+errs, "passphrase") || !strings.Contains(out, "password set") {
 		t.Fatalf("set-password: %d %q %q", code, out, errs)
 	}
@@ -197,25 +197,36 @@ func TestUserIdentityManagement(t *testing.T) {
 	if _, _, code := h.run("", "user", "set-password", "ghost", "--generate"); code == 0 {
 		t.Fatal("unknown user")
 	}
-	// set-role replaces role and scope
-	if _, errs, code := h.run("", "user", "set-role", "carol", "--permission", "admin", "--global"); code != 0 {
+	// set-role replaces what it is given (--role is the former name of --role)
+	if _, errs, code := h.run("", "user", "set-role", "carol", "--role", "admin", "--global"); code != 0 {
 		t.Fatalf("set-role: %d %q", code, errs)
 	}
 	shown, _, _ = h.run("", "user", "show", "carol", "-o", "yaml")
 	if !strings.Contains(shown, "permission: admin") || !strings.Contains(shown, "global: true") || strings.Contains(shown, "main") {
 		t.Fatalf("carol: %s", shown)
 	}
-	if _, errs, code := h.run("", "user", "set-role", "carol", "--permission", "readonly", "--projects", "main"); code != 0 {
+	if _, errs, code := h.run("", "user", "set-role", "carol", "--role", "readonly", "--projects", "main"); code != 0 {
 		t.Fatalf("set-role back: %d %q", code, errs)
 	}
 	shown, _, _ = h.run("", "user", "show", "carol", "-o", "yaml")
 	if !strings.Contains(shown, "permission: readonly") || strings.Contains(shown, "global: true") || !strings.Contains(shown, "main") {
 		t.Fatalf("carol again: %s", shown)
 	}
-	if _, _, code := h.run("", "user", "set-role", "carol", "--permission", "operator"); code == 0 {
-		t.Fatal("set-role without a scope accepted")
+	// what is left out stays: the role alone keeps the scope, the scope alone keeps the role
+	if out, errs, code := h.run("", "user", "set-role", "carol", "--role", "operator"); code != 0 || !strings.Contains(out, "readonly, main -> operator, main") {
+		t.Fatalf("set-role --role: %d %q %q", code, out, errs)
 	}
-	// revoke is the token delete
+	if out, errs, code := h.run("", "user", "set-role", "carol", "--global"); code != 0 || !strings.Contains(out, "operator, main -> operator, global") {
+		t.Fatalf("set-role --global: %d %q %q", code, out, errs)
+	}
+	shown, _, _ = h.run("", "user", "show", "carol", "-o", "yaml")
+	if !strings.Contains(shown, "permission: operator") || !strings.Contains(shown, "global: true") {
+		t.Fatalf("carol kept: %s", shown)
+	}
+	if _, errs, code := h.run("", "user", "set-role", "carol"); code != 2 || !strings.Contains(errs, "give --role") {
+		t.Fatalf("set-role without anything: %d %q", code, errs)
+	}
+	// revoke is how a token ends
 	h.run("", "token", "create", "ci", "--global")
 	if _, errs, code := h.run("", "token", "revoke", "-y", "ci"); code != 0 {
 		t.Fatalf("token revoke: %d %q", code, errs)

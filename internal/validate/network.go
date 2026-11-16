@@ -10,23 +10,12 @@ import (
 
 // NetworkSpec validates a network definition.
 func NetworkSpec(s api.NetworkSpec) error {
-	if s.Bridge != "" {
-		if err := IfName("bridge", s.Bridge); err != nil {
-			return err
-		}
-		if len(s.Bridge) > ipam.MaxBridgeName {
-			return Invalid("bridge", "bridge name %q is longer than %d characters (the gateway interface is derived from it)", s.Bridge, ipam.MaxBridgeName)
-		}
-	}
 	if s.Uplink != "" {
 		if err := IfName("uplink", s.Uplink); err != nil {
 			return err
 		}
-		if s.Uplink == s.Bridge {
-			return Invalid("uplink", "uplink must not be the bridge itself")
-		}
 		if ipam.IsEpairName(s.Uplink) {
-			return Invalid("uplink", "uplink %q looks like a jail interface (a bridge member)", s.Uplink)
+			return Invalid("uplink", "uplink %q looks like a jail interface", s.Uplink)
 		}
 	}
 	if s.MTU != 0 && (s.MTU < 576 || s.MTU > 9216) {
@@ -63,21 +52,6 @@ func NetworkSpec(s api.NetworkSpec) error {
 	return nil
 }
 
-// NetworkMembers validates the spec and additionally checks the observed
-// member list of the bridge: the uplink must not be one of them.
-func NetworkMembers(s api.NetworkSpec, members []string) error {
-	if err := NetworkSpec(s); err != nil {
-		return err
-	}
-	for _, m := range members {
-		if s.Uplink != "" && m == s.Uplink {
-			return Invalid("uplink", "uplink %q is a member of bridge %q", s.Uplink, s.Bridge).
-				WithHint("remove the uplink from the bridge; the uplink is never bridged")
-		}
-	}
-	return nil
-}
-
 func ipv4(s api.NetworkSpec) error {
 	n := s.IPv4
 	p, err := netip.ParsePrefix(n.Subnet)
@@ -90,8 +64,11 @@ func ipv4(s api.NetworkSpec) error {
 	if p.Bits() < 8 || p.Bits() > 30 {
 		return Invalid("ipv4.subnet", "ipv4.subnet prefix length must be between 8 and 30")
 	}
-	if p.Addr().IsMulticast() || p.Addr().IsLoopback() {
-		return Invalid("ipv4.subnet", "ipv4.subnet %q is not a unicast network", n.Subnet)
+	// A network of jails is a unicast network of ordinary addresses: not "this network" (0/8), loopback, link-local,
+	// multicast or the reserved class E (224/3): the reject route of the subnet would blackhole traffic that means
+	// something else, and the jails would be given addresses that are not theirs to use.
+	if a := p.Addr(); a.IsMulticast() || a.IsLoopback() || a.IsLinkLocalUnicast() || a.As4()[0] == 0 || a.As4()[0] >= 224 {
+		return Invalid("ipv4.subnet", "ipv4.subnet %q is not a network for jails: use a private range (10/8, 172.16/12, 192.168/16, 100.64/10) or a range that is routed to this host", n.Subnet)
 	}
 	gw, err := addr("ipv4.gateway", n.Gateway)
 	if err != nil || !gw.Is4() {
@@ -144,6 +121,11 @@ func lastAddr(p netip.Prefix) netip.Addr {
 	return a
 }
 
+var (
+	globalUnicast6 = netip.MustParsePrefix("2000::/3")
+	uniqueLocal6   = netip.MustParsePrefix("fc00::/7")
+)
+
 func ipv6(s api.NetworkSpec) error {
 	n := s.IPv6
 	switch n.Mode {
@@ -160,35 +142,17 @@ func ipv6(s api.NetworkSpec) error {
 	if p != p.Masked() {
 		return Invalid("ipv6.subnet", "ipv6.subnet %q has host bits set (want %s)", n.Subnet, p.Masked())
 	}
-	// What the proxy cannot serve is refused here, not when the first jail starts: the helper approves prefixes of
-	// /48 to /120, and a proxy-mode subnet lies inside one.
-	lo := ipam.RoutedSubnetMin6
+	// What the proxy cannot serve is refused here, not when the first jail starts: the helper accepts prefixes of
+	// /48 to /120.
+	lo, hi := ipam.RoutedSubnetMin6, ipam.SubnetMax6
 	if n.Mode == api.IPv6Proxy {
-		lo = ipam.ProxySubnetMin6
+		lo, hi = ipam.ProxySubnetMin6, ipam.ProxyApproveMax6
 	}
-	if p.Bits() < lo || p.Bits() > ipam.SubnetMax6 {
-		msg := "ipv6.subnet prefix length must be between %d and %d"
-		if n.Mode == api.IPv6Proxy {
-			msg += " in proxy mode: the helper approves proxied prefixes of /%d to /%d only (ndp-proxy in priv.conf), and the subnet must lie inside one"
-			return Invalid("ipv6.subnet", msg, lo, ipam.SubnetMax6, ipam.ProxyApproveMin6, ipam.ProxyApproveMax6)
-		}
-		return Invalid("ipv6.subnet", msg, lo, ipam.SubnetMax6)
+	if p.Bits() < lo || p.Bits() > hi {
+		return Invalid("ipv6.subnet", "ipv6.subnet prefix length must be between %d and %d", lo, hi)
 	}
-	if p.Addr().IsLinkLocalUnicast() || p.Addr().IsMulticast() || p.Addr().IsLoopback() {
-		return Invalid("ipv6.subnet", "ipv6.subnet %q is not a global or unique-local network", n.Subnet)
-	}
-	gw, err := addr("ipv6.gateway", n.Gateway)
-	if err != nil || !gw.Is6() {
-		return Invalid("ipv6.gateway", "ipv6.gateway %q is not an IPv6 address", n.Gateway)
-	}
-	linkLocal := gw.IsLinkLocalUnicast()
-	if !linkLocal {
-		if !p.Contains(gw) {
-			return Invalid("ipv6.gateway", "ipv6.gateway %s is outside %s (only a link-local gateway may be)", gw, p)
-		}
-		if gw == p.Addr() {
-			return Invalid("ipv6.gateway", "ipv6.gateway %s is the network address", gw)
-		}
+	if !globalUnicast6.Contains(p.Addr()) && !uniqueLocal6.Contains(p.Addr()) {
+		return Invalid("ipv6.subnet", "ipv6.subnet %q must be a global (2000::/3) or unique-local (fc00::/7) network", n.Subnet)
 	}
 	r, err := ipam.ParseRange(n.Range)
 	if err != nil || r.First.Is4() {
@@ -197,22 +161,15 @@ func ipv6(s api.NetworkSpec) error {
 	if !p.Contains(r.First) || !p.Contains(r.Last) {
 		return Invalid("ipv6.range", "ipv6.range %q is outside %s", n.Range, p)
 	}
-	if r.Contains(gw) {
-		return Invalid("ipv6.range", "ipv6.range %q contains the gateway %s", n.Range, gw)
-	}
 	if err := exclusions("ipv6.exclude", n.Exclude, p); err != nil {
 		return err
 	}
 	if n.Mode == api.IPv6Proxy {
-		if !linkLocal {
-			return Invalid("ipv6.gateway", "in proxy mode the gateway must be the bridge's link-local address: the bridge must not hold an on-link copy of the upstream prefix %s", p).
-				WithHint("use a gateway such as fe80::1")
-		}
 		if s.Uplink == "" {
 			return Invalid("uplink", "ipv6 proxy mode needs an uplink to answer neighbor solicitations on")
 		}
-		if s.Uplink == s.Bridge || ipam.IsEpairName(s.Uplink) || strings.HasPrefix(s.Uplink, "bridge") {
-			return Invalid("uplink", "in proxy mode the uplink %q must not be a bridge or a bridge member", s.Uplink)
+		if ipam.IsEpairName(s.Uplink) || strings.HasPrefix(s.Uplink, "bridge") {
+			return Invalid("uplink", "in proxy mode the uplink %q must be a plain interface, not a bridge or an interface of a jail", s.Uplink)
 		}
 	}
 	return nil

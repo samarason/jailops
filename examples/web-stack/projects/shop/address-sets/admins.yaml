@@ -3,4 +3,7 @@ kind: AddressSet
 metadata:
   name: admins
 spec:
-  addresses: [203.0.113.7]
+  comment: "Where the administrators connect from (a documentation address: replace it)."
+  addresses:
+    - address: 203.0.113.7
+      comment: the administrator's home

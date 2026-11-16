@@ -30,13 +30,12 @@ func (s *Server) jailRoutes() []route {
 	}.routes()
 	jr = append(jr,
 		route{method: "POST", pattern: "/api/v1/jails", h: func(c *rc) error {
-			// a Jail, with the passphrase of its encrypted volumes when it has some (api.JailCreate)
-			var j api.JailCreate
+			var j api.Jail
 			if err := c.decode(&j); err != nil {
 				return err
 			}
 			c.object = "/api/v1/jails/" + j.Metadata.Name
-			op, err := svc.CreateJailWith(c.r.Context(), j)
+			op, err := svc.CreateJail(c.r.Context(), j)
 			if err != nil {
 				return err
 			}
@@ -129,33 +128,31 @@ func (s *Server) jailRoutes() []route {
 			c.async(op)
 			return nil
 		}},
-		// encrypted volumes (volume_unlock): the passphrase is in the body and nowhere else
-		route{method: "POST", pattern: "/api/v1/jails/{name}/unlock", h: func(c *rc) error {
-			var u api.JailUnlock
-			if err := c.decode(&u); err != nil {
+		// the volumes a jail attaches (volumes.go has the volumes themselves)
+		route{method: "GET", pattern: "/api/v1/jails/{name}/volumes", h: func(c *rc) error {
+			v, err := svc.ListJailVolumes(c.r.Context(), c.pathArg("name"))
+			if err != nil {
 				return err
 			}
-			op, err := svc.UnlockJail(c.r.Context(), c.pathArg("name"), u)
+			c.sync(200, v, 0)
+			return nil
+		}},
+		route{method: "POST", pattern: "/api/v1/jails/{name}/volumes", h: func(c *rc) error {
+			var req api.VolumeAttachRequest
+			if err := c.decode(&req); err != nil {
+				return err
+			}
+			c.object = "/api/v1/jails/" + c.pathArg("name")
+			op, err := svc.AttachVolume(c.r.Context(), c.pathArg("name"), req)
 			if err != nil {
 				return err
 			}
 			c.async(op)
 			return nil
 		}},
-		route{method: "POST", pattern: "/api/v1/jails/{name}/lock", h: func(c *rc) error {
-			op, err := svc.LockJail(c.r.Context(), c.pathArg("name"))
-			if err != nil {
-				return err
-			}
-			c.async(op)
-			return nil
-		}},
-		route{method: "POST", pattern: "/api/v1/jails/{name}/passphrase", h: func(c *rc) error {
-			var pc api.JailPassphraseChange
-			if err := c.decode(&pc); err != nil {
-				return err
-			}
-			op, err := svc.ChangeJailPassphrase(c.r.Context(), c.pathArg("name"), pc)
+		route{method: "DELETE", pattern: "/api/v1/jails/{name}/volumes/{volume}", h: func(c *rc) error {
+			c.object = "/api/v1/jails/" + c.pathArg("name")
+			op, err := svc.DetachVolume(c.r.Context(), c.pathArg("name"), c.pathArg("volume"))
 			if err != nil {
 				return err
 			}
@@ -348,6 +345,11 @@ func (s *Server) handleEvents(c *rc) error {
 		}
 		after = n
 	}
+	release, err := s.streams.acquire(identityKey(c.actor))
+	if err != nil {
+		return err
+	}
+	defer release()
 	rcn := http.NewResponseController(c.w)
 	_ = rcn.SetWriteDeadline(time.Time{})
 	ctx := c.r.Context()
@@ -355,10 +357,11 @@ func (s *Server) handleEvents(c *rc) error {
 	if err != nil {
 		return err
 	}
+	gen := s.svc.CredentialGeneration()
 	ch := s.svc.Events().Subscribe(ctx, after)
 	h := c.w.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-store")
 	h.Set("X-Accel-Buffering", "no")
 	c.w.WriteHeader(http.StatusOK)
 	c.status = 200
@@ -371,6 +374,10 @@ func (s *Server) handleEvents(c *rc) error {
 		case <-ctx.Done():
 			return nil
 		case <-ka.C:
+			// a credential revoked or changed since the stream began ends it
+			if !s.stillAuthorized(c) {
+				return nil
+			}
 			if _, err := fmt.Fprint(c.w, ": ping\n\n"); err != nil {
 				return nil
 			}
@@ -378,6 +385,12 @@ func (s *Server) handleEvents(c *rc) error {
 		case se, ok := <-ch:
 			if !ok {
 				return nil
+			}
+			if g := s.svc.CredentialGeneration(); g != gen {
+				if !s.stillAuthorized(c) {
+					return nil
+				}
+				gen = g
 			}
 			if types != nil && !types[string(se.Event.Type)] {
 				continue
@@ -409,7 +422,7 @@ func (s *Server) authRoutes() []route {
 			if err := c.decode(&req); err != nil {
 				return err
 			}
-			c.object = "user:" + req.Username
+			// the user name is the caller's text: an anonymous request writes none of its body into the audit log
 			host, _ := remoteAddr(c.r)
 			sess, err := svc.Login(c.r.Context(), req.Username, req.Password, req.TOTP, host)
 			if err != nil {
@@ -467,14 +480,16 @@ func (s *Server) authRoutes() []route {
 			if c.actor.Kind != "user" {
 				return api.Errorf(api.CodeInvalid, "only user accounts have a second factor")
 			}
+			// enrolment starts with the password; the code of the new secret confirms it
 			var req struct {
-				Code string `json:"code"`
+				Code     string `json:"code"`
+				Password string `json:"password"`
 			}
 			if err := c.decodeOptional(&req); err != nil {
 				return err
 			}
 			if req.Code == "" {
-				v, err := svc.StartTOTP(c.r.Context(), c.actor.Name)
+				v, err := svc.StartTOTP(c.r.Context(), c.actor.Name, req.Password)
 				if err != nil {
 					return err
 				}
@@ -508,7 +523,13 @@ func (s *Server) authRoutes() []route {
 			if c.actor.Kind != "user" {
 				return api.Errorf(api.CodeInvalid, "only user accounts have recovery codes")
 			}
-			codes, err := svc.RecoveryCodes(c.r.Context(), c.actor.Name)
+			var req struct {
+				Password string `json:"password"`
+			}
+			if err := c.decodeOptional(&req); err != nil {
+				return err
+			}
+			codes, err := svc.RecoveryCodes(c.r.Context(), c.actor.Name, req.Password)
 			if err != nil {
 				return err
 			}

@@ -2,6 +2,7 @@
 // (overlaps, ports taken by another tunnel, interface names) and its message is shown as it comes.
 import type { WireGuard, WireGuardPeerStatus } from '@jailops/shared/api/types'
 import { parseV4Cidr, isV6Cidr } from './netform'
+import { nameError } from './nameField'
 
 export interface ServerForm {
   name: string
@@ -22,8 +23,8 @@ const isV6 = (a: string) => a.includes(':') && /^[0-9a-fA-F:.]+$/.test(a)
 /** Field -> message for what is plainly wrong; empty when the form may be sent. */
 export function checkServer(f: ServerForm): Record<string, string> {
   const e: Record<string, string> = {}
-  if (f.name && !/^[a-z][a-z0-9-]{0,62}$/.test(f.name)) e.name = 'Start with a letter; use lower-case letters, digits and dashes.'
-  else if (f.name.length > 12) e.name = 'At most 12 characters: the interface is named wg-<name> (15 at most).'
+  // the object name rule, at most 12 characters: the interface is wg-<name> (shared lib/names.ts, rule tunnel)
+  if (f.name && nameError(f.name, 'tunnel')) e.name = nameError(f.name, 'tunnel')
   const addrs = splitList(f.address)
   if (f.address && !addrs.every((a) => parseV4Cidr(a) || isV6Cidr(a))) e.address = 'Give addresses with a prefix, for example 10.99.0.1/24 or fd99::1/64.'
   else if (addrs.filter((a) => !a.includes(':')).length > 1 || addrs.filter((a) => a.includes(':')).length > 1) e.address = 'At most one IPv4 and one IPv6 address.'

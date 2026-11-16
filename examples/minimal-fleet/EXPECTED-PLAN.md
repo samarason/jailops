@@ -6,20 +6,21 @@ the real output on every run, so this page cannot go stale (regenerate with `JAI
 ```
 host web1
   create    Image/freebsd-15
-  create    Network/br-db
-  create    Network/br-web
+  create    Network/db
+  create    Network/web
   create    Storage/fast
   create    Project/db
   create    Project/web
   create    FirewallPolicy/db/base
   create    FirewallPolicy/web/base
   create    BackupTarget/vault
+  create    Volume/db/postgres-data
   create    Jail/db/postgres
   create    Jail/web/blog
 host web2
   create    Image/freebsd-15
-  create    Network/br-db
-  create    Network/br-web
+  create    Network/db
+  create    Network/web
   create    Storage/fast
   create    Project/db
   create    Project/web
@@ -36,5 +37,5 @@ projects
     web1         will be created
     web2         will be created
 
-21 create, 0 update, 0 delete, 0 unchanged, 0 unmanaged
+22 create, 0 update, 0 delete, 0 unchanged, 0 unmanaged
 ```

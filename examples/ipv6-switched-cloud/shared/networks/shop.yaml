@@ -3,14 +3,12 @@ kind: Network
 metadata:
   name: shop
 spec:
-  bridge: jo30
-  # In proxy mode the uplink answers neighbor discovery for every jail address and must never be a bridge member.
+  # In proxy mode the uplink answers neighbor discovery for every jail address and must be a plain interface, not a bridge member.
   uplink: vtnet0
   ipv4: {subnet: 10.94.0.0/24, gateway: 10.94.0.1, range: 10.94.0.2-10.94.0.254, nat: true}
   ipv6:
     mode: proxy
     # The provider gave this server the shared /64 2001:db8:1:2::/64. This project's /80 is carved out of it.
     subnet: "2001:db8:1:2:100::/80"
-    gateway: "fe80::1"     # proxy mode: the bridge's link-local address, never an address of the shared segment
     range: "2001:db8:1:2:100::10-2001:db8:1:2:100::ffff"
   dns: [1.1.1.1, 2606:4700:4700::1111]

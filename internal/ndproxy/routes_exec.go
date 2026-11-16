@@ -35,19 +35,19 @@ func validIface(n string) bool {
 	return true
 }
 
-func routeArgs(verb string, addr netip.Addr, bridge string) []string {
-	return []string{verb, "-inet6", netip.PrefixFrom(addr, 128).String(), "-interface", bridge}
+func routeArgs(verb string, addr netip.Addr, iface string) []string {
+	return []string{verb, "-inet6", netip.PrefixFrom(addr, 128).String(), "-interface", iface}
 }
 
-// Add runs `route add -inet6 <addr>/128 -interface <bridge>`. If the route
-// exists it is changed to use the bridge.
-func (r RouteManager) Add(ctx context.Context, addr netip.Addr, bridge string) error {
-	if !validIface(bridge) || !ValidAddr(addr) {
-		return api.Errorf(api.CodeInvalid, "bad route %s via %q", addr, bridge)
+// Add runs `route add -inet6 <addr>/128 -interface <iface>`. If the route
+// exists it is changed to use the interface.
+func (r RouteManager) Add(ctx context.Context, addr netip.Addr, iface string) error {
+	if !validIface(iface) || !ValidAddr(addr) {
+		return api.Errorf(api.CodeInvalid, "bad route %s via %q", addr, iface)
 	}
-	out, err := r.Exec.Run(ctx, "route", routeArgs("add", addr, bridge)...)
+	out, err := r.Exec.Run(ctx, "route", routeArgs("add", addr, iface)...)
 	if err != nil && strings.Contains(string(out), "File exists") {
-		out, err = r.Exec.Run(ctx, "route", routeArgs("change", addr, bridge)...)
+		out, err = r.Exec.Run(ctx, "route", routeArgs("change", addr, iface)...)
 	}
 	if err != nil {
 		return fmt.Errorf("route add %s: %w: %s", addr, err, strings.TrimSpace(string(out)))
@@ -55,13 +55,13 @@ func (r RouteManager) Add(ctx context.Context, addr netip.Addr, bridge string) e
 	return nil
 }
 
-// Remove runs `route delete -inet6 <addr>/128 -interface <bridge>`. A route
+// Remove runs `route delete -inet6 <addr>/128 -interface <iface>`. A route
 // that is already gone is not an error.
-func (r RouteManager) Remove(ctx context.Context, addr netip.Addr, bridge string) error {
-	if !validIface(bridge) || !ValidAddr(addr) {
-		return api.Errorf(api.CodeInvalid, "bad route %s via %q", addr, bridge)
+func (r RouteManager) Remove(ctx context.Context, addr netip.Addr, iface string) error {
+	if !validIface(iface) || !ValidAddr(addr) {
+		return api.Errorf(api.CodeInvalid, "bad route %s via %q", addr, iface)
 	}
-	out, err := r.Exec.Run(ctx, "route", routeArgs("delete", addr, bridge)...)
+	out, err := r.Exec.Run(ctx, "route", routeArgs("delete", addr, iface)...)
 	if err != nil && !strings.Contains(string(out), "not in table") {
 		return fmt.Errorf("route delete %s: %w: %s", addr, err, strings.TrimSpace(string(out)))
 	}
@@ -69,7 +69,8 @@ func (r RouteManager) Remove(ctx context.Context, addr netip.Addr, bridge string
 }
 
 // EnsureUplinkNotMember fails with api.CodeConflict if uplink is a member of
-// any bridge. It only reads: JailOps never modifies a bridge it does not own.
+// a bridge of the host's own (the proxy needs the uplink to be a plain interface). It only reads: JailOps never
+// modifies a bridge.
 func (r RouteManager) EnsureUplinkNotMember(ctx context.Context, uplink string) error {
 	if !validIface(uplink) {
 		return api.Errorf(api.CodeInvalid, "bad interface %q", uplink)

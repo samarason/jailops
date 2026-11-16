@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -33,11 +31,11 @@ delivery is at least once. A new sink starts at the end of the files.
 The list comes from logging.forward of jailopsd.yaml until an administrator
 changes it here or in the console; the stored list then replaces the file's
 until 'logs forward reset'. Every command here needs a global administrator.`,
-		`jailops logs forward add syslog --to tls://logs.example.com:6514 --facility local3
-jailops logs forward add webhook --to https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit
+		`jailops logs forward add logs --url tls://logs.example.com:6514 --facility local3
+jailops logs forward add alerts --url https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/sinks/hook.token --audit
 jailops logs forward test logs
 jailops logs forward status`)
-	fc.AddCommand(a.logForwardList(), a.logForwardAdd(), a.logForwardEdit(), a.logForwardRemove(), a.logForwardTest(), a.logForwardStatus(), a.logForwardReset())
+	fc.AddCommand(a.logForwardList(), a.logForwardAdd(), a.logForwardSet(), a.logForwardRemove(), a.logForwardTest(), a.logForwardStatus(), a.logForwardReset())
 	return fc
 }
 
@@ -162,10 +160,7 @@ type sinkFlags struct {
 
 func (s *sinkFlags) register(a *app, cmd *cobra.Command, add bool) {
 	f := cmd.Flags()
-	if add {
-		f.StringVar(&s.name, "name", "", "name of the sink (default: from the receiver's host name)")
-	}
-	f.StringVar(&s.to, "to", "", "where to send: udp://, tcp:// or tls://HOST[:PORT] for syslog, an https:// URL for a webhook")
+	f.StringVar(&s.to, "url", "", "where to send: udp://, tcp:// or tls://HOST[:PORT] for a syslog sink, an https:// URL for a webhook")
 	f.StringVar(&s.facility, "facility", "", "syslog facility, local0 (default) to local7")
 	f.StringVar(&s.ca, "ca", "", "PEM file of the CA that signed the receiver's certificate (tls and webhook; default: the host's roots)")
 	f.StringVar(&s.token, "token-file", "", "root-owned file whose first line is the webhook's bearer token")
@@ -185,7 +180,7 @@ func (s *sinkFlags) register(a *app, cmd *cobra.Command, add bool) {
 	_ = cmd.RegisterFlagCompletionFunc("from-project", a.completeProjects())
 	_ = cmd.RegisterFlagCompletionFunc("jail", completeKind(a, a.jailDesc()))
 	_ = cmd.RegisterFlagCompletionFunc("exclude-jail", completeKind(a, a.jailDesc()))
-	for _, n := range []string{"to", "queue", "label", "exclude-label", "file"} {
+	for _, n := range []string{"url", "queue", "label", "exclude-label", "file"} {
 		_ = cmd.RegisterFlagCompletionFunc(n, completeNone)
 	}
 }
@@ -208,7 +203,7 @@ func parseSinkLabels(flag string, l []string) (map[string]string, error) {
 // apply writes the flags that were given into k.
 func (s *sinkFlags) apply(cmd *cobra.Command, k *api.LogSink) error {
 	ch := func(n string) bool { return cmd.Flags().Changed(n) }
-	if ch("to") {
+	if ch("url") {
 		k.To = s.to
 	}
 	if ch("facility") {
@@ -260,31 +255,6 @@ func (s *sinkFlags) apply(cmd *cobra.Command, k *api.LogSink) error {
 		}
 	}
 	return nil
-}
-
-var slugRE = regexp.MustCompile(`[^a-z0-9]+`)
-
-// defaultSinkName is the first label of the receiver's host name ("logs" for
-// tls://logs.example.com), or the type for an address; a taken name gets a number.
-func defaultSinkName(k api.LogSink, taken []api.LogSink) string {
-	base := string(k.Type)
-	if _, hp, err := k.SinkTarget(); err == nil {
-		h, _, _ := net.SplitHostPort(hp)
-		if net.ParseIP(h) == nil {
-			first, _, _ := strings.Cut(strings.ToLower(h), ".")
-			if s := strings.Trim(slugRE.ReplaceAllString(first, "-"), "-"); s != "" && s[0] >= 'a' && s[0] <= 'z' {
-				base = s
-			}
-		}
-	}
-	if len(base) > 28 {
-		base = base[:28]
-	}
-	name := base
-	for i := 2; slices.ContainsFunc(taken, func(t api.LogSink) bool { return t.Name == name }); i++ {
-		name = fmt.Sprintf("%s-%d", base, i)
-	}
-	return name
 }
 
 // changeSinks reads the list, lets change edit it and stores it, or with
@@ -343,11 +313,12 @@ func (a *app) warnSink(f api.LogForward, name string) {
 func (a *app) logForwardAdd() *cobra.Command {
 	var s sinkFlags
 	cmd := &cobra.Command{
-		Use:   "add TYPE --to URL",
+		Use:   "add NAME --url URL",
 		Short: "Add a sink",
-		Long: `Add a sink of TYPE syslog or webhook. A syslog sink sends RFC 5424 messages
+		Long: `Add a sink. Its type follows from the URL: udp://, tcp:// and tls:// make a syslog sink, https:// a
+webhook. A syslog sink sends RFC 5424 messages
 with APP-NAME jailops, this host's name and the structured data
-[jailops project="" jail="" app="" file=""]; --to tls://HOST[:6514] verifies
+[jailops project="" jail="" app="" file=""]; --url tls://HOST[:6514] verifies
 the server (the host's roots, or --ca), tcp:// and udp:// (port 514) send in
 the clear and are for a receiver on this host or a trusted network. A webhook
 receives POSTs of JSON lines (time, host, project, jail, app, file, line);
@@ -357,32 +328,29 @@ is the bearer token, which never enters the configuration.
 Without --jail, --label or --from-project the sink takes every jail. --file
 replaces messages; --no-app-logs leaves out the files installed apps declare;
 --audit adds the daemon's audit log. The sink starts at the end of the files.`,
-		Example: `jailops logs forward add syslog --to tls://logs.example.com:6514 --facility local3
-jailops logs forward add syslog --to tcp://127.0.0.1:1514 --name local --jail web --jail db
-jailops logs forward add syslog --to tls://logs.example.com --ca /usr/local/etc/jailops/logs-ca.pem -l tier=front
-jailops logs forward add webhook --to https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/hook.token --audit-only`,
-		Args: cobra.ExactArgs(1),
-		ValidArgsFunction: completeArgs(func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-			return []string{"syslog", "webhook"}, cobra.ShellCompDirectiveNoFileComp
-		}, completeNone),
+		Example: `jailops logs forward add logs --url tls://logs.example.com:6514 --facility local3
+jailops logs forward add local --url tcp://127.0.0.1:1514 --jail web --jail db
+jailops logs forward add front --url tls://logs.example.com --ca /usr/local/etc/jailops/logs-ca.pem -l tier=front
+jailops logs forward add alerts --url https://hooks.example.com/jailops --token-file /usr/local/etc/jailops/sinks/hook.token --audit-only`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeNone,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			typ := api.LogSinkType(args[0])
-			if typ != api.LogSinkSyslog && typ != api.LogSinkWebhook {
-				return usagef("TYPE is syslog or webhook, not %q", args[0])
-			}
 			if s.to == "" {
-				return usagef("--to is required: where the sink sends (tls://logs.example.com:6514, https://hooks.example.com/x)")
+				return usagef("--url is required: where the sink sends (tls://logs.example.com:6514, https://hooks.example.com/x)")
 			}
+			typ := api.LogSinkSyslog
+			if strings.HasPrefix(s.to, "https://") {
+				typ = api.LogSinkWebhook
+			}
+			s.name = args[0]
 			k := api.LogSink{Type: typ}
 			if err := s.apply(cmd, &k); err != nil {
 				return err
 			}
 			f, dry, err := a.changeSinks(cmd.Context(), "add log sink", func(sp api.LogForwardSpec) any { return sp.Sinks[len(sp.Sinks)-1] }, func(sp *api.LogForwardSpec) error {
 				k.Name = s.name
-				if k.Name == "" {
-					k.Name = defaultSinkName(k, sp.Sinks)
-				} else if slices.ContainsFunc(sp.Sinks, func(t api.LogSink) bool { return t.Name == k.Name }) {
-					return api.Errorf(api.CodeAlreadyExists, "sink %q already exists", k.Name).WithHint("change it with: jailops logs forward edit " + k.Name)
+				if slices.ContainsFunc(sp.Sinks, func(t api.LogSink) bool { return t.Name == k.Name }) {
+					return api.Errorf(api.CodeAlreadyExists, "sink %q already exists", k.Name).WithHint("change it with: jailops logs forward set " + k.Name)
 				}
 				sp.Sinks = append(sp.Sinks, k)
 				return nil
@@ -391,7 +359,7 @@ jailops logs forward add webhook --to https://hooks.example.com/jailops --token-
 				return err
 			}
 			a.warnSink(f, k.Name)
-			a.say("log sink %s added (%s %s)\n", k.Name, k.Type, k.To)
+			a.say("log-sink/%s added (%s %s)\n", k.Name, k.Type, k.To)
 			return nil
 		},
 	}
@@ -399,17 +367,17 @@ jailops logs forward add webhook --to https://hooks.example.com/jailops --token-
 	return cmd
 }
 
-func (a *app) logForwardEdit() *cobra.Command {
+func (a *app) logForwardSet() *cobra.Command {
 	var s sinkFlags
 	cmd := &cobra.Command{
-		Use:   "edit NAME",
+		Use:   "set NAME",
 		Short: "Change a sink",
 		Long: `Change the flags given and keep the rest of the sink. A list flag (--jail,
 --label, --file, ...) replaces that list. To start a selection over, remove
 the sink and add it again.`,
-		Example: `jailops logs forward edit logs --facility local5
-jailops logs forward edit logs --to tls://logs2.example.com:6514 --ca /usr/local/etc/jailops/logs-ca.pem
-jailops logs forward edit alerts --audit=false`,
+		Example: `jailops logs forward set logs --facility local5
+jailops logs forward set logs --url tls://logs2.example.com:6514 --ca /usr/local/etc/jailops/logs-ca.pem
+jailops logs forward set alerts --audit=false`,
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completeArgs(a.completeSinks(), completeNone),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -435,7 +403,7 @@ jailops logs forward edit alerts --audit=false`,
 				return err
 			}
 			a.warnSink(f, name)
-			a.say("log sink %s changed\n", name)
+			a.say("log-sink/%s updated\n", name)
 			return nil
 		},
 	}
@@ -448,8 +416,8 @@ func (a *app) logForwardRemove() *cobra.Command {
 		Use:               "remove NAME...",
 		Aliases:           []string{"rm"},
 		Short:             "Remove sinks",
-		Long:              `Remove sinks. Their queued lines are dropped and their offsets forgotten.`,
-		Example:           "jailops logs forward remove logs\njailops logs forward remove logs alerts --dry-run",
+		Long:              `Remove sinks. Their queued lines are dropped and their offsets forgotten. The command asks for confirmation unless -y is given.`,
+		Example:           "jailops logs forward remove logs\njailops logs forward remove -y logs alerts\njailops logs forward remove logs alerts --dry-run",
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: a.completeSinks(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -462,13 +430,16 @@ func (a *app) logForwardRemove() *cobra.Command {
 						}
 						sp.Sinks = slices.Delete(sp.Sinks, i, i+1)
 					}
-					return nil
+					if a.dryRun {
+						return nil
+					}
+					return a.confirm(fmt.Sprintf("Remove log sink %s? Its queued lines are dropped.", strings.Join(args, ", ")))
 				})
 			if err != nil || dry {
 				return err
 			}
 			for _, n := range args {
-				a.say("log sink %s removed\n", n)
+				a.say("log-sink/%s removed\n", n)
 			}
 			return nil
 		},
@@ -577,8 +548,8 @@ func (a *app) logForwardReset() *cobra.Command {
 		Use:   "reset",
 		Short: "Return to the sinks of jailopsd.yaml",
 		Long: `Delete the list stored through the API or the console: logging.forward of
-jailopsd.yaml is in force again.`,
-		Example: "jailops logs forward reset\njailops logs forward reset --dry-run",
+jailopsd.yaml is in force again. The command asks for confirmation unless -y is given.`,
+		Example: "jailops logs forward reset\njailops logs forward reset -y\njailops logs forward reset --dry-run",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if done, err := a.dry("return to the log sinks of jailopsd.yaml", nil); done {
@@ -588,11 +559,18 @@ jailopsd.yaml is in force again.`,
 			if err != nil {
 				return err
 			}
+			cur, err := c.Logs().Forward(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if err := a.confirm(fmt.Sprintf("Delete the stored list of %d log sinks and return to jailopsd.yaml?", len(cur.Spec.Sinks))); err != nil {
+				return err
+			}
 			f, err := c.Logs().ResetForward(cmd.Context())
 			if err != nil {
 				return err
 			}
-			a.say("log sinks of jailopsd.yaml in force (%d)\n", len(f.Spec.Sinks))
+			a.say("log-forward reset: jailopsd.yaml is in force again (%s)\n", count(len(f.Spec.Sinks), "sink", "sinks"))
 			return nil
 		},
 	}

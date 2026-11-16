@@ -1,5 +1,5 @@
 .\" jailops-priv.8, installed as /usr/local/share/man/man8/jailops-priv.8
-.Dd November 2, 2026
+.Dd November 5, 2026
 .Dt JAILOPS-PRIV 8
 .Os
 .Sh NAME
@@ -39,12 +39,21 @@ runs as root and performs, for
 .Xr jailopsd 8 ,
 a fixed list of typed operations: ZFS datasets and snapshots below the storage
 roots and the keys of encrypted jail volumes (the passphrase on standard input),
-jails, interfaces and bridges, pf anchors, a few sysctls, downloads of
+jails, the epair interfaces of jails, pf anchors, a few sysctls, downloads of
 images and the files the daemon may read.
 Everything else is refused, and every request is written to the audit log.
 The daemon connects over a unix socket owned by root and the group
 .Sy jailops ,
 mode 0660; only the configured users and groups may connect.
+.Pp
+Flags are written with one dash, as in
+.Fl pool ;
+two dashes
+.Pq Fl -pool
+are read the same.
+This differs from
+.Xr jailops 1 ,
+whose long flags take two dashes.
 .Pp
 Without a command the helper serves on its socket.
 .Bl -tag -width Ds
@@ -65,7 +74,7 @@ or
 The one-time setup of a host: the user and group, the storage root dataset
 .Pa pool/jailops
 mounted at
-.Pa /jailops ,
+.Pa /usr/local/jailops ,
 the state dataset mounted at
 .Pa /var/db/jailops/state
 and owned by the daemon's user, the directories, and the two configuration
@@ -169,7 +178,12 @@ a missing default file is not an error.
 The file must be owned by root and not writable by group or others.
 .It Fl socket Ar path
 The unix socket, default
-.Pa /var/run/jailops/priv.sock .
+.Pa /var/run/jailops-priv/priv.sock .
+Its directory belongs to root, mode 0710 with the group of the socket,
+so the daemon can reach the socket but put nothing in its place.
+The former default
+.Pa /var/run/jailops/priv.sock
+is read as this path.
 .It Fl group Ar name , Fl mode Ar octal
 The group that owns the socket (default
 .Sy jailops )
@@ -185,6 +199,10 @@ A storage root dataset fixed in the file, for example
 A pool's top dataset is refused unless
 .Fl allow-pool-root
 is set.
+.It Fl allow-start-without-pf
+Start a jail that has a network link while pf is disabled.
+By default the start is refused.
+Its anchor would be loaded and nothing would evaluate it.
 .It Fl storage-file Ar path
 The file that persists the storage roots registered at run time, default
 .Pa /usr/local/etc/jailops/priv.d/storage.conf
@@ -202,22 +220,56 @@ and the daemon's scratch directory for image builds.
 .It Fl helper-path Ar path
 The path the jail.conf hooks call, default
 .Pa /usr/local/libexec/jailops-priv .
-.It Fl if-prefix Ar prefix
-An interface name prefix owned by JailOps (default
-.Sy jo ) .
-.It Fl ndp-proxy Ar uplink=prefix,...
-An uplink the IPv6 proxy may use and the prefixes it may answer for
-(repeatable).
 .It Fl sysctl Ar name , Fl fetch-host Ar host , Fl image-mirror Ar dir
-An extra sysctl readable through the helper, a host images may be fetched
-from over https, a local directory of image archives.
+An extra sysctl readable through the helper, a host that downloads,
+package repositories of image builds and debootstrap mirrors may use over https
+(written http://host, a host also allows plain http for a package repository),
+a local directory of image archives.
+.It Fl unbound-conf Ar file
+The file the helper writes the names of the running jails into
+.Pq Ar jail Ns \&. Ns Ar project Ns \&.internal
+for the host's resolver.
+The default is
+.Pa /var/unbound/conf.d/jailops.conf ,
+the conf.d of the base system's local-unbound.
+It is used when local_unbound is enabled and that directory exists.
+An empty value turns it off.
+Its directory belongs to root and is closed to others.
+See
+.Pa docs/dns.md .
+.It Fl dns-suffix Ar suffix
+The zone under which the jails have names:
+.Ar jail Ns \&. Ns Ar project Ns \&. Ns Ar suffix .
+The default is
+.Dq internal ;
+DNS labels, not
+.Dq local
+.Pq multicast DNS .
+.It Fl pkg-keys-dir Ar dir , Fl keyring-dir Ar dir
+The directories of the key directories a package repository of an image build
+may use besides
+.Pa /usr/share/keys
+(default
+.Pa /usr/local/etc/jailops/keys ) ,
+and of the keyrings debootstrap may check a release with (default
+.Pa /usr/local/share/keyrings ) .
+Root owns them and nobody else can write there, they hold no symbolic links and
+they lie outside every directory the daemon writes; the helper checks this each
+time it uses them.
 .It Xo
 .Fl admin-raw-param , Fl admin-allow-flag , Fl admin-devfs-ruleset ,
 .Fl admin-host-mount , Fl admin-zfs-prop , Fl admin-routes ,
-.Fl admin-raw-pf , Fl admin-resume-send
+.Fl admin-raw-pf , Fl admin-resume-send , Fl admin-zfs-delegation
 .Xc
 The admin policy: what an administrator of the daemon may set beyond the
 built-in rules.
+.It Fl wireguard-routes Ar cidr
+A network a WireGuard tunnel may route into itself although the route is
+wider than a /8 (/16 for IPv6) or covers an address of the host, its default
+gateway, a resolver, loopback, link-local or multicast (repeatable).
+Without it, or
+.Fl admin-routes ,
+such routes are refused.
 .It Fl log Ar stderr | syslog
 The audit log destination.
 Default stderr, or syslog with
@@ -240,11 +292,33 @@ runs the helper under
 with
 .Fl log Ar syslog ;
 it requires
-.Sy zfs
-and
+.Sy zfs ,
 .Sy jailops_revert
-and runs before
-.Sy jailopsd .
+and
+.Sy syslogd
+(the audit lines go to syslog) and runs before
+.Sy jailopsd ,
+which stops before it at shutdown.
+.Xr daemon 8
+supervises the helper: when it exits without being stopped, a crash or
+.Dv SIGKILL ,
+it is started again after five seconds, and that start re-arms a pending host
+change as any start does.
+.Cm stop
+ends the supervisor, which stops the helper;
+.Cm status
+prints the pid of the helper, or that the supervisor is about to start it
+again.
+Stopping the helper does not stop
+.Xr jailopsd 8 :
+the daemon answers
+.Pa /readyz
+with
+.Dq not ready: helper ,
+its requests to the helper fail meanwhile, and it reconnects once the helper
+is back.
+Jails keep running while the helper restarts.
+.Pp
 The rc.d script
 .Pa /usr/local/etc/rc.d/jailops_revert
 runs
@@ -264,6 +338,9 @@ is set.
 Set to
 .Dq YES
 to start the helper at boot.
+Default: the value of
+.Va jailopsd_enable ,
+which is enough, as the daemon starts the helper it needs.
 .It Va jailops_priv_config
 The configuration file.
 Default
@@ -310,7 +387,12 @@ and a start refuses a configuration that does not validate.
 The storage file is reread with
 .Dl service jailops_priv reload
 which sends
-.Dv SIGHUP .
+.Dv SIGHUP
+to the helper.
+After an upgrade of the package, restart the pair, which stops
+.Xr jailopsd 8
+first and starts the helper before it:
+.Dl service jailopsd restart
 .Sh SIGNALS
 .Bl -tag -width SIGTERM
 .It Dv SIGHUP
@@ -327,10 +409,14 @@ The configuration; the installed sample is
 .Pa priv.conf.sample .
 .It Pa /usr/local/etc/jailops/priv.d/storage.conf
 The storage roots registered at run time.
-.It Pa /var/run/jailops/priv.sock
+.It Pa /var/run/jailops-priv/priv.sock
 The socket.
-.It Pa /var/run/jailops/priv.pid
+.It Pa /var/run/jailops-priv.pid
 The pid of the helper under rc.d.
+.It Pa /var/run/jailops-priv-daemon.pid
+The pid of its
+.Xr daemon 8
+supervisor, which the rc.d script starts and stops.
 .It Pa /usr/local/etc/jailops/jails
 The rendered jail.conf files.
 .It Pa /usr/local/libexec/jailops-priv

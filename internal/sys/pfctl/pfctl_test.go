@@ -34,21 +34,20 @@ func TestValidateNames(t *testing.T) {
 	}
 }
 
-const rules = "nat on em0 inet from 10.0.0.0/24 to any -> (em0)\npass in quick on jo0 proto tcp to port 22\nblock drop all\n"
+const rules = "match out on em0 inet from 10.0.0.0/24 to any nat-to (em0)\npass in quick on jo0 proto tcp to port 22\nblock drop all\n"
 
 func TestLoadSequence(t *testing.T) {
 	ctx := context.Background()
 	f := run.NewFake()
 	f.On("pfctl", []string{"-n", "-v", "-a", "jailops/web", "-f", "-"}, "set skip on lo\n"+rules)
 	f.On("pfctl", []string{"-a", "jailops/web", "-f", "-"}, "")
-	// readback prints nat first, then filter, with different spacing
-	f.On("pfctl", []string{"-a", "jailops/web", "-sn"}, "nat on em0 inet from 10.0.0.0/24 to any -> (em0)\n")
-	f.On("pfctl", []string{"-a", "jailops/web", "-sr"}, "pass in quick on jo0 proto tcp to port 22\nblock drop all\n")
+	// the readback has the same rules with different spacing
+	f.On("pfctl", []string{"-a", "jailops/web", "-sr"}, "match out on em0 inet from 10.0.0.0/24 to any   nat-to (em0)\npass in quick on jo0 proto tcp to port 22\nblock drop all\n")
 	if err := NewCommand(f).Load(ctx, "jailops/web", rules); err != nil {
 		t.Fatal(err)
 	}
 	argv := f.Argv()
-	if len(argv) != 4 || !strings.Contains(argv[0], "-n -v") || strings.Contains(argv[1], "-n") {
+	if len(argv) != 3 || !strings.Contains(argv[0], "-n -v") || strings.Contains(argv[1], "-n") {
 		t.Fatalf("order: %q", argv)
 	}
 	for _, c := range f.Calls()[:2] {
@@ -72,7 +71,6 @@ func TestLoadReadbackMismatch(t *testing.T) {
 	f := run.NewFake()
 	f.On("pfctl", []string{"-n", run.RestArgs}, rules)
 	f.On("pfctl", []string{"-a", "jailops/web", "-f", "-"}, "")
-	f.On("pfctl", []string{"-a", "jailops/web", "-sn"}, "")
 	f.On("pfctl", []string{"-a", "jailops/web", "-sr"}, "block drop all\n")
 	err := NewCommand(f).Load(context.Background(), "jailops/web", rules)
 	if !api.IsCode(err, api.CodeInternal) {
@@ -103,7 +101,6 @@ func TestTablesAndFlush(t *testing.T) {
 		"pfctl -a jailops/shared.pf -t trusted -T delete 10.0.0.1",
 		"pfctl -a jailops/shared.pf -t trusted -T show",
 		"pfctl -a jailops/web -F Tables",
-		"pfctl -a jailops/web -F nat",
 		"pfctl -a jailops/web -F rules",
 	}
 	if !reflect.DeepEqual(f.Argv(), want) {
@@ -125,6 +122,37 @@ func TestTablesAndFlush(t *testing.T) {
 	}
 	if len(f.Calls()) != before {
 		t.Error("invalid input reached pfctl")
+	}
+}
+
+// The dry run prints the adaptive timeouts that pf derives from a state limit; the readback of the loaded rule prints
+// them on 15.2 and leaves them out on 15.1. Both are the same rule.
+func TestLoadAcceptsTheAdaptiveTimeoutsInEitherOutput(t *testing.T) {
+	withAdaptive := "pass out quick on jo0 all flags S/SA keep state (max 10000, adaptive.start 6000, adaptive.end 12000) label \"jo-1\"\n"
+	without := "pass out quick on jo0 all flags S/SA keep state (max 10000) label \"jo-1\"\n"
+	for name, tc := range map[string][2]string{"15.1": {withAdaptive, without}, "15.2": {withAdaptive, withAdaptive}, "reverse": {without, withAdaptive}} {
+		f := run.NewFake()
+		f.On("pfctl", []string{"-n", run.RestArgs}, tc[0])
+		f.On("pfctl", []string{"-a", "jailops/web", "-f", "-"}, "")
+		f.On("pfctl", []string{"-a", "jailops/web", "-sr"}, tc[1])
+		if err := NewCommand(f).Load(context.Background(), "jailops/web", "x"); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if got := RuleLines(withAdaptive); len(got) != 1 || strings.Contains(got[0], "adaptive") {
+		t.Errorf("%q", got)
+	}
+}
+
+// A real difference is named in the error: the first rule the two sides do not share.
+func TestLoadMismatchNamesTheFirstDifference(t *testing.T) {
+	f := run.NewFake()
+	f.On("pfctl", []string{"-n", run.RestArgs}, "pass in all\nblock drop all\n")
+	f.On("pfctl", []string{"-a", "jailops/web", "-f", "-"}, "")
+	f.On("pfctl", []string{"-a", "jailops/web", "-sr"}, "pass in all\nblock all\n")
+	err := NewCommand(f).Load(context.Background(), "jailops/web", "x")
+	if err == nil || !strings.Contains(err.Error(), `expected "block drop all", read back "block all"`) {
+		t.Fatalf("%v", err)
 	}
 }
 

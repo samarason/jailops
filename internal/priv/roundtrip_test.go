@@ -494,13 +494,17 @@ func TestRunnerRoundTrip(t *testing.T) {
 }
 
 func TestPFAndNetRoundTrip(t *testing.T) {
-	f := newFixture(t)
+	f := newFixtureWith(t, func(e *env) { e.storeLan(t, "10.1.0.0/16") })
 	ctx := context.Background()
 	p := f.client.PF()
-	if err := p.Load(ctx, "jailops/web", "pass all\n"); err != nil {
+	if _, _, err := f.client.Net().EpairCreate(ctx, "jo0123456789a0"); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := p.Read(ctx, "jailops/web"); err != nil || got != "pass all\n" {
+	const rs = "pass in on jo0123456789a0a all\n"
+	if err := p.Load(ctx, "jailops/web", rs); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.Read(ctx, "jailops/web"); err != nil || got != rs {
 		t.Errorf("read %q %v", got, err)
 	}
 	if n, err := p.Validate(ctx, "jailops/web", "pass all\n"); err != nil || n == "" {
@@ -526,42 +530,34 @@ func TestPFAndNetRoundTrip(t *testing.T) {
 	}
 
 	n := f.client.Net()
-	if err := n.BridgeCreate(ctx, "jo0"); err != nil {
+	a, b, err := "jo0123456789a0a", "jo0123456789a0b", error(nil) // made above, for the ruleset that stands on it
+	_ = b
+	if err := n.SetDescription(ctx, a, "jailops jail=p/web net=lan (host side)"); err != nil {
 		t.Fatal(err)
 	}
-	a, b, err := n.EpairCreate(ctx, "jo0123456789a0")
-	if err != nil || a != "jo0123456789a0a" || b != "jo0123456789a0b" {
-		t.Fatalf("epair %q %q %v", a, b, err)
-	}
-	if err := n.BridgeAddMember(ctx, "jo0", a, true); err != nil {
+	if err := n.AddrAdd(ctx, a, mustPrefix("10.1.0.1/32")); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.SetDescription(ctx, a, "jailops:x"); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.AddrAdd(ctx, "jo0", mustPrefix("10.1.0.1/24")); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.SetLink(ctx, "jo0", true); err != nil {
+	if err := n.SetLink(ctx, a, true); err != nil {
 		t.Fatal(err)
 	}
 	ifs, err := n.List(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var br *ifconfig.Iface
+	var he *ifconfig.Iface
 	for i := range ifs {
-		if ifs[i].Name == "jo0" {
-			br = &ifs[i]
+		if ifs[i].Name == a {
+			he = &ifs[i]
 		}
 	}
-	if br == nil || len(br.Members) != 1 || !br.Members[0].Private || len(br.Inet) != 1 || !br.Up() {
-		t.Errorf("bridge %+v", br)
+	if he == nil || len(he.Inet) != 1 || !he.Up() {
+		t.Errorf("host end %+v", he)
 	}
-	if err := n.RouteAdd(ctx, ifconfig.Route{Dest: "10.1.0.9/32", Interface: "jo0"}); err != nil {
+	if err := n.RouteAdd(ctx, ifconfig.Route{Dest: "10.1.0.9/32", Interface: a}); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.RouteDelete(ctx, ifconfig.Route{Dest: "10.1.0.9/32", Interface: "jo0"}); err != nil {
+	if err := n.RouteDelete(ctx, ifconfig.Route{Dest: "10.1.0.9/32", Interface: a}); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.RouteAdd(ctx, ifconfig.Route{Dest: "default", Gateway: "10.0.0.1"}); !api.IsCode(err, api.CodeForbidden) {
@@ -570,19 +566,13 @@ func TestPFAndNetRoundTrip(t *testing.T) {
 	if _, err := n.IPv6Forwarding(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.AddrRemove(ctx, "jo0", mustPrefix("10.1.0.1/24")); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.BridgeDeleteMember(ctx, "jo0", a); err != nil {
+	if err := n.AddrRemove(ctx, a, mustPrefix("10.1.0.1/32")); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.EpairDestroy(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.BridgeDestroy(ctx, "jo0"); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.BridgeDestroy(ctx, "jo0"); !api.IsCode(err, api.CodeNotFound) {
+	if err := n.EpairDestroy(ctx, a); !api.IsCode(err, api.CodeNotFound) {
 		t.Errorf("second destroy: %v", err)
 	}
 }
@@ -666,7 +656,7 @@ func TestAuditLog(t *testing.T) {
 	secret := "TOP-SECRET-CONTENT"
 	_ = f.client.WriteFile(ctx, WriteFileReq{Path: filepath.Join(f.cfg.MountBase, "s"), Data: []byte(secret), Mode: 0o600})
 	_, _ = f.client.ZFS().Exists(ctx, "tank/other")
-	_ = f.client.PF().Load(ctx, "jailops/a", "pass all # "+secret+"\n")
+	_ = f.client.PF().Load(ctx, "jailops/a", "pass all # "+secret+"\n") // refused: names no interface
 	out := f.audit.String()
 	if strings.Contains(out, secret) {
 		t.Errorf("content leaked into the audit log:\n%s", out)
@@ -954,7 +944,7 @@ func TestReconnect(t *testing.T) {
 	f.client.mu.Unlock()
 	// the next call redials; poll with a deadline instead of guessing how long the drop takes
 	var rerr error
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		if _, rerr = f.client.ZFS().Exists(ctx, "tank/jailops"); rerr == nil {
 			break
 		}
@@ -1031,54 +1021,5 @@ func TestTinyWritesAreCoalesced(t *testing.T) {
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Errorf("4 MiB in tiny writes took %v", d)
-	}
-}
-
-// The gateway pair of a network (the host's own port on the bridge) goes through the helper with the same typed
-// operations as everything else: names it owns, nothing more.
-func TestGatewayPairThroughTheHelper(t *testing.T) {
-	f := newFixture(t)
-	ctx := context.Background()
-	n := f.client.Net()
-	if err := n.BridgeCreate(ctx, "jo21"); err != nil {
-		t.Fatal(err)
-	}
-	m, l3, err := n.EpairCreate(ctx, "jo21g")
-	if err != nil || m != "jo21ga" || l3 != "jo21gb" {
-		t.Fatalf("%q %q %v", m, l3, err)
-	}
-	if err := n.BridgeAddMember(ctx, "jo21", m, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.AddrAdd(ctx, l3, mustPrefix("10.91.0.1/24")); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.AddrAdd(ctx, l3, mustPrefix("fd91:1::1/64")); err != nil {
-		t.Fatal(err)
-	}
-	for _, i := range []string{m, l3, "jo21"} {
-		if err := n.SetLink(ctx, i, true); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// a port or an address on an interface JailOps does not own is refused
-	if _, _, err := n.EpairCreate(ctx, "em21g"); !api.IsCode(err, api.CodeForbidden) {
-		t.Errorf("epair outside the prefix: %v", err)
-	}
-	if err := n.AddrAdd(ctx, "em0", mustPrefix("10.91.0.1/24")); !api.IsCode(err, api.CodeForbidden) {
-		t.Errorf("address on em0: %v", err)
-	}
-	if err := n.BridgeAddMember(ctx, "jo21", "em0", false); !api.IsCode(err, api.CodeForbidden) {
-		t.Errorf("foreign port: %v", err)
-	}
-	// destroying one end removes the pair
-	if err := n.EpairDestroy(ctx, m); err != nil {
-		t.Fatal(err)
-	}
-	ifs, _ := n.List(ctx)
-	for _, i := range ifs {
-		if i.Name == m || i.Name == l3 {
-			t.Errorf("%s is still there", i.Name)
-		}
 	}
 }

@@ -1,0 +1,12 @@
+apiVersion: jailops/v1
+kind: Volume
+hosts: [nas1]
+metadata:
+  name: plexdata
+spec:
+  storage: bulk
+  size: 200G
+  uid: 972
+  gid: 972
+  mode: "0750"
+  comment: the Plex library database

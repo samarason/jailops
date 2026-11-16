@@ -3,14 +3,11 @@
 03 [host, jail] ifconfig -j <jail> joe49a245eed00b down
 04 [host, jail] ifconfig -j <jail> joe49a245eed00b inet6 2001:db8:2::100 prefixlen 128 -alias
 05 [host, jail] ifconfig -j <jail> joe49a245eed00b inet 10.20.0.10/24 -alias
-06 ndp -d fe80::c864:60ff:fed0:bb57   (on jo0gb)
-07 ndp -d 2001:db8:2::100   (on jo0gb)
-08 ndp -d 10.20.0.10   (on jo0gb)
-09 ndproxy withdraw 2001:db8:2::100 on em0
-10 route delete -inet6 2001:db8:2::100/128
-11 ifconfig joe49a245eed00a down
-12 ifconfig jo0 -private joe49a245eed00a
-13 ifconfig jo0 deladdr ca:64:60:d0:bb:57
-14 ifconfig jo0 deletem joe49a245eed00a
-15 ifconfig joe49a245eed00a -description
-16 ifconfig joe49a245eed00a destroy
+06 ndproxy withdraw 2001:db8:2::100 on em0
+07 route delete -inet6 2001:db8:2::100/128
+08 route delete -inet 10.20.0.10/32
+09 ifconfig joe49a245eed00a down
+10 ifconfig joe49a245eed00a inet6 fe80::1/64 -alias
+11 ifconfig joe49a245eed00a inet 10.20.0.1/32 -alias
+12 ifconfig joe49a245eed00a -description
+13 ifconfig joe49a245eed00a destroy

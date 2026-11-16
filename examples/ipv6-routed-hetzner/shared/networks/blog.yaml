@@ -3,14 +3,12 @@ kind: Network
 metadata:
   name: blog
 spec:
-  bridge: jo40
   uplink: vtnet0
   ipv4: {subnet: 10.40.0.0/24, gateway: 10.40.0.1, range: 10.40.0.2-10.40.0.254, nat: true}
   ipv6:
     mode: routed
     # The provider routes 2001:db8:abcd:1::/64 to this host. Each project gets its own /80 of it;
-    # a routed /64 holds 65,536 of them. The gateway is a real address on the gateway interface.
+    # a routed /64 holds 65,536 of them.
     subnet: "2001:db8:abcd:1:1::/80"
-    gateway: "2001:db8:abcd:1:1::1"
     range: "2001:db8:abcd:1:1::10-2001:db8:abcd:1:1::ffff"
   dns: [2a01:4ff:ff00::add:1, 1.1.1.1]

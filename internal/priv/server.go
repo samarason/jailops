@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"net"
 	"os"
 	"runtime/debug"
@@ -124,6 +125,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		go func() {
 			defer s.wg.Done()
 			defer func() { <-s.slots }()
+			defer func() { supervise.Report(nil, "helper-connection", recover()) }()
 			s.serveConn(uc)
 		}()
 	}
@@ -156,12 +158,12 @@ type request struct {
 	id     uint64
 	cancel context.CancelFunc
 	in     chan []byte
-	inOnce sync.Once
-	window chan struct{} // tokens for data frames the server may send
-	ctl    chan *Frame   // control frames of a session request
+	// inClosed is set under session.mu when the client ended the request
+	// stream and r.in is closed; data after it is a protocol violation.
+	inClosed bool
+	window   chan struct{} // tokens for data frames the server may send
+	ctl      chan *Frame   // control frames of a session request
 }
-
-func (r *request) closeIn() { r.inOnce.Do(func() { close(r.in) }) }
 
 type session struct {
 	s    *Server
@@ -209,6 +211,10 @@ func (s *Server) serveConn(uc *net.UnixConn) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	defer cancel()
+	// violation notes a protocol violation; the caller then closes the connection
+	violation := func(reason string, id uint64) {
+		s.audit.Note("priv.protocol.violation", "conn", conn, "req", id, "reason", reason)
+	}
 	for {
 		f, files, err := fc.read()
 		if err != nil {
@@ -221,6 +227,7 @@ func (s *Server) serveConn(uc *net.UnixConn) {
 			fl.Close() // clients never send descriptors
 		}
 		if f.NFds != 0 {
+			violation("descriptors from a client", f.ID)
 			return
 		}
 		switch f.Kind {
@@ -230,27 +237,35 @@ func (s *Server) serveConn(uc *net.UnixConn) {
 				wg.Done()
 			}
 		case KindData:
-			r := sess.get(f.ID)
+			r, open := sess.input(f.ID)
 			if r == nil {
 				continue // the request already finished
 			}
-			if len(f.Data) == 0 || len(f.Data) > ChunkSize {
-				return // protocol violation
+			if !open {
+				violation("data after end", f.ID)
+				return
 			}
+			if len(f.Data) == 0 || len(f.Data) > ChunkSize {
+				violation("bad data frame", f.ID)
+				return
+			}
+			// only this loop closes r.in (endInput), so the stream is still open here
 			select {
 			case r.in <- f.Data:
 			default:
-				return // the client ignored the window
+				violation("data beyond the window", f.ID)
+				return
 			}
 		case KindEnd:
-			if r := sess.get(f.ID); r != nil {
-				r.closeIn()
-			}
+			sess.endInput(f.ID)
 		case KindAck:
+			// r.window and r.ctl are never closed: a frame for a request
+			// that finishes meanwhile lands in a buffer nobody reads
 			if r := sess.get(f.ID); r != nil {
 				select {
 				case r.window <- struct{}{}:
 				default:
+					violation("ack beyond the window", f.ID)
 					return
 				}
 			}
@@ -259,14 +274,16 @@ func (s *Server) serveConn(uc *net.UnixConn) {
 				select {
 				case r.ctl <- f:
 				default:
-					return // a flood of control frames
+					violation("too many control frames", f.ID)
+					return
 				}
 			}
 		case KindCancel:
 			if r := sess.get(f.ID); r != nil {
-				r.cancel()
+				r.cancel() // idempotent, also after the request finished
 			}
 		default:
+			violation("unknown frame kind", f.ID)
 			return
 		}
 	}
@@ -276,6 +293,24 @@ func (ss *session) get(id uint64) *request {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	return ss.reqs[id]
+}
+
+// input returns request id and whether its request stream is still open.
+func (ss *session) input(id uint64) (*request, bool) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	r := ss.reqs[id]
+	return r, r != nil && !r.inClosed
+}
+
+// endInput closes the request stream of id once; an unknown id is ignored.
+func (ss *session) endInput(id uint64) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if r := ss.reqs[id]; r != nil && !r.inClosed {
+		r.inClosed = true
+		close(r.in)
+	}
 }
 
 func (ss *session) reply(f *Frame, files ...*os.File) {

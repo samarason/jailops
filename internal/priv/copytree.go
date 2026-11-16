@@ -99,7 +99,7 @@ func (c Config) resolveMount(p string) (resolved, error) {
 	if rel == "." {
 		return resolved{}, forbidden("%q is a storage root", p)
 	}
-	return resolved{root: best, rel: rel}, nil
+	return c.inJailTree(resolved{root: best, rel: rel}), nil
 }
 
 func (o CopyOpts) filled() CopyOpts {
@@ -149,12 +149,12 @@ func (l *Local) CopyTree(ctx context.Context, src, dst string, o CopyOpts) (Copy
 		return res, invalid("source and destination overlap")
 	}
 	o = o.filled()
-	srcTop, err := os.OpenRoot(rs.root)
+	srcTop, err := rs.openRoot()
 	if err != nil {
 		return res, mapFSErr(err)
 	}
 	defer srcTop.Close()
-	dstTop, err := os.OpenRoot(rd.root)
+	dstTop, err := rd.openRoot()
 	if err != nil {
 		return res, mapFSErr(err)
 	}

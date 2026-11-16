@@ -1,4 +1,4 @@
-$ jailops token create ci --permission operator --projects main --expires 720h --allow-from 10.0.0.0/8
+$ jailops token create ci --role operator --projects main --expires 720h --allow-from 10.0.0.0/8
 <token>
 ! warning: this secret is shown only once and cannot be retrieved again; store it now.
 
@@ -21,9 +21,9 @@ $ jailops token create j --global -o json
 ! warning: this secret is shown only once and cannot be retrieved again; store it now.
 
 $ jailops token list
-NAME   PERMISSION   SCOPE    EXPIRES      ALLOW-FROM   AGE
-ci     operator     main     2026-03-31   10.0.0.0/8   3h
-j      readonly     global   never        -            3h
+NAME   ROLE       SCOPE    EXPIRES      ALLOW-FROM   AGE
+ci     operator   main     2026-03-31   10.0.0.0/8   3h
+j      readonly   global   never        -            3h
 
 $ jailops token list -o json
 [
@@ -96,22 +96,20 @@ $ jailops token create both --global --projects main
 
 $ jailops token create ghost --projects nope
 ! invalid: project "nope" does not exist
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
-$ jailops token create weird --permission  --global
+$ jailops token create weird --role  --global
 ! invalid: token permission is required
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
-$ jailops token delete -y ci j
-token/ci deleted
-token/j deleted
+$ jailops token revoke -y ci j
+token/ci revoked
+token/j revoked
 
-$ jailops cert create laptop --pem <dir>/laptop.pem --permission operator --projects main
+$ jailops cert create laptop --pem <dir>/laptop.pem --role operator --projects main
 certificate/laptop created
 
-$ jailops cert add hostb --kind host --fingerprint AB:CD:000000000000000000000000000000000000000000000000000000000000 --permission admin --global
+$ jailops cert create hostb --kind host --fingerprint AB:CD:000000000000000000000000000000000000000000000000000000000000 --role admin --global
 certificate/hostb created
 
 $ jailops cert create bad --fingerprint xyz --global
@@ -125,37 +123,37 @@ $ jailops cert create noscope --fingerprint <sha256>
 [exit 2]
 
 $ jailops cert list
-NAME     KIND     PERMISSION   SCOPE    EXPIRES   FINGERPRINT
-hostb    host     admin        global   never     <fingerprint>
-laptop   client   operator     main     never     <fingerprint>
+NAME     KIND     ROLE       SCOPE    EXPIRES   FINGERPRINT
+hostb    host     admin      global   never     <fingerprint>
+laptop   client   operator   main     never     <fingerprint>
 
-$ jailops cert delete -y hostb
-certificate/hostb deleted
+$ jailops cert revoke -y hostb
+certificate/hostb revoked
 
-$ jailops user create alice --permission operator --projects main
+$ jailops user create alice --role operator --projects main
 <password>
 ! warning: this secret is shown only once and cannot be retrieved again; store it now.
 
 $ jailops user list
-NAME    PERMISSION   SCOPE   TOTP   DISABLED
-alice   operator     main    no     no
+NAME    ROLE       SCOPE   TOTP   DISABLED
+alice   operator   main    no     no
 
-$ jailops user create bob --password-stdin --global
+$ jailops user create bob --password-file - --global
 ! 
-! usage: --password-stdin needs the password on the first line of standard input
+! usage: the password is not on the first line of standard input
 ! hint: run 'jailops user create --help' for usage
 [exit 2]
 
-$ jailops user create bob --password-stdin --global
+$ jailops user create bob --password-file - --global
 user/bob created
 
 $ jailops user disable bob
 user/bob disabled
 
 $ jailops user list
-NAME    PERMISSION   SCOPE    TOTP   DISABLED
-alice   operator     main     no     no
-bob     readonly     global   no     yes
+NAME    ROLE       SCOPE    TOTP   DISABLED
+alice   operator   main     no     no
+bob     readonly   global   no     yes
 
 $ jailops user enable bob
 user/bob enabled

@@ -66,30 +66,14 @@ func (s *Service) PlanCopy(ctx context.Context, src, dst, newUUID, stamp string,
 		from, to string
 		props    map[string]string
 	}
-	// raw names the encrypted volumes, copied as stored: the copy stays encrypted, with the same passphrase, and locked.
-	raw := map[string]bool{}
 	items := []item{{st.Container, dc, map[string]string{PropID: newUUID, PropName: dstName, PropProject: dstProject, "mountpoint": dstMP, PropComplete: "off"}}}
 	items = append(items, item{st.Root, dc + "/root", map[string]string{PropID: newUUID, PropName: dstName, PropProject: dstProject, "mountpoint": dstRoot}})
 	for _, d := range st.Persist {
 		items = append(items, item{d.DS, dc + "/" + strings.TrimPrefix(d.DS, st.Container+"/"), map[string]string{PropID: newUUID, PropName: dstName, PropProject: dstProject, "mountpoint": dstRoot + d.Path}})
 	}
-	var volParent *item
-	if len(st.Volumes) > 0 {
-		volParent = &item{s.Cfg.at(src).volumesDS(), s.Cfg.at(dst).volumesDS(), map[string]string{PropID: newUUID, PropName: dstName, PropProject: dstProject, PropKind: KindVolumes, PropManaged: "on", "canmount": "off", "mountpoint": "none"}}
+	if st.Delegated != "" {
+		items = append(items, item{st.Delegated, s.Cfg.at(dst).delegatedDS(), map[string]string{PropID: newUUID, PropName: dstName, PropProject: dstProject, "mountpoint": "none"}})
 	}
-	for _, v := range st.Volumes {
-		it := item{v.DS, s.Cfg.at(dst).volumeDS(strings.TrimPrefix(v.DS, s.Cfg.at(src).volumesDS()+"/")), map[string]string{PropID: newUUID, PropName: dstName, PropProject: dstProject, "mountpoint": dstRoot + v.Path, "canmount": "noauto"}}
-		if v.Encrypted {
-			if s.Keys == nil {
-				return nil, res, api.Errorf(api.CodeUnsupported, "volume %s is encrypted and this host has no key operations", volumeName(v.DS))
-			}
-			// UNVERIFIED: a raw receive of an encryption root with -o keylocation=prompt.
-			raw[it.to] = true
-			it.props[PropEncrypted], it.props["keylocation"] = "on", "prompt"
-		}
-		items = append(items, it)
-	}
-
 	srcSnaps := make([]string, len(st.all()))
 	for i, d := range st.all() {
 		srcSnaps[i] = d + "@" + snap
@@ -111,32 +95,28 @@ func (s *Service) PlanCopy(ctx context.Context, src, dst, newUUID, stamp string,
 	for i, it := range items {
 		it := it
 		send := "zfs send -p"
-		if raw[it.to] {
-			send = "zfs send -w"
-		}
 		pl.Add(plan.Step{Name: "send-" + it.to[strings.LastIndex(it.to, "/")+1:],
 			Describe: fmt.Sprintf("%s %s@%s | zfs receive %s", send, it.from, snap, it.to),
 			Do: func(ctx context.Context) error {
 				// UNVERIFIED: send of a clone gives a full, independent stream.
-				if volParent != nil && strings.HasPrefix(it.to, volParent.to+"/") {
-					if ok, _ := z.Exists(ctx, volParent.to); !ok {
-						if err := z.Create(ctx, volParent.to, volParent.props); err != nil {
-							return err
-						}
-					}
-				}
-				if raw[it.to] {
-					return s.Keys.ReplicateRaw(ctx, it.from+"@"+snap, it.to, it.props)
-				}
 				return z.Replicate(ctx, it.from+"@"+snap, it.to, it.props)
 			},
 			Undo: owned, UndoOnFail: i == 0})
+	}
+	if st.Delegated != "" {
+		// the helper receives without the jailed property: the copy's dataset is handed to its jail again
+		dd := s.Cfg.at(dst).delegatedDS()
+		pl.Add(plan.Step{Name: "delegate-dataset", Describe: "zfs set jailed=on " + dd,
+			Do: func(ctx context.Context) error { return z.Set(ctx, dd, map[string]string{"jailed": "on"}) }})
 	}
 	// rewrite the records for the copy
 	nrec := rec
 	nrec.Metadata.Name, nrec.Metadata.Project, nrec.Metadata.UUID = dstName, dstProject, newUUID
 	nrec.Metadata.Generation = 1
 	nrec.Metadata.CreatedAt, nrec.Metadata.UpdatedAt = s.Cfg.now(), s.Cfg.now()
+	// A copy attaches no volume: a volume belongs to the jails it is attached to, and two jails writing one volume
+	// by accident is not what a copy should start with. Attach what the copy needs with `jailops volume attach`.
+	nrec.Spec.Volumes = nil
 	nrec.Spec.Network = append([]api.NetworkAttach(nil), rec.Spec.Network...)
 	for i := range nrec.Spec.Network {
 		n := &nrec.Spec.Network[i]

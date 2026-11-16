@@ -9,8 +9,9 @@ import (
 	"jailops.net/jailops/sdk/api"
 )
 
-// Every jail port is a private bridge member whatever the network says: jails reach each other through the host.
-func TestEveryJailPortIsPrivate(t *testing.T) {
+// Every jail has a routed link of its own: its host end carries the gateway as a /32 and the host routes the jail's
+// address through it, so jails reach each other only through the host.
+func TestEveryJailHasARoutedLinkOfItsOwn(t *testing.T) {
 	e := dtest.New(t, dtest.Options{})
 	e.Seed()
 	c := ctxT(t)
@@ -21,7 +22,7 @@ func TestEveryJailPortIsPrivate(t *testing.T) {
 	if _, err := e.Admin.Networks().Create(c, n); err != nil {
 		t.Fatal(err)
 	}
-	// A private network belongs to one project, like every network: no sharing, so no ranges to keep apart.
+	// A network belongs to one project: no sharing, so no ranges to keep apart.
 	if _, err := e.Admin.Projects().Create(c, api.Project{Metadata: api.ObjectMeta{Name: "p1"}, Spec: api.ProjectSpec{
 		Networks: []api.ProjectNetwork{{Network: "priv"}},
 		Storage:  []api.ProjectStorage{{Storage: "default"}}}}); err != nil {
@@ -30,9 +31,9 @@ func TestEveryJailPortIsPrivate(t *testing.T) {
 	_, err := e.Admin.Projects().Create(c, api.Project{Metadata: api.ObjectMeta{Name: "p2"}, Spec: api.ProjectSpec{
 		Networks: []api.ProjectNetwork{{Network: "priv"}}}})
 	if !api.IsCode(err, api.CodeConflict) {
-		t.Fatalf("a second project took the private network: %v", err)
+		t.Fatalf("a second project took the network: %v", err)
 	}
-	// Jails attach privately: the host end becomes a private member.
+	// A jail attaches with a link of its own.
 	jl := dtest.WebJail("w1")
 	jl.Spec.Network = []api.NetworkAttach{{Network: "priv", IPv4: "auto"}}
 	jl.Spec.Storage = "default"
@@ -54,17 +55,23 @@ func TestEveryJailPortIsPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var private []string
+	var addr, route []string
 	for _, jd := range des.Jails {
 		for _, steps := range jd.Attach {
 			for _, st := range steps {
-				if st.Op == render.OpSetPrivate {
-					private = append(private, st.Describe())
+				switch st.Op {
+				case render.OpAddAddr:
+					addr = append(addr, st.Describe())
+				case render.OpAddHostRoute:
+					route = append(route, st.Describe())
 				}
 			}
 		}
 	}
-	if len(private) != 1 || !strings.HasPrefix(private[0], "ifconfig jo") || !strings.Contains(private[0], " private jo") {
-		t.Fatalf("the attach plan lacks `ifconfig <bridge> private <epair>`: %v", private)
+	if len(addr) != 1 || !strings.Contains(addr[0], " inet 10.30.0.1/32 alias") {
+		t.Fatalf("the host end lacks the gateway /32: %v", addr)
+	}
+	if len(route) != 1 || !strings.HasPrefix(route[0], "route add -inet 10.30.0.10/32 -interface jo") {
+		t.Fatalf("the host lacks the route to the jail: %v", route)
 	}
 }

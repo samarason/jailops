@@ -1,6 +1,7 @@
 package fake
 
 import (
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -27,6 +28,7 @@ func (s *Server) routes() {
 	s.users = newKind(s, "users", "user", api.ScopeFleet, func(v *api.User) *api.ObjectMeta { return &v.Metadata })
 	s.wireguard = newKind(s, "wireguard", "wireguard", api.ScopeFleet, func(v *api.WireGuard) *api.ObjectMeta { return &v.Metadata })
 
+	s.volumes = newKind(s, "volumes", "volume", api.ScopeHost, func(v *api.Volume) *api.ObjectMeta { return &v.Metadata })
 	s.profiles = newKind(s, "profiles", "profile", api.ScopeFleet, func(v *api.Profile) *api.ObjectMeta { return &v.Metadata })
 	s.profiles.scoped = true
 	s.setupProfiles()
@@ -36,6 +38,7 @@ func (s *Server) routes() {
 	s.setupStorage()
 	s.setupAccess()
 	s.setupJails()
+	s.setupVolumes()
 	s.setupImages()
 	s.setupNetworks()
 	s.setupWireGuard()
@@ -65,13 +68,14 @@ func (s *Server) routes() {
 	m("POST /api/v1/users", s.createUser)
 	m("POST /api/v1/users/{name}/password", s.setUserPassword)
 	for _, reg := range []func(muxer){
-		s.jails.register, s.images.register, s.networks.register, s.policies.register, s.addrsets.register,
+		s.jails.register, s.volumes.register, s.images.register, s.networks.register, s.policies.register, s.addrsets.register,
 		s.targets.register, s.bpolicies.register, s.backups.register, s.remotes.register,
 		s.profiles.register, s.tokens.register, s.certs.register, s.users.register, s.projects.register, s.storages.register,
 		s.wireguard.register,
 	} {
 		reg(m)
 	}
+	s.registerRenames(m)
 	m("POST /api/v1/trust/tokens", s.createTrustToken)
 	m("POST /api/v1/trust/clients", s.redeemTrustToken)
 	m("GET /api/v1/sessions", s.listSessions)
@@ -94,12 +98,17 @@ func (s *Server) routes() {
 	m("POST /api/v1/updates/apply", s.handleUpdatesApply)
 	m("GET /api/v1/jails/{name}/updates", s.handleUpdateHistory)
 	m("POST /api/v1/jails/{name}/provision", s.handleProvision)
+	m("POST /api/v1/jails/{name}/shell-setup", s.handleShellSetup)
 	m("GET /api/v1/host/identity", s.handleHostIdentity)
 	m("PUT /api/v1/host/identity", s.handleHostIdentityPut)
 	m("GET /api/v1/host/snapshots", s.handleHostSnapshots)
 	m("POST /api/v1/host/snapshots/{name}/restore", s.handleHostRestore)
 	m("GET /api/v1/host/firewall", s.handleHostFirewall)
 	m("PUT /api/v1/host/firewall", s.handleHostFirewallPut)
+	m("GET /api/v1/host/certificate", s.handleHostCertificate)
+	m("PUT /api/v1/host/certificate", s.handleHostCertificateUpload)
+	m("POST /api/v1/host/certificate/acme", s.handleHostCertificateACME)
+	m("POST /api/v1/host/certificate/self-signed", s.handleHostCertificateSelfSigned)
 	m("GET /api/v1/host/pending", s.handleHostPending)
 	m("POST /api/v1/host/pending/confirm", s.handleHostPendingAction(true))
 	m("POST /api/v1/host/pending/revert", s.handleHostPendingAction(false))
@@ -113,6 +122,8 @@ func (s *Server) routes() {
 	m("GET /api/v1/jails/{name}/logs", s.jailLogs)
 	m("GET /api/v1/jails/{name}/logs/{file...}", s.jailLog)
 	m("GET /api/v1/logs", s.handleLogs)
+	m("GET /api/v1/boot", s.handleBoot)
+	m("POST /api/v1/firewall/test", s.handleFirewallTest)
 	m("GET /api/v1/logs/forward", s.handleLogForward)
 	m("PUT /api/v1/logs/forward", s.handleLogForwardPut)
 	m("DELETE /api/v1/logs/forward", s.handleLogForwardDelete)
@@ -122,10 +133,17 @@ func (s *Server) routes() {
 	m("POST /api/v1/jails/{name}/access", s.handleAppAllow)
 	m("POST /api/v1/jails/{name}/access/deny", s.handleAppDeny)
 	m("PUT /api/v1/jails/{name}/state", s.jailAction)
-	m("POST /api/v1/jails", s.jailCreate)
-	m("POST /api/v1/jails/{name}/unlock", s.jailUnlock)
-	m("POST /api/v1/jails/{name}/lock", s.jailLock)
-	m("POST /api/v1/jails/{name}/passphrase", s.jailPassphrase)
+	m("POST /api/v1/volumes", s.volumeCreate)
+	m("POST /api/v1/volumes/{name}/unlock", s.volumeUnlock)
+	m("POST /api/v1/volumes/{name}/lock", s.volumeLock)
+	m("POST /api/v1/volumes/{name}/passphrase", s.volumePassphrase)
+	m("GET /api/v1/volumes/{name}/snapshots", s.volSnapList)
+	m("POST /api/v1/volumes/{name}/snapshots", s.volSnapCreate)
+	m("DELETE /api/v1/volumes/{name}/snapshots/{snap}", s.volSnapDelete)
+	m("POST /api/v1/volumes/{name}/rollback", s.volRollback)
+	m("GET /api/v1/jails/{name}/volumes", s.jailVolumes)
+	m("POST /api/v1/jails/{name}/volumes", s.jailAttach)
+	m("DELETE /api/v1/jails/{name}/volumes/{volume}", s.jailDetach)
 	m("GET /api/v1/jails/{name}/snapshots", s.snapList)
 	m("POST /api/v1/jails/{name}/snapshots", s.snapCreate)
 	m("GET /api/v1/jails/{name}/snapshots/{snap}", s.snapGet)
@@ -159,9 +177,13 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	info := api.ServerInfo{
 		APIVersion: api.Version, APIExtensions: slices.Clone(s.extensions), Version: "fake",
 		HostUUID: s.uuid, Hostname: s.hostname, Role: api.RoleHost, Hub: s.hub, Auth: auth,
-		Environment: api.Environment{OS: "FreeBSD", Arch: s.arch, Pool: "tank"}, SecretsRecipient: s.secretsRec,
+		Environment: api.Environment{OS: "FreeBSD", KernelVersion: s.release, Arch: s.arch, Pool: "tank"}, SecretsRecipient: s.secretsRec,
 	}
 	s.mu.Unlock()
+	if auth == "untrusted" {
+		// as the daemon: a caller that proved nothing learns what a client negotiates with, nothing about the host
+		info = api.ServerInfo{APIVersion: info.APIVersion, APIExtensions: info.APIExtensions, Role: info.Role, Auth: auth}
+	}
 	writeSync(w, 200, info)
 }
 
@@ -282,8 +304,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			}
 			rc = &reqInfo{id: rc.id, kind: rc.kind, authed: rc.authed, project: req.Project}
 		}
+		if b.Spec.Kind == "volume" {
+			return s.restoreVolumeBackup(rc.project, b, name, *req)
+		}
 		pf := api.RestorePreflight{}
 		spec := clone(&b.Spec.Bundle.Spec)
+		restoreVolumes := s.planRestoreVolumes(rc.project, b, name, *req, &spec, &pf)
 		for i := range spec.Network {
 			n := spec.Network[i].Network
 			if m, ok := req.NetworkMap[n]; ok {
@@ -320,6 +346,9 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		}
 		jail := &api.Jail{Metadata: api.ObjectMeta{Name: name, Project: rc.project, Labels: nil}, Spec: spec}
 		op := s.startOp(rc.project, "restores.create", "Restoring "+name, map[string][]string{"jails": {"/api/v1/jails/" + name}}, func() (any, *api.Error) {
+			for _, vb := range restoreVolumes {
+				s.restoreVolume(rc.project, vb, vb.Spec.Jail, "")
+			}
 			delete(s.jails.items, s.jails.keyIn(rc.project, name))
 			if e := s.assignJail(jail, nil); e != nil {
 				return nil, e
@@ -344,4 +373,98 @@ func imageName(ref string) string {
 func genNumber(s string) int {
 	n, _ := strconv.Atoi(strings.TrimPrefix(s, "g"))
 	return n
+}
+
+// imageCreateHint is the server's hint for an image reference that names no image: the commands that make it.
+func (s *Server) imageCreateHint(ref string) string {
+	alias := ""
+	if _, a, ok := strings.Cut(ref, "@"); ok {
+		alias = a
+	}
+	return api.ImageCreateHint("it", imageName(ref), alias, api.BaseRelease(s.release))
+}
+
+// restoreVolumeBackup restores a volume backup as a new volume of the project, like the daemon: a name that is taken is
+// refused, an encrypted volume needs its passphrase. s.mu is held.
+func (s *Server) restoreVolumeBackup(project string, b *api.Backup, name string, req api.RestoreRequest) reply {
+	if b.Spec.Volume == nil {
+		return reply{err: api.Errorf(api.CodeInvalid, "backup %s holds no volume spec", b.Metadata.Name)}
+	}
+	pf := api.RestorePreflight{}
+	switch {
+	case s.volumes.items[project+"/"+name] != nil:
+		pf.Errors = append(pf.Errors, "volume "+name+" already exists in project "+project+"; restore it under another name with as=NAME (a volume is never replaced)")
+	case b.Spec.Volume.Encrypted && req.Passphrase == "":
+		pf.Errors = append(pf.Errors, "the volume is encrypted: give its passphrase; it makes the volume again and is never stored")
+	case !b.Spec.Volume.Encrypted && req.Passphrase != "":
+		pf.Errors = append(pf.Errors, "a passphrase was given but the volume is not encrypted")
+	default:
+		pf.Changes = append(pf.Changes, "creates volume "+name+" in project "+project+" from backup "+b.Metadata.Name)
+	}
+	pf.OK = len(pf.Errors) == 0
+	if req.DryRun {
+		return reply{status: 200, meta: pf}
+	}
+	if !pf.OK {
+		return reply{err: api.Errorf(api.CodeInvalid, "restore preflight failed").WithDetail("errors", strings.Join(pf.Errors, "; "))}
+	}
+	op := s.startOp(project, "restores.create", "Restoring "+name, map[string][]string{"volumes": {"/api/v1/volumes/" + name}}, func() (any, *api.Error) {
+		v := s.restoreVolume(project, b, name, req.Passphrase)
+		return clone(v), nil
+	})
+	return reply{op: &op}
+}
+
+// restoreVolume makes the volume of a volume backup. s.mu is held.
+func (s *Server) restoreVolume(project string, b *api.Backup, name, passphrase string) *api.Volume {
+	v := &api.Volume{Metadata: api.ObjectMeta{Name: name, Project: project}, Spec: *b.Spec.Volume}
+	s.volumes.insert(v, false)
+	if v.Spec.Encrypted {
+		s.vol.init()
+		key := project + "/" + name
+		s.vol.pass[key], s.vol.locked[key] = passphrase, false
+	}
+	return v
+}
+
+// planRestoreVolumes decides how a jail restore gets the volumes the jail attaches that the project lacks: from their
+// newest backup; with no_volumes every attachment is left out. It returns the backups to restore and notes the result in pf and spec.
+// s.mu is held.
+func (s *Server) planRestoreVolumes(project string, b *api.Backup, name string, req api.RestoreRequest, spec *api.JailSpec, pf *api.RestorePreflight) []*api.Backup {
+	var restore []*api.Backup
+	var keep []api.VolumeAttach
+	if req.NoVolumes {
+		if len(spec.Volumes) > 0 {
+			pf.Changes = append(pf.Changes, "jail "+name+" is restored without its volumes (no_volumes): attach them with jailops volume attach")
+		}
+		spec.Volumes = nil
+		return nil
+	}
+	for _, v := range spec.Volumes {
+		if s.volumes.items[project+"/"+v.Name] != nil {
+			keep = append(keep, v)
+			continue
+		}
+		var best *api.Backup
+		for _, k := range slices.Sorted(maps.Keys(s.backups.items)) {
+			vb := s.backups.items[k]
+			if vb.Spec.Kind == "volume" && vb.Spec.Jail == v.Name && vb.Metadata.Project == project && !vb.Status.Failed &&
+				(best == nil || vb.Metadata.CreatedAt.After(best.Metadata.CreatedAt)) {
+				best = vb
+			}
+		}
+		switch {
+		case best == nil:
+			// like the daemon: the jail is restored, and does not start until the volume exists
+			pf.Changes = append(pf.Changes, "volume "+v.Name+" is not in the project and no backup of it was found: the jail attaches it, and does not start until the volume exists")
+		case best.Spec.Volume != nil && best.Spec.Volume.Encrypted:
+			pf.Errors = append(pf.Errors, "volume "+v.Name+" is encrypted: restore its backup "+best.Metadata.Name+" first (it needs its passphrase), then restore the jail")
+		default:
+			restore = append(restore, best)
+			pf.Changes = append(pf.Changes, "restores volume "+v.Name+" from backup "+best.Metadata.Name+" first")
+		}
+		keep = append(keep, v)
+	}
+	spec.Volumes = keep
+	return restore
 }

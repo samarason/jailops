@@ -17,12 +17,13 @@ const fmt = (key: string, v: number) => (key === 'memory' ? bytes(v) : String(v)
     <div v-for="r in rows" :key="r.key" class="qrow" :data-quota="r.key">
       <span class="faint">{{ s.project.quotaNames[r.key] }}</span>
       <Meter :value="r.pct" :label="s.project.quotaNames[r.key]" :warn-at="75" :danger-at="95" />
-      <span class="mono">{{ fmt(r.key, r.used) }} / {{ fmt(r.key, r.limit) }}</span>
+      <span class="mono nowrap-cell">{{ fmt(r.key, r.used) }} / {{ fmt(r.key, r.limit) }}</span>
     </div>
   </div>
 </template>
 
 <style>
-.qrow { display: grid; grid-template-columns: 110px 1fr 140px; gap: 12px; align-items: center; margin-bottom: 6px; }
+.nowrap-cell { white-space: nowrap; }
+.qrow { display: grid; grid-template-columns: 110px 1fr minmax(140px, auto); gap: 12px; align-items: center; margin-bottom: 6px; }
 @media (max-width: 800px) { .qrow { grid-template-columns: 1fr; gap: 2px; } }
 </style>

@@ -26,7 +26,7 @@ func appFleet(t *testing.T) *fleettest.Env {
 	}
 	app("db", "postgresql")
 	app("web", "nginx")
-	e.Write("projects/shop/app-access/db.yaml", "apiVersion: jailops/v1\nkind: AppAccess\nmetadata:\n  name: db\nhosts: [db1]\nspec:\n  grants:\n    - {source: \"@web\", database: shop}\n")
+	e.Write("projects/shop/app-access/db.yaml", "apiVersion: jailops/v1\nkind: AppAccess\nmetadata:\n  name: db\nhosts: [db1]\nspec:\n  grants:\n    - {source: \"jail:web\", database: shop}\n")
 	e.Write("projects/shop/app-access/web.yaml", "apiVersion: jailops/v1\nkind: AppAccess\nmetadata:\n  name: web\nhosts: [db1]\nspec:\n  grants:\n    - {source: 203.0.113.0/24, ports: [\"80\"]}\n")
 	return e
 }
@@ -39,7 +39,7 @@ var connRE = regexp.MustCompile(`postgres://shop:([A-Za-z0-9]{32})@[^ \n]+`)
 func TestAppsAndGrantsApplyOnce(t *testing.T) {
 	e := appFleet(t)
 	p := mustOK(t, run(t, e, "plan")).out
-	for _, want := range []string{"create    App/shop/db", "install app postgresql as jail db", "create    AppAccess/shop/db from @web", "allow @web, database shop"} {
+	for _, want := range []string{"create    App/shop/db", "install app postgresql as jail db", "create    AppAccess/shop/db from jail:web", "allow jail:web, database shop"} {
 		contains(t, p, want)
 	}
 	ap := mustOK(t, run(t, e, "sync", "--apply")).out
@@ -71,7 +71,7 @@ func TestAppsAndGrantsApplyOnce(t *testing.T) {
 		}
 	}
 	acc, err := c.Apps().Access(ctx, "db")
-	if err != nil || len(acc.Grants) != 1 || acc.Grants[0].Source != "@web" || acc.Grants[0].Database != "shop" {
+	if err != nil || len(acc.Grants) != 1 || acc.Grants[0].Source != "jail:web" || acc.Grants[0].Database != "shop" {
 		t.Fatalf("%v %+v", err, acc)
 	}
 	again := mustOK(t, run(t, e, "plan")).out
@@ -147,6 +147,6 @@ func TestAppRefusalsAndErrors(t *testing.T) {
 
 	e2 := appFleet(t)
 	mustOK(t, run(t, e2, "sync", "--apply"))
-	e2.Write("projects/shop/app-access/db.yaml", "apiVersion: jailops/v1\nkind: AppAccess\nmetadata:\n  name: db\nhosts: [db1]\nspec:\n  grants:\n    - {source: \"@web\", database: other}\n")
+	e2.Write("projects/shop/app-access/db.yaml", "apiVersion: jailops/v1\nkind: AppAccess\nmetadata:\n  name: db\nhosts: [db1]\nspec:\n  grants:\n    - {source: \"jail:web\", database: other}\n")
 	mustFail(t, run(t, e2, "plan"), "the database of a grant does not change")
 }

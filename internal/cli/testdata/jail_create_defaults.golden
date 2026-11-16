@@ -1,0 +1,25 @@
+$ jailops create web --image freebsd-15@stable
+jail/web created
+! network lan: the only network of project main
+! storage default: the only storage of project main
+
+$ jailops network grant dmz --project main
+network/dmz granted to project main
+
+$ jailops create db --image freebsd-15@stable --storage default
+! invalid: a jail needs a network: name one with --network NAME or use a profile that has one
+[exit 2]
+
+$ jailops --dry-run create db --image freebsd-15@stable --network dmz
+dry-run: would create jail db
+apiVersion: jailops/v1
+kind: Jail
+metadata:
+  name: db
+spec:
+  image: freebsd-15@stable
+  storage: default
+  network:
+    - network: dmz
+! storage default: the only storage of project main
+

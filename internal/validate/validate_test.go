@@ -47,9 +47,9 @@ func TestParseSize(t *testing.T) {
 
 func TestImageRef(t *testing.T) {
 	ok := map[string]ImageRef{
-		"freebsd-15.0@stable": {Name: "freebsd-15.0", Alias: "stable"},
-		"freebsd-15.0#g3":     {Name: "freebsd-15.0", Generation: 3, Pinned: true},
-		"alpine-3.22":         {Name: "alpine-3.22"},
+		"freebsd-15-0@stable": {Name: "freebsd-15-0", Alias: "stable"},
+		"freebsd-15-0#g3":     {Name: "freebsd-15-0", Generation: 3, Pinned: true},
+		"alpine-3-22":         {Name: "alpine-3-22"},
 	}
 	for s, want := range ok {
 		got, err := ParseImageRef(s)
@@ -57,7 +57,7 @@ func TestImageRef(t *testing.T) {
 			t.Errorf("%q: %+v %v", s, got, err)
 		}
 	}
-	for _, s := range []string{"", "@stable", "x@", "x#", "x#g", "x#g0", "x#3", "x#g03", "x#g-1", "x#g+1", "X@a", "x@A", "x y", "x#g1@a", "a/b", "x@a\n"} {
+	for _, s := range []string{"", "@stable", "freebsd-15.0@stable", "x@", "x#", "x#g", "x#g0", "x#3", "x#g03", "x#g-1", "x#g+1", "X@a", "x@A", "x y", "x#g1@a", "a/b", "x@a\n"} {
 		if _, err := ParseImageRef(s); err == nil {
 			t.Errorf("%q accepted", s)
 		}
@@ -66,12 +66,12 @@ func TestImageRef(t *testing.T) {
 
 func okJail() api.JailSpec {
 	return api.JailSpec{
-		Image:     "freebsd-15.0@stable",
+		Image:     "freebsd-15-0@stable",
 		Hostname:  "web.example.org",
 		Resources: api.Resources{CPU: 2, Memory: "2G", Disk: "20G"},
 		Network:   []api.NetworkAttach{{Network: "lan", IPv4: "auto", IPv6: "2001:db8::5", MAC: "02:00:00:00:00:01"}},
-		Firewall:  api.FirewallAttach{Policy: "web", Tags: []string{"web", "tier-1"}},
-		Volumes:   []api.VolumeMount{{Name: "data", Mount: "/srv/data", Quota: "10G"}},
+		Firewall:  api.FirewallAttach{Policies: []string{"web"}, Tags: []string{"web", "tier-1"}},
+		Volumes:   []api.VolumeAttach{{Name: "data", Mount: "/srv/data"}},
 		Boot:      api.BootPolicy{Depends: []string{"db"}},
 		Packages:  []string{"nginx", "py311-foo+bar"},
 		Env:       map[string]string{"A": "b"},
@@ -101,15 +101,15 @@ func TestJailSpec(t *testing.T) {
 		{"v6 multicast", func(s *api.JailSpec) { s.Network[0].IPv6 = "ff02::1" }, "network[0].ipv6"},
 		{"mac upper", func(s *api.JailSpec) { s.Network[0].MAC = "02:00:00:00:00:AA" }, "network[0].mac"},
 		{"mac mcast", func(s *api.JailSpec) { s.Network[0].MAC = "01:00:00:00:00:01" }, "network[0].mac"},
-		{"policy", func(s *api.JailSpec) { s.Firewall.Policy = "x y" }, "firewall.policy"},
+		{"policy", func(s *api.JailSpec) { s.Firewall.Policies = []string{"x y"} }, "firewall.policies[0]"},
+		{"policy twice", func(s *api.JailSpec) { s.Firewall.Policies = []string{"x", "x"} }, "firewall.policies[1]"},
 		{"tag", func(s *api.JailSpec) { s.Firewall.Tags = []string{"a b"} }, "firewall.tags[0]"},
 		{"dup tag", func(s *api.JailSpec) { s.Firewall.Tags = []string{"a", "a"} }, "firewall.tags[1]"},
 		{"vol mount", func(s *api.JailSpec) { s.Volumes[0].Mount = "srv/data" }, "volumes[0].mount"},
 		{"vol dotdot", func(s *api.JailSpec) { s.Volumes[0].Mount = "/srv/../etc" }, "volumes[0].mount"},
 		{"vol quote", func(s *api.JailSpec) { s.Volumes[0].Mount = "/srv/\"x" }, "volumes[0].mount"},
 		{"vol root", func(s *api.JailSpec) { s.Volumes[0].Mount = "/" }, "volumes[0].mount"},
-		{"vol quota", func(s *api.JailSpec) { s.Volumes[0].Quota = "x" }, "volumes[0].quota"},
-		{"vol dup", func(s *api.JailSpec) { s.Volumes = append(s.Volumes, s.Volumes[0]) }, "volumes[1].name"},
+		{"vol dup", func(s *api.JailSpec) { s.Volumes = append(s.Volumes, s.Volumes[0]) }, "volumes[1].volume"},
 		{"depends self", func(s *api.JailSpec) { s.Boot.Depends = []string{"web"} }, "boot.depends[0]"},
 		{"package", func(s *api.JailSpec) { s.Packages = []string{"x;rm"} }, "packages[0]"},
 		{"env key", func(s *api.JailSpec) { s.Env = map[string]string{"1A": "x"} }, "env"},
@@ -128,9 +128,9 @@ func TestJailSpec(t *testing.T) {
 
 func okNet() api.NetworkSpec {
 	return api.NetworkSpec{
-		Bridge: "jo0", Uplink: "em0", DNS: []string{"9.9.9.9", "2620:fe::fe"},
+		Uplink: "em0", DNS: []string{"9.9.9.9", "2620:fe::fe"},
 		IPv4: &api.IPv4Net{Subnet: "10.20.0.0/24", Gateway: "10.20.0.1", Range: "10.20.0.10-10.20.0.200", Exclude: []string{"10.20.0.50-10.20.0.60"}, NAT: true},
-		IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:1::/64", Gateway: "2001:db8:1::1", Range: "2001:db8:1::100-2001:db8:1::ffff"},
+		IPv6: &api.IPv6Net{Mode: api.IPv6Routed, Subnet: "2001:db8:1::/64", Range: "2001:db8:1::100-2001:db8:1::ffff"},
 	}
 }
 
@@ -139,7 +139,7 @@ func TestNetworkSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 	proxy := func(s *api.NetworkSpec) {
-		s.IPv6 = &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:2::/64", Gateway: "fe80::1", Range: "2001:db8:2::100-2001:db8:2::200"}
+		s.IPv6 = &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:2::/64", Range: "2001:db8:2::100-2001:db8:2::200"}
 	}
 	p := okNet()
 	proxy(&p)
@@ -151,8 +151,6 @@ func TestNetworkSpec(t *testing.T) {
 		mut   func(*api.NetworkSpec)
 		field string
 	}{
-		{"bridge", func(s *api.NetworkSpec) { s.Bridge = "jo 0" }, "bridge"},
-		{"uplink=bridge", func(s *api.NetworkSpec) { s.Uplink = "jo0" }, "uplink"},
 		{"uplink epair", func(s *api.NetworkSpec) { s.Uplink = "jo0123456789a0a" }, "uplink"},
 		{"mtu", func(s *api.NetworkSpec) { s.MTU = 100 }, "mtu"},
 		{"mtu v6", func(s *api.NetworkSpec) { s.MTU = 1000 }, "mtu"},
@@ -174,10 +172,7 @@ func TestNetworkSpec(t *testing.T) {
 		{"nat no uplink", func(s *api.NetworkSpec) { s.Uplink = "" }, "ipv4.nat"},
 		{"v6 mode", func(s *api.NetworkSpec) { s.IPv6.Mode = "weird" }, "ipv6.mode"},
 		{"v6 subnet v4", func(s *api.NetworkSpec) { s.IPv6.Subnet = "10.0.0.0/8" }, "ipv6.subnet"},
-		{"v6 gw outside", func(s *api.NetworkSpec) { s.IPv6.Gateway = "2001:db8:9::1" }, "ipv6.gateway"},
-		{"v6 range gw", func(s *api.NetworkSpec) { s.IPv6.Range = "2001:db8:1::1-2001:db8:1::ff" }, "ipv6.range"},
 		{"v6 range outside", func(s *api.NetworkSpec) { s.IPv6.Range = "2001:db8:2::1-2001:db8:2::ff" }, "ipv6.range"},
-		{"proxy global gw", func(s *api.NetworkSpec) { proxy(s); s.IPv6.Gateway = "2001:db8:2::1" }, "ipv6.gateway"},
 		{"proxy no uplink", func(s *api.NetworkSpec) { proxy(s); s.Uplink = ""; s.IPv4.NAT = false }, "uplink"},
 		{"proxy uplink bridge", func(s *api.NetworkSpec) { proxy(s); s.Uplink = "bridge0" }, "uplink"},
 	}
@@ -188,18 +183,10 @@ func TestNetworkSpec(t *testing.T) {
 			wantInvalid(t, NetworkSpec(s), tc.field)
 		})
 	}
-	// routed mode may use a link-local gateway; none disables v6 checks
+	// none disables the v6 checks
 	s := okNet()
-	s.IPv6.Gateway = "fe80::1"
-	if err := NetworkSpec(s); err != nil {
-		t.Fatal(err)
-	}
 	s.IPv6 = &api.IPv6Net{Mode: api.IPv6None}
 	if err := NetworkSpec(s); err != nil {
-		t.Fatal(err)
-	}
-	wantInvalid(t, NetworkMembers(p, []string{"em0"}), "uplink")
-	if err := NetworkMembers(p, []string{"jo0123456789a0a"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -208,7 +195,7 @@ func TestFirewall(t *testing.T) {
 	ok := api.FirewallPolicySpec{
 		DefaultIn: "deny", DefaultOut: "allow",
 		Rules: []api.FirewallRule{
-			{Name: "ssh", Action: "allow", Direction: "in", Proto: "tcp", From: []string{"@office", "10.0.0.0/8", "tag:admin"}, Ports: []string{"22", "8000-8100"}},
+			{Name: "ssh", Action: "allow", Direction: "in", Proto: "tcp", From: []string{"set:office", "jail:web", "10.0.0.0/8", "tag:admin"}, Ports: []string{"22", "8000-8100"}},
 			{Action: "allow", Direction: "in", Proto: "tcp", Redirect: &api.Redirect{HostPort: 8080, JailPort: 80}},
 			{Action: "allow", Direction: "out", Proto: "icmp6", To: []string{"any"}},
 		},
@@ -224,14 +211,16 @@ func TestFirewall(t *testing.T) {
 	r := func(mut func(*api.FirewallRule)) api.FirewallPolicySpec {
 		x := api.FirewallRule{Action: "allow", Direction: "in", Proto: "tcp", Ports: []string{"80"}}
 		mut(&x)
-		return api.FirewallPolicySpec{Rules: []api.FirewallRule{x}}
+		return api.FirewallPolicySpec{DefaultIn: "deny", DefaultOut: "allow", Rules: []api.FirewallRule{x}}
 	}
 	tests := []struct {
 		name  string
 		spec  api.FirewallPolicySpec
 		field string
 	}{
-		{"default", api.FirewallPolicySpec{DefaultIn: "maybe"}, "default_in"},
+		{"default", api.FirewallPolicySpec{DefaultIn: "maybe", DefaultOut: "allow"}, "default_in"},
+		{"default in missing", api.FirewallPolicySpec{DefaultOut: "allow"}, "default_in"},
+		{"default out missing", api.FirewallPolicySpec{DefaultIn: "deny"}, "default_out"},
 		{"action", r(func(x *api.FirewallRule) { x.Action = "pass" }), "rules[0].action"},
 		{"direction", r(func(x *api.FirewallRule) { x.Direction = "both" }), "rules[0].direction"},
 		{"proto", r(func(x *api.FirewallRule) { x.Proto = "sctp" }), "rules[0].proto"},
@@ -239,8 +228,12 @@ func TestFirewall(t *testing.T) {
 		{"port 0", r(func(x *api.FirewallRule) { x.Ports = []string{"0"} }), "rules[0].ports"},
 		{"port range", r(func(x *api.FirewallRule) { x.Ports = []string{"90-80"} }), "rules[0].ports"},
 		{"port junk", r(func(x *api.FirewallRule) { x.Ports = []string{"80 or any"} }), "rules[0].ports"},
-		{"set syntax", r(func(x *api.FirewallRule) { x.From = []string{"@Bad Name"} }), "rules[0].from"},
-		{"set dash", r(func(x *api.FirewallRule) { x.From = []string{"@a-b"} }), "rules[0].from"},
+		{"at sign", r(func(x *api.FirewallRule) { x.From = []string{"@office"} }), "rules[0].from"},
+		{"set syntax", r(func(x *api.FirewallRule) { x.From = []string{"set:Bad Name"} }), "rules[0].from"},
+		{"set with an underscore", r(func(x *api.FirewallRule) { x.From = []string{"set:a_b"} }), "rules[0].from"},
+		{"jail dash at the end", r(func(x *api.FirewallRule) { x.From = []string{"jail:a-"} }), "rules[0].from"},
+		{"jail too long", r(func(x *api.FirewallRule) { x.From = []string{"jail:" + strings.Repeat("a", 30)} }), "rules[0].from"},
+		{"unknown kind", r(func(x *api.FirewallRule) { x.From = []string{"group:office"} }), "rules[0].from"},
 		{"tag syntax", r(func(x *api.FirewallRule) { x.To = []string{"tag:a b"} }), "rules[0].to"},
 		{"addr", r(func(x *api.FirewallRule) { x.To = []string{"10.0.0.1; pass all"} }), "rules[0].to"},
 		{"rdr out", r(func(x *api.FirewallRule) {
@@ -261,7 +254,7 @@ func TestFirewall(t *testing.T) {
 			x.Redirect = &api.Redirect{HostPort: 1, JailPort: 2}
 		}), "rules[0].redirect"},
 		{"rule name", r(func(x *api.FirewallRule) { x.Name = "x\npass all" }), "rules[0].name"},
-		{"raw ctrl", api.FirewallPolicySpec{Raw: "pass\x00"}, "raw"},
+		{"raw ctrl", api.FirewallPolicySpec{DefaultIn: "deny", DefaultOut: "allow", Raw: "pass\x00"}, "raw"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,13 +265,65 @@ func TestFirewall(t *testing.T) {
 }
 
 func TestAddressSet(t *testing.T) {
-	if err := AddressSetSpec(api.AddressSetSpec{Addresses: []string{"10.0.0.1", "10.0.0.0/8", "2001:db8::/32"}, Includes: []string{"office"}}); err != nil {
+	if err := AddressSetSpec(api.AddressSetSpec{Addresses: api.Entries("10.0.0.1", "10.0.0.0/8", "2001:db8::/32", "jail:web", "jail:web-2", "set:office")}); err != nil {
 		t.Fatal(err)
 	}
 	for _, s := range []api.AddressSetSpec{
-		{Addresses: []string{"@x"}}, {Addresses: []string{"any"}}, {Addresses: []string{"1.2.3"}}, {Includes: []string{"Bad"}},
+		{Addresses: api.Entries("@web")}, {Addresses: api.Entries("jail:Bad Name")}, {Addresses: api.Entries("any")}, {Addresses: api.Entries("tag:x")}, {Addresses: api.Entries("1.2.3")}, {Addresses: api.Entries("set:Bad")},
+		{Addresses: []api.AddressEntry{{Address: "10.0.0.1", Comment: "two\nlines"}}},
+		{Addresses: []api.AddressEntry{{Address: "10.0.0.1", Comment: strings.Repeat("x", CommentMax+1)}}},
 	} {
 		wantInvalid(t, AddressSetSpec(s), "")
+	}
+}
+
+// A member set:NAME is another set and jail:NAME a jail, flattened like an include; a set that reaches itself through
+// its members is a cycle, and a jail that is not there has no addresses.
+func TestFlattenSetWithJailMembers(t *testing.T) {
+	sets := map[string]api.AddressSetSpec{
+		"git-allow": {Addresses: api.Entries("192.0.2.7", "jail:web", "jail:web-2", "set:office", "jail:gone")},
+		"office":    {Addresses: api.Entries("198.51.100.0/24")},
+		"loop":      {Addresses: api.Entries("set:loop2")},
+		"loop2":     {Addresses: api.Entries("set:loop")},
+	}
+	jails := map[string][]string{"web": {"10.0.0.5", "fd00::5"}, "web-2": {"10.0.0.6"}}
+	got, err := FlattenSet("git-allow", sets, jails)
+	if err != nil || strings.Join(got, " ") != "10.0.0.5 10.0.0.6 192.0.2.7 198.51.100.0/24 fd00::5" {
+		t.Fatalf("%v %v", got, err)
+	}
+	if _, err := FlattenSet("loop", sets, jails); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("a cycle through members: %v", err)
+	}
+	sets["git-allow"] = api.AddressSetSpec{Addresses: api.Entries("set:nosuch")}
+	if _, err := FlattenSet("git-allow", sets, jails); err == nil || !strings.Contains(err.Error(), "nosuch") {
+		t.Fatalf("a set that does not exist: %v", err)
+	}
+}
+
+// A reference is kind:name; @ is not used, and an unknown kind names the kinds.
+func TestParseEndpointKinds(t *testing.T) {
+	for s, want := range map[string]EndpointKind{"any": EndpointAny, "jail:web": EndpointJail, "jail:web-2": EndpointJail, "set:office": EndpointSet,
+		"set:git-allow": EndpointSet, "tag:backend": EndpointTag, "192.0.2.7": EndpointAddr, "10.0.0.0/8": EndpointAddr, "2001:db8::1": EndpointAddr} {
+		if k, _, err := ParseEndpoint(s); err != nil || k != want {
+			t.Errorf("%s: kind %v, %v", s, k, err)
+		}
+	}
+	for s, want := range map[string]string{
+		"@web":                            "@ is not used: write jail:web, set:web or tag:web",
+		"host:web":                        "unknown kind",
+		"jail:":                           "invalid",
+		"jail:Web":                        "invalid",
+		"jail:web-":                       "invalid",
+		"jail:" + strings.Repeat("a", 30): "invalid",
+		"set:web_1":                       "invalid",
+		"set:":                            "invalid",
+		"tag:":                            "invalid",
+		"web":                             "not a valid address",
+		"999.1.1.1":                       "not a valid address",
+	} {
+		if _, _, err := ParseEndpoint(s); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want an error with %q, got %v", s, want, err)
+		}
 	}
 }
 
@@ -308,7 +353,7 @@ func FuzzParseSize(f *testing.F) {
 }
 
 func FuzzEndpointAndImage(f *testing.F) {
-	for _, s := range []string{"@a", "tag:x", "10.0.0.0/8", "any", "x#g1", "x@y"} {
+	for _, s := range []string{"jail:a", "set:a", "tag:x", "10.0.0.0/8", "any", "x#g1", "x@y"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
@@ -367,6 +412,9 @@ func TestQualifiedNameInjective(t *testing.T) {
 		for i, n := 0, r.IntN(6); i < n; i++ {
 			b = append(b, alpha[r.IntN(len(alpha))])
 		}
+		if b[len(b)-1] == '-' { // a name does not end in a hyphen
+			b = append(b, 'x')
+		}
 		return string(b)
 	}
 	seen := map[string][2]string{}
@@ -392,7 +440,7 @@ func TestProjectSpecShape(t *testing.T) {
 		Hosts:    []string{"h1", "h2"},
 		Networks: []api.ProjectNetwork{{Network: "lan"}, {Network: "dmz"}},
 		Storage:  []api.ProjectStorage{{Storage: "*", Quota: "10G"}},
-		Quotas:   api.ProjectQuotas{Jails: 3, Memory: "4G"}, Firewall: "base", Images: []string{"freebsd-15.0"}, NewNetwork: true,
+		Quotas:   api.ProjectQuotas{Jails: 3, Memory: "4G"}, FirewallPolicies: []string{"base"}, Images: []string{"freebsd-15-0"}, NewNetwork: true,
 	}
 	if err := ProjectSpec("web", ok); err != nil {
 		t.Fatal(err)
@@ -409,7 +457,8 @@ func TestProjectSpecShape(t *testing.T) {
 		"host slash":      func(s *api.ProjectSpec) { s.Hosts = []string{"a/b"} },
 		"host empty":      func(s *api.ProjectSpec) { s.Hosts = []string{""} },
 		"dup host":        func(s *api.ProjectSpec) { s.Hosts = []string{"a", "a"} },
-		"firewall inject": func(s *api.ProjectSpec) { s.Firewall = "x; pass" },
+		"firewall inject": func(s *api.ProjectSpec) { s.FirewallPolicies = []string{"x; pass"} },
+		"firewall twice":  func(s *api.ProjectSpec) { s.FirewallPolicies = []string{"x", "x"} },
 	}
 	for name, m := range mut {
 		s := ok
@@ -467,7 +516,7 @@ func TestJailSpecProjectFields(t *testing.T) {
 }
 
 func TestJailDevicesAreValidated(t *testing.T) {
-	ok := api.JailSpec{Image: "fb", Network: []api.NetworkAttach{{Network: "lan", MTU: 1400, Ingress: "10M"}, {Name: "mgmt", Network: "m"}},
+	ok := api.JailSpec{Image: "fb", Network: []api.NetworkAttach{{Network: "lan", MTU: 1400, Egress: "10M"}, {Name: "mgmt", Network: "m"}},
 		Devfs: []api.DevfsDevice{{Name: "t", Device: "tun"}}, Proxy: []api.ProxyDevice{{Name: "p", Listen: ":8080", JailPort: 80}, {Name: "q", Listen: "192.0.2.1:53", JailPort: 53, Proto: "udp"}},
 		Profiles: []string{"base"}}
 	if err := JailSpec("web", ok); err != nil {
@@ -494,6 +543,80 @@ func TestJailDevicesAreValidated(t *testing.T) {
 		mut(&s)
 		if err := JailSpec("web", s); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// A comment on a rule, a policy or a set is one line of at most CommentMax characters.
+func TestFirewallComments(t *testing.T) {
+	rule := api.FirewallRule{Action: "allow", Direction: "in", Proto: "tcp", Ports: []string{"22"}}
+	ok := api.FirewallPolicySpec{Comment: "ssh", DefaultIn: "deny", DefaultOut: "allow", Rules: []api.FirewallRule{{Action: rule.Action, Direction: rule.Direction, Proto: rule.Proto, Ports: rule.Ports, Comment: "from the office"}}}
+	if _, err := FirewallPolicySpec(ok); err != nil {
+		t.Fatal(err)
+	}
+	for name, mod := range map[string]func(p *api.FirewallPolicySpec){
+		"policy two lines": func(p *api.FirewallPolicySpec) { p.Comment = "a\nb" },
+		"policy too long":  func(p *api.FirewallPolicySpec) { p.Comment = strings.Repeat("x", CommentMax+1) },
+		"rule two lines":   func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = "a\rb" },
+		"rule too long":    func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = strings.Repeat("é", CommentMax+1) },
+		// the comment is a comment line of the ruleset: a backslash would continue it onto the next line (the next rule is gone)
+		"policy backslash":    func(p *api.FirewallPolicySpec) { p.Comment = `ends with a backslash\` },
+		"rule quote":          func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = `read file "x"` },
+		"rule bidi override":  func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = "ssh \u202eadmin" },
+		"rule zero width":     func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = "ss\u200bh" },
+		"rule line separator": func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = "a\u2028b" },
+		"rule not UTF-8":      func(p *api.FirewallPolicySpec) { p.Rules[0].Comment = "a\xffb" },
+	} {
+		p := ok
+		p.Rules = append([]api.FirewallRule(nil), ok.Rules...)
+		mod(&p)
+		if _, err := FirewallPolicySpec(p); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	if err := AddressSetSpec(api.AddressSetSpec{Comment: "x\ny", Addresses: api.Entries("10.0.0.1")}); err == nil {
+		t.Error("a set comment of two lines was accepted")
+	}
+	if err := AddressSetSpec(api.AddressSetSpec{Comment: strings.Repeat("x", CommentMax), Addresses: []api.AddressEntry{{Address: "10.0.0.1", Comment: strings.Repeat("y", CommentMax)}}}); err != nil {
+		t.Errorf("comments of exactly %d characters: %v", CommentMax, err)
+	}
+}
+
+// A rule belongs to the jail that has the policy: an inbound rule is to the jail itself and an outbound rule from it, so
+// the other end is the only one a rule names.
+func TestRuleNamesOnlyTheOtherEnd(t *testing.T) {
+	spec := func(r api.FirewallRule) api.FirewallPolicySpec {
+		return api.FirewallPolicySpec{DefaultIn: "deny", DefaultOut: "allow", Rules: []api.FirewallRule{r}}
+	}
+	for name, tc := range map[string]struct {
+		rule api.FirewallRule
+		bad  string
+	}{
+		"inbound from":  {api.FirewallRule{Action: "allow", Direction: "in", Proto: "tcp", From: []string{"192.0.2.7"}, Ports: []string{"5432"}}, ""},
+		"outbound to":   {api.FirewallRule{Action: "allow", Direction: "out", Proto: "tcp", To: []string{"192.0.2.7"}, Ports: []string{"5432"}}, ""},
+		"inbound to":    {api.FirewallRule{Action: "allow", Direction: "in", Proto: "tcp", To: []string{"any"}, Ports: []string{"22"}}, "inbound rule is always to the jail itself"},
+		"outbound from": {api.FirewallRule{Action: "allow", Direction: "out", Proto: "tcp", From: []string{"192.0.2.7"}}, "outbound rule is always from the jail itself"},
+	} {
+		_, err := FirewallPolicySpec(spec(tc.rule))
+		switch {
+		case tc.bad == "" && err != nil:
+			t.Errorf("%s: %v", name, err)
+		case tc.bad != "" && (err == nil || !strings.Contains(err.Error(), tc.bad)):
+			t.Errorf("%s: want an error saying %q, got %v", name, tc.bad, err)
+		}
+	}
+}
+
+func TestParseRate(t *testing.T) {
+	for in, want := range map[string]uint64{"64000": 64000, "500K": 500000, "10M": 10000000, "1G": 1000000000, "10m": 10000000} {
+		got, err := ParseRate(in)
+		if err != nil || got != want {
+			t.Errorf("%q: %d %v, want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "0", "0M", "M", "10 M", "10MB", "10Mbit/s", "-5M", "1.5M", "fast", "1234567890", "10T"} {
+		if _, err := ParseRate(in); err == nil {
+			t.Errorf("%q accepted", in)
 		}
 	}
 }

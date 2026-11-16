@@ -6,7 +6,7 @@ Two things are called provisioning. This page keeps them apart.
 
 [`examples/provisioning`](../examples/provisioning) is a cloud-init-style path in one repeatable script, `bootstrap.sh`: it checks
 FreeBSD 15.1 and the pool, loads the kernel modules, installs the packages, adds the three `pf.conf` anchor lines, turns on
-forwarding, runs `jailops-priv init`, writes what the host operator approves into `priv.conf` (`ndp-proxy`, `admin-host-mount`),
+forwarding, runs the setup, writes what the host operator approves into `priv.conf` (`admin-host-mount`),
 starts the services, requires a clean `jailops doctor`, clones a fleet repository and runs `jailops-sync validate`, `plan` and
 `sync --apply`. It is the sequence of [install.md](install.md) as a script; the README of the example lists every variable.
 

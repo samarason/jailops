@@ -1,6 +1,6 @@
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
 
-/** Human bytes with binary units, one decimal under 100. */
+/** Human bytes with binary units: one decimal under 100, dropped when it is zero ("96 MiB", "2.4 GiB"). */
 export function bytes(n: number | undefined | null): string {
   if (n === undefined || n === null || Number.isNaN(n)) return '-'
   let v = Math.abs(n)
@@ -9,7 +9,7 @@ export function bytes(n: number | undefined | null): string {
     v /= 1024
     i++
   }
-  const s = i === 0 || v >= 100 ? Math.round(v).toString() : v.toFixed(1)
+  const s = i === 0 || v >= 100 ? Math.round(v).toString() : v.toFixed(1).replace(/\.0$/, '')
   return `${n < 0 ? '-' : ''}${s} ${UNITS[i]}`
 }
 
@@ -32,11 +32,37 @@ export function ago(ts: string | undefined, now = Date.now()): string {
   return `${Math.floor(s / 86400)}d ago`
 }
 
-export function stamp(ts: string | undefined): string {
+/** One time format everywhere: ISO date and time in UTC, "2026-11-01 13:16 UTC". The relative form ("3d ago") goes
+ *  in the tooltip (TimeStamp.vue). Seconds only when asked for (logs, audit). */
+export function stamp(ts: string | undefined, seconds = false): string {
   if (!ts || ts.startsWith('0001')) return '-'
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return ts
-  return d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z')
+  return d.toISOString().slice(0, seconds ? 19 : 16).replace('T', ' ') + ' UTC'
+}
+
+/** A date only, "2026-11-01" (UTC). */
+export function day(ts: string | undefined): string {
+  const s = stamp(ts)
+  return s === '-' || !/^\d{4}-/.test(s) ? s : s.slice(0, 10)
+}
+
+/** Snapshot names that carry a time (20261101T131612Z, daily-20261101T131612Z) shown as a date: the name is kept for
+ *  the tooltip. Any other name is returned as it is. */
+export function snapshotLabel(name: string): string {
+  const m = /^(.*?)(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(name)
+  if (!m) return name
+  const at = `${m[2]}-${m[3]}-${m[4]} ${m[5]}:${m[6]} UTC`
+  const head = m[1].replace(/[-_@.]$/, '')
+  return head ? `${head} ${at}` : at
+}
+
+/** Sentence case for status words from the server ("ONLINE", "success", "ok" -> "Online", "Success", "OK"). */
+export function sentence(s: string | undefined | null): string {
+  if (!s) return ''
+  const t = s.replace(/[_-]+/g, ' ').trim()
+  if (/^(ok|ntp|pf|ip|dns|tls|acme|api|cpu|zfs)$/i.test(t)) return t.toUpperCase()
+  return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()
 }
 
 /** Count the addresses of an inclusive "a-b" IPv4 or IPv6 range; 0 if malformed. */
@@ -69,6 +95,7 @@ export function parseSize(s: string | undefined): number | null {
   return Math.round(parseFloat(m[1]) * 1024 ** mul)
 }
 
+/** "1 jail", "3 jails", "1 check", "0 warnings". */
 export function plural(n: number, one: string, many = one + 's'): string {
   return `${n} ${n === 1 ? one : many}`
 }

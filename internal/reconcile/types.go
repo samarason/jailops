@@ -26,6 +26,16 @@ type Desired struct {
 	WireGuard []WireGuardDesired
 	// Host is the kernel state JailOps manages: modules, then sysctls.
 	Host HostDesired
+	// Pipes are the dummynet pipes of the bandwidth limits that jails have: the loop configures them before it loads
+	// the anchors that send traffic into them, and deletes the pipes of JailOps's range that nobody wants.
+	Pipes []PipeDesired
+}
+
+// PipeDesired is one dummynet pipe: its number (in JailOps's range, render.PipeBase) and its bandwidth in bits per
+// second, 0 for unlimited.
+type PipeDesired struct {
+	Number int
+	Rate   uint64
 }
 
 // HostDesired is the kernel state the loop asserts before it touches
@@ -45,10 +55,9 @@ type HostDesired struct {
 
 // NetworkDesired is one managed network.
 type NetworkDesired struct {
-	Name   string
-	ID     string
-	Bridge string
-	Spec   api.NetworkSpec
+	Name string
+	ID   string
+	Spec api.NetworkSpec
 	// Steps is render.NetworkPlan for the network.
 	Steps []render.Step
 	// Anchors maps an anchor name used by Steps (OpLoadAnchor) to its ruleset.
@@ -72,8 +81,8 @@ type JailDesired struct {
 	// Attach holds, per network attachment, the host-phase steps of
 	// render.AttachPlan.
 	Attach [][]render.Step
-	// Bridges is the bridge of each attachment.
-	Bridges []string
+	// Networks is the network of each attachment.
+	Networks []string
 	// Epairs are the host-side interface names the jail should have while it runs.
 	Epairs []string
 	// JailSide are the jail-phase description steps of the jail ends of the epairs: what ifconfig shows inside the
@@ -83,6 +92,9 @@ type JailDesired struct {
 	// when the jail has no firewall.
 	AnchorName string
 	Ruleset    string
+	// Anchor is the structured form of Ruleset, made by the same code: the rules in the order they are loaded, each
+	// with what it matches. The firewall test walks it. It is nil when Ruleset is empty.
+	Anchor *render.Anchor
 	// ParentAnchors maps the parent anchors of AnchorName ("jailops/<project>")
 	// to the ruleset that makes them evaluate their children.
 	// UNVERIFIED: nested anchors on FreeBSD.
@@ -110,8 +122,9 @@ type WireGuardDesired struct {
 
 // ProxyAddr is one address of an IPv6 proxy mode network.
 type ProxyAddr struct {
-	Addr   string
-	Bridge string
+	Addr string
+	// Iface is the host end of the jail's epair: the interface the host route of the address leaves through.
+	Iface  string
 	Uplink string
 }
 
@@ -168,11 +181,13 @@ type NDPFactory func(uplink string) (NDP, error)
 
 // Condition types reported by the loop.
 const (
-	CondReady   = "Ready"
-	CondDrift   = "InSync"
-	CondBoot    = "Autostart"
-	CondProxy   = "NDPProxy"
-	CondNetwork = "Network"
+	CondReady = "Ready"
+	CondDrift = "InSync"
+	CondBoot  = "Autostart"
+	CondProxy = "NDPProxy"
+	// CondProxyFlood is False while the proxy dropped solicitations over its limits in the last hour.
+	CondProxyFlood = "NDPFlood"
+	CondNetwork    = "Network"
 )
 
 func cond(t string, ok bool, reason, msg string, now time.Time) api.Condition {

@@ -107,7 +107,7 @@ func FuzzCheckCommand(f *testing.F) {
 	f.Add("sh\x00-c\x00id")
 	f.Add("sysctl\x00-n\x00net.inet.ip.forwarding")
 	f.Add("sysctl\x00net.inet.ip.forwarding=1")
-	f.Add("kldload\x00if_bridge")
+	f.Add("kldload\x00if_epair")
 	f.Add("kldstat\x00-n\x00pf")
 	f.Add("pfctl\x00-a\x00jailops/web/x\x00-s\x00rules")
 	f.Add("uname\x00-r")
@@ -174,7 +174,7 @@ func FuzzJailConf(f *testing.F) {
 		// accepted text has no variable expansion other than the hooks and
 		// no command separators outside quoted hook lines
 		for _, l := range strings.Split(s, "\n") {
-			if strings.Contains(l, "${") && !strings.Contains(l, "hook ") && strings.TrimLeft(l, "\t") != `exec.consolelog = "/var/log/jail_${name}_console.log";` {
+			if strings.Contains(l, "${") && !strings.Contains(l, "hook ") && strings.TrimLeft(l, "\t") != `exec.consolelog = "/var/log/jailops/jail_${name}_console.log";` {
 				t.Fatalf("accepted a variable: %q", l)
 			}
 		}

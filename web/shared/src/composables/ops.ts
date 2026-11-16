@@ -21,9 +21,37 @@ let seq = 0
 
 export const POLL_MS = { value: 150 }
 
+/** How long a finished toast stays: long enough to read a failure, short enough not to pile up over the page. */
+export const TOAST_MS = { success: 5000, cancelled: 5000, failure: 15000 }
+
+const timers = new Map<number, { left: number; started: number; handle?: ReturnType<typeof setTimeout> }>()
+
 export function dismiss(id: number): void {
+  const tm = timers.get(id)
+  if (tm?.handle) clearTimeout(tm.handle)
+  timers.delete(id)
   const i = toasts.findIndex((t) => t.id === id)
   if (i >= 0) toasts.splice(i, 1)
+}
+
+function arm(id: number, ms: number): void {
+  const tm = { left: ms, started: Date.now(), handle: setTimeout(() => dismiss(id), ms) as ReturnType<typeof setTimeout> | undefined }
+  timers.set(id, tm)
+}
+
+/** Hover or keyboard focus holds a toast; leaving it gives back the time that was left. */
+export function holdToast(id: number): void {
+  const tm = timers.get(id)
+  if (!tm?.handle) return
+  clearTimeout(tm.handle)
+  tm.handle = undefined
+  tm.left = Math.max(1000, tm.left - (Date.now() - tm.started))
+}
+export function releaseToast(id: number): void {
+  const tm = timers.get(id)
+  if (!tm || tm.handle) return
+  tm.started = Date.now()
+  tm.handle = setTimeout(() => dismiss(id), tm.left)
 }
 
 function errorOf(e: unknown): Toast['error'] {
@@ -34,8 +62,8 @@ function errorOf(e: unknown): Toast['error'] {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /**
- * Run a mutating request through the async operation flow. A toast shows progress. On failure
- * the toast stays until dismissed and carries the api.Error code, message and hint. The promise
+ * Run a mutating request through the async operation flow. A toast shows progress. A failure toast carries the
+ * api.Error code, message and hint and stays 15 seconds (5 for success), longer while pointed at or focused. The promise
  * resolves with the finished operation (or null for a sync reply) and rejects with the ApiError,
  * so a dialog can show the same error inline.
  */
@@ -76,12 +104,13 @@ export async function runOp<T = unknown>(title: string, start: () => Promise<Mut
     const err = op.error ?? { code: 'internal', message: 'The operation failed.' }
     t.status = 'failure'
     t.error = err
-    dataVersion.value++
+    finish(t)
     throw new ApiError(err, 0)
   } catch (e) {
     if (t.status !== 'failure') {
       t.status = 'failure'
       t.error = errorOf(e)
+      arm(t.id, TOAST_MS.failure)
     }
     throw e
   }
@@ -89,8 +118,7 @@ export async function runOp<T = unknown>(title: string, start: () => Promise<Mut
 
 function finish(t: Toast): void {
   dataVersion.value++
-  // Successful toasts fade on their own; failures wait for the operator.
-  setTimeout(() => dismiss(t.id), t.status === 'success' ? 4000 : 6000)
+  arm(t.id, t.status === 'failure' ? TOAST_MS.failure : TOAST_MS.success)
 }
 
 export async function cancelToast(t: Toast): Promise<void> {

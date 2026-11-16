@@ -220,8 +220,10 @@ func (s *Server) validateProject(p, old *api.Project) *api.Error {
 	if _, ok := parseSize(q.Memory); !ok {
 		return api.Errorf(api.CodeInvalid, "invalid memory quota %q", q.Memory)
 	}
-	if p.Spec.Firewall != "" && s.policies.items[name+"/"+p.Spec.Firewall] == nil {
-		return api.Errorf(api.CodeInvalid, "firewall policy %q does not exist in project %q", p.Spec.Firewall, name)
+	for _, pn := range p.Spec.FirewallPolicies {
+		if s.policies.items[name+"/"+pn] == nil {
+			return api.Errorf(api.CodeInvalid, "firewall policy %q does not exist in project %q", pn, name)
+		}
 	}
 	return nil
 }
@@ -251,8 +253,7 @@ func (s *Server) newNetworkFor(project string) (string, *api.Error) {
 			continue
 		}
 		n := &api.Network{Metadata: api.ObjectMeta{Name: project}, Spec: api.NetworkSpec{
-			Bridge: "jo" + strconv.Itoa(len(s.networks.items)),
-			IPv4:   &api.IPv4Net{Subnet: sub, Gateway: fmt.Sprintf("10.64.%d.1", i), Range: fmt.Sprintf("10.64.%d.10-10.64.%d.250", i, i)}}}
+			IPv4: &api.IPv4Net{Subnet: sub, Gateway: fmt.Sprintf("10.64.%d.1", i), Range: fmt.Sprintf("10.64.%d.10-10.64.%d.250", i, i)}}}
 		s.networks.insert(n, false)
 		return project, nil
 	}
@@ -476,7 +477,7 @@ func (s *Server) setupAccess() {
 		if verb == "create" || rc.id.Global {
 			return nil
 		}
-		if p := s.project(pol.Metadata.Project); p != nil && p.Spec.Firewall == pol.Metadata.Name {
+		if p := s.project(pol.Metadata.Project); p != nil && slices.Contains(p.Spec.FirewallPolicies, pol.Metadata.Name) {
 			return api.Errorf(api.CodeForbidden, "the mandatory firewall policy of project %q can only be changed by a global admin", p.Metadata.Name)
 		}
 		return nil

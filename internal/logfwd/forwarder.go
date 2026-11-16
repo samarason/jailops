@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"log/slog"
 	"maps"
 	"net"
+	"net/netip"
 	"path"
 	"reflect"
 	"slices"
@@ -65,13 +67,23 @@ type Env struct {
 	AuditAfter func(ctx context.Context, after int64, limit int) ([]AuditRecord, error)
 	AuditLast  func(ctx context.Context) (int64, error)
 	Offsets    Offsets
-	// Dial opens connections (net.Dialer by default).
+	// Dial opens connections. The default dialer refuses, for a sink set through the API, a resolved address that
+	// CheckTarget refuses; a replacement (tests) does what it does.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	// CheckFile checks a CA or token file (CheckFile by default).
+	// CheckFile replaces the owner and mode check of a CA or token file (tests: their files are not root's). By
+	// default the open descriptor is checked; either way the file is opened without following a symlink.
 	CheckFile func(path string, secret bool) error
-	Clock     Clock
-	Jitter    func() float64
-	Log       *slog.Logger
+	// SecretsDir is logging.secrets_dir: the only directory the files of an API sink may lie in.
+	SecretsDir string
+	// CheckDir checks SecretsDir (CheckSecretsDir by default).
+	CheckDir func(dir string) error
+	// OwnPorts are the ports this daemon listens on: an API sink may not send to them on an address of the host.
+	OwnPorts func() []int
+	// TargetCheck replaces the check of an API sink's destination (tests).
+	TargetCheck func(netip.AddrPort) error
+	Clock       Clock
+	Jitter      func() float64
+	Log         *slog.Logger
 	// Poll is how often files are read (default 2s); Refresh how often the
 	// jail list is read again (default 30s).
 	Poll    time.Duration
@@ -82,11 +94,10 @@ type Env struct {
 
 func (e *Env) defaults() {
 	if e.Dial == nil {
-		var d net.Dialer
-		e.Dial = d.DialContext
+		e.Dial = e.guardedDialer()
 	}
-	if e.CheckFile == nil {
-		e.CheckFile = CheckFile
+	if e.CheckDir == nil {
+		e.CheckDir = CheckSecretsDir
 	}
 	if e.Clock == nil {
 		e.Clock = realClock{}
@@ -117,6 +128,7 @@ type Forwarder struct {
 	sinks   map[string]*sink
 	order   []string
 	pending []api.LogSink
+	fromAPI bool // the pending list was set through the API
 	wg      sync.WaitGroup
 }
 
@@ -130,20 +142,26 @@ func New(env Env) *Forwarder {
 func (f *Forwarder) Start(ctx context.Context) {
 	f.mu.Lock()
 	f.ctx = ctx
-	list := f.pending
+	list, fromAPI := f.pending, f.fromAPI
 	f.mu.Unlock()
-	f.Apply(list)
+	f.ApplyFrom(list, fromAPI)
 }
+
+// Env is the forwarder's environment, with its defaults.
+func (f *Forwarder) Env() *Env { return f.env }
 
 // Wait returns when every sink loop has saved its offsets and ended.
 func (f *Forwarder) Wait() { f.wg.Wait() }
 
-// Apply replaces the sink list: a sink whose configuration changed starts
-// over from its saved offsets; a removed sink's offsets are deleted.
-func (f *Forwarder) Apply(list []api.LogSink) {
+// Apply replaces the sink list with the list of jailopsd.yaml.
+func (f *Forwarder) Apply(list []api.LogSink) { f.ApplyFrom(list, false) }
+
+// ApplyFrom replaces the sink list: a sink whose configuration or origin changed starts over from its saved
+// offsets; a removed sink's offsets are deleted. fromAPI restricts the sinks (see CheckTarget and SecretsDir).
+func (f *Forwarder) ApplyFrom(list []api.LogSink, fromAPI bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.pending = slices.Clone(list)
+	f.pending, f.fromAPI = slices.Clone(list), fromAPI
 	if f.ctx == nil {
 		return
 	}
@@ -155,7 +173,7 @@ func (f *Forwarder) Apply(list []api.LogSink) {
 	}
 	for name, s := range f.sinks {
 		k, keep := want[name]
-		if keep && reflect.DeepEqual(k, s.cfg) {
+		if keep && reflect.DeepEqual(k, s.cfg) && s.api == fromAPI {
 			continue
 		}
 		s.stop()
@@ -169,6 +187,7 @@ func (f *Forwarder) Apply(list []api.LogSink) {
 			continue
 		}
 		s := newSink(k, f.env)
+		s.api = fromAPI
 		f.sinks[k.Name] = s
 		ctx, cancel := context.WithCancel(f.ctx)
 		s.cancel = cancel
@@ -202,13 +221,14 @@ func TestLine(id, host string) string {
 }
 
 // Test sends one tagged line to k with a sender of its own, beside the
-// running loop, and reports how it went.
-func (f *Forwarder) Test(ctx context.Context, k api.LogSink) api.LogForwardTestResult {
+// running loop, and reports how it went: an error is a short fixed class
+// (Classify), never what the receiver answered.
+func (f *Forwarder) Test(ctx context.Context, k api.LogSink, fromAPI bool) api.LogForwardTestResult {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	start := f.env.Clock.Now()
 	res := api.LogForwardTestResult{Sink: k.Name, Line: TestLine(hex.EncodeToString(b[:]), f.env.Hostname)}
-	snd, err := newSender(k, f.env)
+	snd, err := newSender(k, f.env, fromAPI)
 	if err == nil {
 		ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 		err = snd.send(ctx, []Entry{{Time: start, File: "test", Line: res.Line}})
@@ -217,7 +237,7 @@ func (f *Forwarder) Test(ctx context.Context, k api.LogSink) api.LogForwardTestR
 	}
 	res.Millis = f.env.Clock.Now().Sub(start).Milliseconds()
 	if err != nil {
-		res.Error = err.Error()
+		res.Error = Classify(err)
 		return res
 	}
 	res.OK = true
@@ -234,6 +254,7 @@ type source struct {
 // but the fields under mu, which Status reads.
 type sink struct {
 	cfg    api.LogSink
+	api    bool // set through the API: restricted
 	env    *Env
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -293,6 +314,11 @@ func (s *sink) run(ctx context.Context) {
 			s.snd.close()
 		}
 	}()
+	// a panic in a cycle is a restart of the loop (the state of the sink is in its fields), not the end of the daemon
+	supervise.Run(ctx, s.env.Log, "log-forward", s.loop)
+}
+
+func (s *sink) loop(ctx context.Context) {
 	for {
 		s.cycle(ctx)
 		select {
@@ -424,6 +450,18 @@ func (s *sink) refresh(ctx context.Context) {
 		}
 	}
 	s.srcs = srcs
+	// a source that is gone (a deleted jail) leaves the tables once nothing of it is queued
+	live := make(map[string]bool, len(srcs))
+	for _, src := range srcs {
+		live[src.key] = true
+	}
+	for k := range s.read {
+		if !live[k] && s.pending[k] == 0 {
+			delete(s.read, k)
+			delete(s.acked, k)
+			delete(s.pending, k)
+		}
+	}
 	s.mu.Lock()
 	s.nSources, s.overLimit = len(srcs), over
 	s.mu.Unlock()
@@ -553,7 +591,7 @@ func (s *sink) sendSome(ctx context.Context) {
 			return
 		}
 		if s.snd == nil {
-			snd, err := newSender(s.cfg, s.env)
+			snd, err := newSender(s.cfg, s.env, s.api)
 			if err != nil {
 				s.fail(err)
 				return

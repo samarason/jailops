@@ -12,6 +12,7 @@ Jail web
 
 Resources
   Limits:       cpu 2, memory 2G
+  Firewall:     open: no firewall policy (the host answers ping and DNS only)
   Usage:        - (racct is off: set kern.racct.enable=1 in /boot/loader.conf and reboot)
   Disk:         not available: cannot open 'tank/jailops/projects/main/jails/web': dataset does not exist
 
@@ -90,7 +91,7 @@ $ jailops jail info db -o json
   ],
   "volumes": [
     {
-      "name": "data",
+      "volume": "data",
       "mount": "/var/db"
     }
   ],

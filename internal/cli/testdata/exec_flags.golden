@@ -1,0 +1,22 @@
+$ jailops exec web --project shop -- echo -n x
+-n x
+
+$ jailops exec --project shop web -- echo id
+id
+
+$ jailops jail exec web -T --project shop -- echo -T is the command's
+-T is the command's
+
+$ jailops exec web --project shop echo
+! usage: "--project" after the jail name would be the command: a command does not start with "-"
+! hint: put flags before the jail name, or end them with --: jailops exec web --project ... -- COMMAND
+[exit 2]
+
+$ jailops exec web echo -l --project shop --
+! usage: unknown shorthand flag: 'l' in -l
+! hint: run 'jailops exec --help' for usage
+[exit 2]
+
+$ jailops --project shop exec web echo -l
+-l
+

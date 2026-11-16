@@ -3,12 +3,12 @@ kind: Project
 metadata:
   name: intra
 spec:
-  description: Internal tools. Nothing in this project is reachable from the internet.
+  comment: Internal tools. Nothing in this project is reachable from the internet.
   hosts: [cloud1]
   networks:
     - {network: intra}
   storage:
     - {storage: default, quota: 100G}
   quotas: {jails: 10, memory: 8G, addresses: 50}
-  firewall: floor
+  firewall_policies: [floor]
   images: [freebsd-15]

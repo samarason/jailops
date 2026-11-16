@@ -51,8 +51,9 @@ func (l *lockSet) tryLock(holder string, keys ...string) (func(), error) {
 // reconcileWait is how long an operation a person asked for waits for the background reconcile of a resource.
 const reconcileWait = 20 * time.Second
 
-// lockPatient is tryLock for an operation a caller asked for: when the only thing in the way is a reconcile pass
-// (the daemon's own background work, over in moments), it waits for it instead of answering "busy".
+// lockPatient is tryLock for an operation a caller asked for: when the only thing in the way is a reconcile pass or
+// the preparation of the same network by another jail's start (the daemon's own short work, over in moments), it waits
+// for it instead of answering "busy": several jails of one network can be started at once.
 func (l *lockSet) lockPatient(ctx context.Context, holder string, keys ...string) (func(), error) {
 	deadline := time.Now().Add(reconcileWait)
 	for {
@@ -68,12 +69,12 @@ func (l *lockSet) lockPatient(ctx context.Context, holder string, keys ...string
 	}
 }
 
-// onlyReconcile reports whether every held key among keys is held by a reconcile pass.
+// onlyReconcile reports whether every held key among keys is held by a reconcile pass or a network preparation.
 func (l *lockSet) onlyReconcile(keys []string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, k := range keys {
-		if h, ok := l.held[k]; ok && !strings.HasPrefix(h, "reconcile") {
+		if h, ok := l.held[k]; ok && !strings.HasPrefix(h, "reconcile") && !strings.HasPrefix(h, "prepare network ") {
 			return false
 		}
 	}
@@ -92,3 +93,6 @@ func jailLock(n string) string    { return "jail/" + n }
 func networkLock(n string) string { return "network/" + n }
 func imageLock(n string) string   { return "image/" + n }
 func anchorLock(n string) string  { return "anchor/" + n }
+
+// volumeLock is the lock of a volume of a project.
+func volumeLock(project, name string) string { return "volume/" + project + "/" + name }

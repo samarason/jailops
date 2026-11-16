@@ -31,10 +31,10 @@ func (h *fakeHost) NDPAnswer(_ context.Context, q priv.NDPAnswerReq) error {
 }
 
 func TestTheHelperRefusalReachesTheNetworkStatus(t *testing.T) {
-	h := &fakeHost{openErr: api.Errorf(api.CodeForbidden, "the IPv6 proxy is not approved for \"vtnet0\": add the line `ndp-proxy = vtnet0=<prefix>` to priv.conf")}
+	h := &fakeHost{openErr: api.Errorf(api.CodeForbidden, "prefix 2001:db8::/32 must be between /48 and /120")}
 	_, err := newHelperNDP(h, nil, "vtnet0", nil)
-	if !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), "ndp-proxy = vtnet0=") {
-		t.Fatalf("the operator is not told what to add: %v", err)
+	if !api.IsCode(err, api.CodeForbidden) || !strings.Contains(err.Error(), "must be between /48 and /120") {
+		t.Fatalf("the refusal is lost: %v", err)
 	}
 }
 

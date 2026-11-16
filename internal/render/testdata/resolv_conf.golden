@@ -1,4 +1,4 @@
-# Managed by JailOps. Do not edit; changes are overwritten.
+# written by JailOps. Remove this line to keep your own changes: JailOps rewrites the file only while it is here.
 search example.org
 nameserver 9.9.9.9
 nameserver 2620:fe::fe

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -49,7 +50,7 @@ func (d *Daemon) serve(ln net.Listener, name string, _ *tls.Config) {
 		Handler:           d.srv.Handler(),
 		ConnContext:       d.srv.ConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       2 * time.Minute,
+		ReadTimeout:       cmp.Or(d.opts.ReadTimeout, 2*time.Minute),
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(d.log.Handler(), slog.LevelWarn),

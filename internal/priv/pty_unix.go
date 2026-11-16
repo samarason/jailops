@@ -12,6 +12,9 @@ import (
 // openPTY allocates a pseudo-terminal pair: it opens /dev/ptmx (what
 // posix_openpt does), unlocks and "grants" the slave, finds its name and opens
 // it. (FreeBSD has its own in pty_freebsd.go.)
+// fionread is FIONREAD: the bytes waiting to be read.
+const fionread = 0x541b
+
 func openPTY() (master, slave *os.File, err error) {
 	master, err = os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {

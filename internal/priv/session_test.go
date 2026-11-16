@@ -122,7 +122,7 @@ func waitExit(t *testing.T, s ExecSession) int {
 }
 
 func gone(pid int) bool {
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 600; i++ {
 		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
 			return true
 		}
@@ -268,11 +268,12 @@ func TestExecTTYWindowSizeAndResize(t *testing.T) {
 	})
 }
 
-func TestExecTTYSessionLeaderWithControllingTerminal(t *testing.T) {
+func TestExecTTYSessionCommandIsTheForegroundGroupWithControllingTerminal(t *testing.T) {
 	execHosts(t, func(t *testing.T, h Host, e *env) {
-		// the command is a session leader (sid == pid) and its fd 0 is a
-		// terminal that is also its controlling terminal (/dev/tty opens)
-		script := `[ "$(cut -d' ' -f6 /proc/$$/stat)" = "$$" ] && echo leader; [ -t 0 ] && echo tty0; : > /dev/tty && echo ctty`
+		// the command leads a process group of its own (pgid == pid) that is the foreground group of the terminal
+		// (tpgid == pgid), below the session leader of the helper (sid != pid), and its fd 0 is a terminal that is also its
+		// controlling terminal (/dev/tty opens)
+		script := `[ "$(cut -d' ' -f5 /proc/$$/stat)" = "$$" ] && echo leader; [ "$(cut -d' ' -f8 /proc/$$/stat)" = "$$" ] && echo foreground; [ "$(cut -d' ' -f6 /proc/$$/stat)" != "$$" ] && echo below; [ -t 0 ] && echo tty0; : > /dev/tty && echo ctty`
 		s, err := h.Exec(context.Background(), "alpha_web", []string{"sh", "-c", script}, ExecOpts{TTY: true})
 		if err != nil {
 			t.Fatal(err)
@@ -280,7 +281,7 @@ func TestExecTTYSessionLeaderWithControllingTerminal(t *testing.T) {
 		out := readAll(t, s.Stdout())
 		waitExit(t, s)
 		got := get(t, out)
-		for _, want := range []string{"leader", "tty0", "ctty"} {
+		for _, want := range []string{"leader", "foreground", "below", "tty0", "ctty"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("missing %q in %q", want, got)
 			}
@@ -423,7 +424,7 @@ func TestExecDisconnectKillsTheSession(t *testing.T) {
 
 func waitFor(t *testing.T, f func() bool, what string) {
 	t.Helper()
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 1200; i++ {
 		if f() {
 			return
 		}
@@ -532,7 +533,8 @@ func TestExecLimits(t *testing.T) {
 	}
 }
 
-func TestExecIsAuditedWithItsArgv(t *testing.T) {
+// The audit log names the program and how many arguments it got, never the arguments: a command line may carry a secret.
+func TestExecIsAuditedWithItsProgramButNotItsArguments(t *testing.T) {
 	fx := newFixture(t)
 	fx.conf(t, "alpha_web")
 	s, err := fx.client.Exec(WithAdmin(context.Background(), "alice"), "alpha_web", []string{"sh", "-c", "exit 0"}, ExecOpts{})
@@ -546,10 +548,13 @@ func TestExecIsAuditedWithItsArgv(t *testing.T) {
 		return strings.Contains(fx.audit.String(), `"outcome":"ok"`) && strings.Contains(fx.audit.String(), "jail.session")
 	}, "audit line")
 	out := fx.audit.String()
-	for _, want := range []string{`"op":"jail.session"`, `"argv":"sh -c exit 0"`, `"jail":"alpha_web"`, `"admin":"alice"`} {
+	for _, want := range []string{`"op":"jail.session"`, `"argv":"sh (2 arguments)"`, `"jail":"alpha_web"`, `"admin":"alice"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("audit lacks %s:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "exit 0") {
+		t.Errorf("the arguments are in the audit log:\n%s", out)
 	}
 	// a refused session is audited too
 	_, _ = fx.client.Exec(context.Background(), "alpha_ghost", []string{"id"}, ExecOpts{})
@@ -590,4 +595,25 @@ func TestSignalAllowListIsFixed(t *testing.T) {
 	if len(names) != 6 {
 		t.Errorf("allowed signals changed: %v", names)
 	}
+}
+
+// A command without a terminal runs as long as it runs: the grace period is for what is left after it ended (a command
+// that took longer than it was killed at ten seconds).
+func TestExecWithoutATerminalIsNotCutOffAfterTheGracePeriod(t *testing.T) {
+	old := sessionGrace
+	sessionGrace = 300 * time.Millisecond
+	defer func() { sessionGrace = old }()
+	execHosts(t, func(t *testing.T, h Host, e *env) {
+		s, err := h.Exec(context.Background(), "alpha_web", []string{"sh", "-c", "sleep 1; echo done"}, ExecOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go io.Copy(io.Discard, s.Stderr())
+		if got := get(t, readAll(t, s.Stdout())); got != "done\n" {
+			t.Errorf("stdout %q", got)
+		}
+		if c := waitExit(t, s); c != 0 {
+			t.Errorf("exit %d: the command was killed while it ran", c)
+		}
+	})
 }

@@ -1,4 +1,4 @@
-$ jailops trust add --name laptop --permission operator --projects main -o json
+$ jailops cert enroll laptop --role operator --projects main -o json
 {
   "name": "laptop",
   "token": "<trust-token>",
@@ -7,7 +7,7 @@ $ jailops trust add --name laptop --permission operator --projects main -o json
 ! warning: this trust token is shown only once and works only once; hand it to the new client now.
 ! trust for laptop (operator, main) can be claimed until 2026-03-01 10:00:00 UTC
 
-$ jailops trust add --name old --role admin --global -o json
+$ jailops cert enroll old --role admin --global -o json
 {
   "name": "old",
   "token": "<trust-token>",
@@ -16,7 +16,7 @@ $ jailops trust add --name old --role admin --global -o json
 ! warning: this trust token is shown only once and works only once; hand it to the new client now.
 ! trust for old (admin, global) can be claimed until 2026-03-01 10:00:00 UTC
 
-$ jailops remote create lab unix:/run/lab.sock
+$ jailops remote add lab unix:/run/lab.sock
 remote/lab added
 ! warning: saved, but the server could not be reached: Get "http://jailops.local/api/v1": dial unix /run/lab.sock: connect: no such file or directory
 

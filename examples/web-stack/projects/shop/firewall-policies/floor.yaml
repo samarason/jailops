@@ -3,5 +3,6 @@ kind: FirewallPolicy
 metadata:
   name: floor
 spec:
+  comment: "The floor of the project shop; every jail starts closed, and its own policy opens what it needs."
   default_in: deny
   default_out: allow

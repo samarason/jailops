@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"jailops.net/jailops/internal/supervise"
 	"net"
 	"net/http"
 	"strings"
@@ -34,8 +35,9 @@ func (s *Server) handleExec(c *rc) error {
 		return err
 	}
 	defer st.Release()
-	// Every exec is audited with its argument vector, when it starts and when it ends.
-	argv := fmt.Sprintf("%q", st.Argv)
+	// Every exec is audited with its argument vector, when it starts and when it ends. Long arguments (a script passed on
+	// the command line, a pasted secret) are cut: the entry says what was run, not everything that was typed.
+	argv := fmt.Sprintf("%q", auditArgv(st.Argv))
 	c.detail = "exec argv=" + argv
 	s.svc.Audit(context.WithoutCancel(c.r.Context()), storeEntry(c, "EXEC", st.Project, "start argv="+argv+fmt.Sprintf(" tty=%v", req.TTY)))
 	conn, brw, err := http.NewResponseController(c.w).Hijack()
@@ -50,7 +52,7 @@ func (s *Server) handleExec(c *rc) error {
 		_ = st.Session.Signal(9)
 		return nil
 	}
-	code := s.pump(conn, brw.Reader, st, s.svc.ExecLimitsOf())
+	code := s.pump(conn, brw.Reader, st, s.svc.ExecLimitsOf(), func() bool { return s.stillAuthorized(c) })
 	c.detail += fmt.Sprintf(" exit=%d", code)
 	return nil
 }
@@ -68,8 +70,9 @@ func headerHasToken(h http.Header, key, token string) bool {
 
 // pump moves frames between the connection and the session until the command
 // ends, the client goes away, the stream idles or the session lives too long.
-// It returns the exit status (-1 when the session was cut off).
-func (s *Server) pump(conn net.Conn, rd *bufio.Reader, st *service.ExecStart, lim service.ExecLimits) int {
+// It returns the exit status (-1 when the session was cut off). still is asked at every keepalive tick whether the
+// caller's credential still holds; a revoked one ends the session.
+func (s *Server) pump(conn net.Conn, rd *bufio.Reader, st *service.ExecStart, lim service.ExecLimits, still func() bool) int {
 	sess := st.Session
 	var wmu sync.Mutex
 	write := func(t api.FrameType, p []byte) error {
@@ -94,8 +97,11 @@ func (s *Server) pump(conn net.Conn, rd *bufio.Reader, st *service.ExecStart, li
 	maxT := time.AfterFunc(lim.Max, func() { kill("the session reached its maximum duration") })
 	defer maxT.Stop()
 	go func() {
+		defer func() { supervise.Report(nil, "exec-session", recover()) }()
 		t := time.NewTicker(lim.Idle/4 + time.Millisecond)
 		defer t.Stop()
+		ka := time.NewTicker(s.cfg.KeepAlive)
+		defer ka.Stop()
 		for {
 			select {
 			case <-done:
@@ -105,12 +111,19 @@ func (s *Server) pump(conn net.Conn, rd *bufio.Reader, st *service.ExecStart, li
 					kill("the session was idle too long")
 					return
 				}
+			case <-ka.C:
+				if still != nil && !still() {
+					kill("the credential of this session was revoked")
+					return
+				}
 			}
 		}
 	}()
 	// Client to command.
+	in := newStdinPump(sess.Stdin())
 	go func() {
-		defer func() { _ = sess.Stdin().Close() }()
+		defer func() { supervise.Report(nil, "exec-session", recover()) }()
+		defer in.stop()
 		for {
 			t, p, err := api.ReadFrame(rd)
 			if err != nil {
@@ -121,11 +134,12 @@ func (s *Server) pump(conn net.Conn, rd *bufio.Reader, st *service.ExecStart, li
 			switch t {
 			case api.FrameStdin:
 				if len(p) == 0 {
-					_ = sess.Stdin().Close()
+					in.closeInput()
 					continue
 				}
-				if _, err := sess.Stdin().Write(p); err != nil {
-					continue // the command no longer reads
+				if !in.push(p) {
+					kill("the command did not read its input")
+					return
 				}
 			case api.FrameResize:
 				if r, c, err := api.ParseResize(p); err == nil {
@@ -180,4 +194,19 @@ func (s *Server) pump(conn net.Conn, rd *bufio.Reader, st *service.ExecStart, li
 	}
 	_ = write(api.FrameExit, api.Int32Payload(int32(code)))
 	return code
+}
+
+// auditArgvMax is how many bytes of one argument an audit entry keeps.
+const auditArgvMax = 200
+
+// auditArgv is the argument vector of an exec as the audit log keeps it: each argument cut to auditArgvMax bytes.
+func auditArgv(argv []string) []string {
+	out := make([]string, len(argv))
+	for i, a := range argv {
+		if len(a) > auditArgvMax {
+			a = a[:auditArgvMax] + fmt.Sprintf("...(%d bytes more)", len(a)-auditArgvMax)
+		}
+		out[i] = a
+	}
+	return out
 }

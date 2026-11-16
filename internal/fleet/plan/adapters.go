@@ -156,6 +156,28 @@ func init() {
 		},
 		resCreate(sets), resDelete(sets)))
 
+	// A volume is made without a passphrase here: a file cannot carry one (check refuses encrypted volumes).
+	reg(build(info(api.KindVolume),
+		func(c *sdk.Client) resource[api.Volume] { return volRes{c.Volumes()} },
+		func(v *api.Volume) *api.ObjectMeta { return &v.Metadata }, func(v *api.Volume) any { return v.Spec },
+		func(m api.ObjectMeta, s any) api.Volume { return api.Volume{Metadata: m, Spec: s.(api.VolumeSpec)} },
+		func(ctx context.Context, c *sdk.Client, v api.Volume) error {
+			op, err := c.Volumes().Create(ctx, v, "")
+			if err != nil {
+				return err
+			}
+			_, err = op.Wait(ctx)
+			return err
+		},
+		func(ctx context.Context, c *sdk.Client, name string) error {
+			op, err := c.Volumes().Delete(ctx, name)
+			if err != nil {
+				return err
+			}
+			_, err = op.Wait(ctx)
+			return err
+		}))
+
 	targets := func(c *sdk.Client) *sdk.Resource[api.BackupTarget] { return c.Backups().Targets() }
 	stor := func(c *sdk.Client) *sdk.Resource[api.Storage] { return c.Storage() }
 	reg(build(info(api.KindStorage), asRes(stor),
@@ -204,6 +226,21 @@ func init() {
 			_, err = op.Wait(ctx)
 			return err
 		}))
+}
+
+type volRes struct{ v *sdk.VolumeClient }
+
+func (r volRes) List(ctx context.Context, opts ...sdk.ListOption) iter.Seq2[api.Volume, error] {
+	return r.v.List(ctx, opts...)
+}
+func (r volRes) GetETag(ctx context.Context, n string) (api.Volume, string, error) {
+	return r.v.GetETag(ctx, n)
+}
+func (r volRes) Update(ctx context.Context, n string, v api.Volume, etag string) (api.Volume, error) {
+	return r.v.Update(ctx, n, v, etag)
+}
+func (r volRes) Patch(ctx context.Context, n string, p any, etag string) (api.Volume, error) {
+	return r.v.Patch(ctx, n, p, etag)
 }
 
 type jailRes struct{ j *sdk.JailClient }

@@ -12,8 +12,8 @@ Rolling back data of jail web to snapshot good (taken 3h ago).
 1.5 MiB written since then would be discarded.
 ! This destroys 1.5 MiB of data written to jail "web" since snapshot "good". It cannot be undone.
 ! Type the name "web" to confirm: 
-! usage: confirmation required
-! hint: type the name on standard input, or pass --confirm-data-loss
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: type the name on standard input, or pass --confirm-data-loss (-y does not answer this question)
 [exit 2]
 
 $ jailops jail rollback web --data --snapshot good -y
@@ -21,8 +21,8 @@ Rolling back data of jail web to snapshot good (taken 3h ago).
 1.5 MiB written since then would be discarded.
 ! This destroys 1.5 MiB of data written to jail "web" since snapshot "good". It cannot be undone.
 ! Type the name "web" to confirm: 
-! usage: confirmation required
-! hint: type the name on standard input, or pass --confirm-data-loss
+! usage: confirmation required: standard input is not a terminal and gave no answer
+! hint: type the name on standard input, or pass --confirm-data-loss (-y does not answer this question)
 [exit 2]
 
 $ jailops jail rollback web --data --snapshot good
@@ -59,7 +59,6 @@ jail/web rolled back
 
 $ jailops jail rollback web
 ! invalid: jail "web" has no previous generation
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops jail upgrade web

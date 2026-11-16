@@ -23,7 +23,7 @@ func TestJailInfoUsageUnavailable(t *testing.T) {
 	tr.ok("jail", "info", "db", "-o", "json")
 	tr.golden("jail_info_usage")
 
-	old := newHarness(t, fake.WithExtensions("operations", "etag", "events", "jails", "jail_snapshots", "profiles", "updates"))
+	old := newHarness(t, fake.WithExtensions("operations", "etag", "events", "jails", "jail_snapshots", "profiles", "updates", "volumes"))
 	old.seedDualStack()
 	out, errs, code := old.run("", "jail", "info", "web")
 	if code != 0 || errs != "" {

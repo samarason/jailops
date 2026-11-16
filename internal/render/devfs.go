@@ -2,9 +2,7 @@ package render
 
 import (
 	"fmt"
-	"hash/fnv"
 	"sort"
-	"strings"
 
 	"jailops.net/jailops/sdk/api"
 )
@@ -17,21 +15,47 @@ var devfsPaths = map[string][]string{
 	"bpf":  {"bpf*"},
 	"fuse": {"fuse"},
 	"dri":  {"dri", "dri/*"},
+	// zfs is not on the allow-list a user can name: a jail with zfs_delegation gets it (SpecDevfsDevices), because
+	// `zfs` inside the jail talks to the kernel through /dev/zfs.
+	"zfs": {"zfs"},
 }
 
-// DevfsRuleset renders the devfs ruleset of a jail that is given device
-// nodes: its number, derived from the set of devices (so jails with the same
-// devices share one), and the text of the ruleset in devfs.rules(5) syntax.
-// The base is the stock jail ruleset: hide everything, then unhide the basic
-// and login devices, then the allow-listed ones. Only devices on
-// api.DevfsAllowList are rendered; anything else is an error, so a path can
-// never be injected. The root helper loads the text; UNVERIFIED: the loading
-// (devfs rule -s <n> ...) and that jail.conf's devfs_ruleset takes it.
-func DevfsRuleset(devices []string) (int, string, error) {
+// devfsOrder fixes the bit of every allow-listed device in a ruleset number: the number of a ruleset is
+// DevfsRulesetBase plus the bits of its devices, plus DevfsLinuxOffset for a Linux jail, so two different sets of
+// devices never share a number and a number says what its ruleset holds.
+var devfsOrder = []string{"bpf", "dri", "fuse", "pf", "tap", "tun", "zfs"}
+
+const (
+	// DevfsRulesetBase is the first number of the private rulesets; the stock ones (1 to 5) are below it.
+	DevfsRulesetBase = 5000
+	// DevfsLinuxOffset separates the rulesets of Linux jails from those of FreeBSD jails.
+	DevfsLinuxOffset = 1 << 7
+	// BuildDevfsRuleset is the ruleset of the Linux image build jail, which no jail shares.
+	BuildDevfsRuleset = DevfsRulesetBase + 2*DevfsLinuxOffset
+)
+
+// devfsNumber is the number of the ruleset of a set of devices; names are sorted and unique.
+func devfsNumber(linux bool, names []string) int {
+	n := DevfsRulesetBase
+	for _, name := range names {
+		for bit, d := range devfsOrder {
+			if d == name {
+				n += 1 << bit
+			}
+		}
+	}
+	if linux {
+		n += DevfsLinuxOffset
+	}
+	return n
+}
+
+// devfsNames checks a list of devices against api.DevfsAllowList and returns it sorted and unique.
+func devfsNames(devices []string) ([]string, error) {
 	set := map[string]bool{}
 	for _, d := range devices {
 		if _, ok := devfsPaths[d]; !ok {
-			return 0, "", fmt.Errorf("render: device %q is not on the devfs allow-list", d)
+			return nil, fmt.Errorf("render: device %q is not on the devfs allow-list", d)
 		}
 		set[d] = true
 	}
@@ -40,25 +64,47 @@ func DevfsRuleset(devices []string) (int, string, error) {
 		names = append(names, d)
 	}
 	sort.Strings(names)
-	if len(names) == 0 {
-		return DefaultDevfsRuleset, "", nil
+	return names, nil
+}
+
+// DevfsRuleset returns the devfs ruleset of a FreeBSD jail that is given device nodes: its number and the
+// `devfs rule -s <n> ...` argument lists that load it into the kernel, in order. The base is the stock jail ruleset
+// (include the stock sets that hide everything and unhide the basic and login devices), then the allow-listed
+// devices. A jail without devices uses the stock ruleset DefaultDevfsRuleset and loads nothing. Only devices on
+// api.DevfsAllowList are rendered; anything else is an error, so a path can never be injected. The number is the
+// one of jail.conf's devfs_ruleset, and the root helper loads the rules before the jail is created: a number that
+// nobody loaded would show the jail the whole of the host's /dev.
+func DevfsRuleset(devices []string) (int, [][]string, error) {
+	names, err := devfsNames(devices)
+	if err != nil {
+		return 0, nil, err
 	}
-	h := fnv.New32a()
-	h.Write([]byte(strings.Join(names, ",")))
-	n := 5000 + int(h.Sum32()%50000)
-	var b builder
-	b.line("%s", Header)
-	b.line("[jailops_devfs_%d=%d]", n, n)
-	b.line("add include $devfsrules_hide_all")
-	b.line("add include $devfsrules_unhide_basic")
-	b.line("add include $devfsrules_unhide_login")
+	if len(names) == 0 {
+		return DefaultDevfsRuleset, nil, nil
+	}
+	n := devfsNumber(false, names)
+	s := fmt.Sprint(n)
+	rules := [][]string{
+		{"devfs", "rule", "-s", s, "add", "include", "1"}, // hide everything
+		{"devfs", "rule", "-s", s, "add", "include", "2"}, // the basic devices
+		{"devfs", "rule", "-s", s, "add", "include", "3"}, // the login devices
+	}
 	for _, d := range names {
 		for _, p := range devfsPaths[d] {
-			b.line("add path '%s' unhide", p)
+			rules = append(rules, []string{"devfs", "rule", "-s", s, "add", "path", p, "unhide"})
 		}
 	}
-	text, err := b.result()
-	return n, text, err
+	return n, rules, nil
+}
+
+// SpecDevfsDevices lists the devices a jail's devfs ruleset holds: the ones its spec names, and zfs when the jail has
+// zfs_delegation (jail(8) attaches the delegated dataset, and the jail's zfs needs /dev/zfs).
+func SpecDevfsDevices(sp api.JailSpec) []string {
+	out := DevfsDevices(sp.Devfs)
+	if sp.Delegate {
+		out = append(out, "zfs")
+	}
+	return out
 }
 
 // DevfsDevices lists the device nodes of a jail's devfs devices.
@@ -97,37 +143,14 @@ func DevfsUnhidable(glob string) bool {
 	return false
 }
 
-// LinuxDevfsRuleset renders the private devfs ruleset of a Linux jail: hide
-// everything, unhide the nodes of a Linux userland, then the allow-listed
-// devices the jail was given. The number is derived from the set of devices.
-func LinuxDevfsRuleset(devices []string) (int, string, error) {
-	set := map[string]bool{}
-	for _, d := range devices {
-		if _, ok := devfsPaths[d]; !ok {
-			return 0, "", fmt.Errorf("render: device %q is not on the devfs allow-list", d)
-		}
-		set[d] = true
+// LinuxDevfsRuleset returns the private devfs ruleset of a Linux jail: its number and the argument lists that load
+// it: hide everything, unhide the nodes of a Linux userland, then the allow-listed devices the jail was given.
+func LinuxDevfsRuleset(devices []string) (int, [][]string, error) {
+	names, err := devfsNames(devices)
+	if err != nil {
+		return 0, nil, err
 	}
-	var names []string
-	for d := range set {
-		names = append(names, d)
-	}
-	sort.Strings(names)
-	h := fnv.New32a()
-	h.Write([]byte("linux:" + strings.Join(names, ",")))
-	n := 5000 + int(h.Sum32()%50000)
-	var b builder
-	b.line("%s", Header)
-	b.line("[jailops_devfs_%d=%d]", n, n)
-	b.line("add hide")
-	for _, p := range linuxDevfsNodes {
-		b.line("add path '%s' unhide", p)
-	}
-	for _, d := range names {
-		for _, p := range devfsPaths[d] {
-			b.line("add path '%s' unhide", p)
-		}
-	}
-	text, err := b.result()
-	return n, text, err
+	n := devfsNumber(true, names)
+	rules, err := LinuxDevfsRuleArgv(n, names)
+	return n, rules, err
 }

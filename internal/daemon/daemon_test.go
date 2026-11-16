@@ -21,7 +21,7 @@ func TestConfigStrictAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Dataset != "tank/jailops" || cfg.MountBase != "/jailops" || cfg.StateDir != "/var/db/jailops/state" || cfg.Listen.Unix.Mode != 0o660 ||
+	if cfg.Dataset != "tank/jailops" || cfg.MountBase != "/usr/local/jailops" || cfg.StateDir != "/var/db/jailops/state" || cfg.Listen.Unix.Mode != 0o660 ||
 		cfg.Reconcile.Interval.Std() != 30*time.Second || cfg.Log.Format != "text" || cfg.Role != "host" {
 		t.Fatalf("%+v", cfg)
 	}
@@ -167,15 +167,15 @@ func TestDoctor(t *testing.T) {
 	}
 	for name, want := range map[string]api.DoctorStatus{
 		"state.files": api.DoctorOK, "db.integrity": api.DoctorOK, "operations.journal": api.DoctorOK,
-		"sysctl.net.link.bridge.pfil_member": api.DoctorOK, "sysctl.net.inet.ip.forwarding": api.DoctorOK,
-		"jails.health": api.DoctorOK, "render": api.DoctorOK,
+		"sysctl.net.inet.ip.forwarding": api.DoctorOK,
+		"jails.health":                  api.DoctorOK, "render": api.DoctorOK,
 	} {
 		if c, ok := by[name]; !ok || c.Status != want {
 			t.Errorf("%s: %+v", name, c)
 		}
 	}
 	// Kernel modules cannot be read through the fake runner: unknown, not ok.
-	if c := by["kernel.module.if_bridge"]; c.Status != api.DoctorOK && c.Status != api.DoctorUnknown {
+	if c := by["kernel.module.if_epair"]; c.Status != api.DoctorOK && c.Status != api.DoctorUnknown {
 		t.Errorf("%+v", c)
 	}
 	// A sysctl the networks need but the host lacks fails with a hint.
@@ -282,20 +282,4 @@ func TestSampleNamesEveryConfigKey(t *testing.T) {
 		}
 	}
 	walk(reflect.TypeOf(daemon.Config{}))
-}
-
-// The keys that mapped Unix users and groups to roles are gone; an old configuration stops the daemon with a
-// message that names the key and says what to do, not with a bare "unknown field".
-func TestRemovedUnixKeysFailWithAnExplanation(t *testing.T) {
-	for _, key := range []string{"admin_group: jailops-admin", "user_group: jailops", "user_projects: [web]"} {
-		name, _, _ := strings.Cut(key, ":")
-		_, err := daemon.Decode(strings.NewReader("pool: tank\nlisten:\n  unix:\n    path: /var/run/jailops/jailops.sock\n    " + key + "\n"))
-		if err == nil || !strings.Contains(err.Error(), "listen.unix."+name) || !strings.Contains(err.Error(), "no longer supported") ||
-			!strings.Contains(err.Error(), "jailops user create") {
-			t.Errorf("%s: %v", name, err)
-		}
-	}
-	if _, err := daemon.Decode(strings.NewReader("pool: tank\nlisten:\n  unix:\n    path: /var/run/jailops/jailops.sock\n    mode: 0666\n")); err != nil {
-		t.Fatal(err)
-	}
 }

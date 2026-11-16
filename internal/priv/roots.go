@@ -238,20 +238,54 @@ func renderStorageFile(roots []string) []byte {
 // or above: mounting a root there would shadow the running system.
 var systemMountPoints = []string{"/", "/boot", "/etc", "/usr", "/var", "/usr/local", "/usr/local/etc", "/var/run", "/tmp", "/dev", "/bin", "/sbin", "/lib", "/libexec", "/root"}
 
-// systemPaths are the paths of this helper that a root must not cover.
-func (c Config) systemPaths() []string {
-	p := slices.Clone(systemMountPoints)
-	p = append(p, c.ConfDir, filepath.Dir(c.HelperPath), c.HelperPath, filepath.Dir(c.StorageFile))
-	return p
+// systemTrees are host directories a storage root may not be mounted inside either: the helper writes below a root
+// as root, so a root there would let the daemon write system files. A root may lie elsewhere in /usr or /var
+// (/usr/jails).
+var systemTrees = []string{"/boot", "/etc", "/root", "/dev", "/bin", "/sbin", "/lib", "/libexec", "/rescue", "/proc",
+	"/var/run", "/var/db", "/var/cron", "/var/at", "/var/log", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec",
+	"/usr/local/etc", "/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/libexec"}
+
+// helperDirs are the helper's own directories: no root may be mounted on, above or inside them.
+func (c Config) helperDirs() []string {
+	var out []string
+	for _, d := range []string{c.ConfDir, filepath.Dir(c.HelperPath), c.HelperPath, filepath.Dir(c.StorageFile), c.HostDir, c.WireGuardDir, c.PkgKeysDir, c.KeyringDir} {
+		if d != "" && d != "/" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
-// overlapsSystem reports whether mountpoint m shadows (equals, or is an
-// ancestor of) one of the helper's own paths, or lies inside the conf dir.
+// overlapsSystem reports whether m, the mountpoint of a storage root, shadows (equals, or is an ancestor of) a
+// system path or a directory of the helper, or lies inside a system tree or a directory of the helper.
 func (c Config) overlapsSystem(m string) bool {
-	for _, s := range c.systemPaths() {
+	if c.shadowsSystem(m) {
+		return true
+	}
+	for _, s := range systemTrees {
+		if within(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// shadowsSystem is the check of a dataset below a root, whose mountpoint the operator may have put outside the
+// root's tree (the daemon's state dataset in /var/db/jailops): it may not shadow a system path, nor overlap a
+// directory of the helper in either direction.
+func (c Config) shadowsSystem(m string) bool {
+	if m == "/" {
+		return true
+	}
+	for _, s := range systemMountPoints {
 		if within(m, s) {
 			return true
 		}
 	}
-	return within(c.ConfDir, m)
+	for _, d := range c.helperDirs() {
+		if within(m, d) || within(d, m) {
+			return true
+		}
+	}
+	return false
 }

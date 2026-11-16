@@ -3,8 +3,14 @@ kind: FirewallPolicy
 metadata:
   name: postgres
 spec:
+  comment: "The database of the shop: only the application may connect."
   default_in: deny
   default_out: allow
   rules:
-    # Only the app jail may talk to the database.
-    - {name: from-app, action: allow, direction: in, proto: tcp, ports: ["5432"], from: ["10.60.0.20"]}
+    - name: from-app
+      comment: "the application reads and writes its rows"
+      action: allow
+      direction: in
+      proto: tcp
+      ports: ["5432"]
+      from: ["10.60.0.20"]

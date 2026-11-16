@@ -146,7 +146,8 @@ func TestGCSweepsOnlyUnreferencedOldChunks(t *testing.T) {
 }
 
 func TestGCNeverSweepsWhatAnOpenSessionRelies(t *testing.T) {
-	e, _ := spyEnv(t, nil)
+	// the lease runs on the clock of the node, which this test moves by five hours: the session must outlive that
+	e, _ := spyEnv(t, func(c *node.Config) { c.Lease = 24 * time.Hour })
 	h := e.Host(t, "h")
 	f := nodetest.NewFixture(t, 11)
 	g := f.Group("h", "j")
@@ -638,9 +639,9 @@ func TestReconcileRebuildsTheIndex(t *testing.T) {
 
 // The pins of a session that was abandoned (its lease ran out) must not keep chunks from GC for ever.
 func TestAbandonedSessionPinsAreReleased(t *testing.T) {
-	// The lease runs on the wall clock. It must be long enough for the steps up to the first GC even on a slow, loaded
-	// CI machine (100ms was not: PutChunk answered lease_expired), and the sleep below must outlast it.
-	e, _ := spyEnv(t, func(c *node.Config) { c.Lease = time.Second })
+	// The lease runs on the clock of the node, which the test moves by hand: ten hours of lease, five hours pass (the
+	// session is alive), six more pass (it is not).
+	e, _ := spyEnv(t, func(c *node.Config) { c.Lease = 10 * time.Hour })
 	h := e.Host(t, "h")
 	f := nodetest.NewFixture(t, 30)
 	g := f.Group("h", "j")
@@ -657,7 +658,7 @@ func TestAbandonedSessionPinsAreReleased(t *testing.T) {
 	if err != nil || st.KeptPinned != 1 || !exists(e, c.ID) {
 		t.Fatalf("while the lease is alive: %+v %v", st, err)
 	}
-	time.Sleep(1300 * time.Millisecond) // the host went away; nobody heartbeats
+	e.Clock.Advance(6 * time.Hour) // the host went away; nobody heartbeats
 	st, _, err = e.Node.GC(ctx, node.GCOptions{}, "admin")
 	if err != nil || st.Removed != 1 || exists(e, c.ID) {
 		t.Fatalf("after the lease ran out: %+v %v", st, err)

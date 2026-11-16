@@ -4,12 +4,9 @@
 04 ifconfig joe49a245eed00a description jailops jail=web/nginx net=lan (host side)
 05 ifconfig joe49a245eed00a mtu 1500
 06 ifconfig joe49a245eed00b mtu 1500
-07 ifconfig jo0 addm joe49a245eed00a
-08 ifconfig jo0 static joe49a245eed00a ca:64:60:d0:bb:57
-09 ifconfig jo0 private joe49a245eed00a
-10 ifconfig joe49a245eed00a up
-11 ifconfig jo0gb staticarp
-12 ndp -s 10.20.0.10 ca:64:60:d0:bb:57   (on jo0gb)
-13 ndp -s 2001:db8:1::100 ca:64:60:d0:bb:57   (on jo0gb)
-14 ndp -s fe80::c864:60ff:fed0:bb57 ca:64:60:d0:bb:57   (on jo0gb)
-15 [host, jail] ifconfig -j <jail> joe49a245eed00b description jailops jail=web/nginx net=lan (jail side)
+07 ifconfig joe49a245eed00a inet 10.20.0.1/32 alias
+08 ifconfig joe49a245eed00a inet6 fe80::1/64 alias
+09 ifconfig joe49a245eed00a up
+10 route add -inet 10.20.0.10/32 -interface joe49a245eed00a
+11 route add -inet6 2001:db8:1::100/128 -interface joe49a245eed00a
+12 [host, jail] ifconfig -j <jail> joe49a245eed00b description jailops jail=web/nginx net=lan (jail side)

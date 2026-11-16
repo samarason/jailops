@@ -118,7 +118,7 @@ resources:
 notes: |
   TODO: what to do after the installation: the first-run steps, how to connect.
 
-$ jailops app export cache -o <dir>/cache.yaml
+$ jailops app export cache --file <dir>/cache.yaml
 Wrote <dir>/cache.yaml, drafted from jail cache, with 10 line(s) marked TODO.
 Next: fill in the marked lines and run 'jailops app validate <dir>/cache.yaml'.
 
@@ -137,17 +137,108 @@ $ jailops app validate <dir>/cache.yaml
 ! hint: fix the files listed and run 'jailops app validate' again; docs/apps.md has the format
 [exit 2]
 
-$ jailops app export cache -o <dir>/cache.yaml
+$ jailops app export cache --file <dir>/cache.yaml
 ! already_exists: <dir>/cache.yaml exists
-! hint: keep it, or write over it with --force
+! hint: keep it, or write over it with --overwrite
 [exit 5]
 
-$ jailops app export cache -o <dir>/other.yaml
+$ jailops app export cache --file <dir>/other.yaml
 Wrote <dir>/other.yaml, drafted from jail cache, with 10 line(s) marked TODO.
 The definition is named cache: rename the file to cache.yaml, or change name: to match the file name.
 Next: fill in the marked lines and run 'jailops app validate <dir>/other.yaml'.
 
-$ jailops app export cache --output <dir>/cache.yaml --force -q
+$ jailops app export cache -o json
+{
+  "jail": "cache",
+  "definition": {
+    "version": 1,
+    "name": "cache",
+    "title": "cache",
+    "summary": "TODO: what it is and what it is for, in one line.",
+    "description": "TODO: a few short paragraphs of plain text: what the software does, what this\ndefinition sets up and what is left to the operator.\n",
+    "category": "other",
+    "homepage": "https://memcached.org/",
+    "license": "TODO",
+    "image": {
+      "os": "freebsd",
+      "release_min": "15.1"
+    },
+    "packages": [
+      {
+        "name": "memcached",
+        "repo": "ports",
+        "version": "1.6.39"
+      }
+    ],
+    "services": [
+      {
+        "name": "memcached",
+        "rc": {
+          "memcached_flags": "-l 0.0.0.0 -m 64"
+        },
+        "start": true
+      }
+    ],
+    "ports": [
+      {
+        "name": "memcached",
+        "port": 11211,
+        "proto": "tcp",
+        "description": "Listened on by memcached.",
+        "expose": false
+      }
+    ],
+    "data": [
+      {
+        "path": "/var/db/memcached"
+      }
+    ],
+    "setup": [
+      [
+        "/bin/mkdir",
+        "-p",
+        "/var/run/memcached"
+      ],
+      [
+        "/usr/sbin/chown",
+        "nobody:nobody",
+        "/var/db/memcached",
+        "/var/run/memcached"
+      ]
+    ],
+    "health": {
+      "tcp": 11211,
+      "wait_seconds": 60
+    },
+    "resources": {
+      "memory": "256M",
+      "disk": "2G",
+      "cpu": "1"
+    },
+    "notes": "TODO: what to do after the installation: the first-run steps, how to connect.\n"
+  },
+  "todo": {
+    "category": "choose the category",
+    "config": "keep the files a person edits, with the service each one restarts",
+    "data": "every directory that holds state needs a data path: only the jail's volumes were found",
+    "health": "check that this test fits: a tcp connection says only that something listens; http or exec can say more",
+    "logs": "no log file of the app was found; name where it logs (many log to /var/log/messages), or [] for none",
+    "setup": "check the owners and add what else must happen once before the first start"
+  },
+  "findings": [
+    "packages: memcached (installed on purpose; their dependencies come with them)",
+    "services: memcached (enabled in /etc/rc.conf)",
+    "ports: 11211/tcp (listening now)",
+    "ports of the base system left out: 22/tcp of sshd",
+    "data: /var/db/memcached (the jail's volumes)",
+    "setup: the owners were read from the jail (pkg -r leaves the directories of a package's user to root)"
+  ]
+}
+
+$ jailops app export cache -o csv
+! usage: -o csv is not available here: the draft is YAML (the default), -o json or -o yaml
+! hint: run 'jailops app export --help' for usage
+[exit 2]
 
 $ jailops app export plain
 # plain: an app definition for the JailOps catalog, format version 1 (docs/apps.md).
@@ -248,7 +339,7 @@ $ jailops app export off
 
 $ jailops app export missing
 ! not_found: jail "missing" not found
-! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
+! hint: list them with 'jailops jail list'; check --project, --host and --remote too
 [exit 4]
 
 $ jailops app export

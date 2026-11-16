@@ -25,13 +25,22 @@ describe('rollback', () => {
 })
 
 describe('restore', () => {
-  const f = { backup: 'b', as: '', host: '', replace: false, keepIp: false, networkMap: { a: 'a', b: 'x' } }
+  const f = { backup: 'b', as: '', host: '', replace: false, keepIp: false, noVolumes: false, passphrase: '', networkMap: { a: 'a', b: 'x' } }
   it('omits empties and identity mappings', () => {
     expect(buildRequest(f, true)).toEqual({ backup: 'b', network_map: { b: 'x' }, dry_run: true })
   })
   it('key ignores dry_run but not choices', () => {
     expect(requestKey(f)).toBe(requestKey({ ...f }))
     expect(requestKey(f)).not.toBe(requestKey({ ...f, as: 'n' }))
+  })
+  it('sends no_volumes and the passphrase only when set, and the key ignores what the passphrase says', () => {
+    expect(buildRequest({ ...f, noVolumes: true }, false)).toMatchObject({ no_volumes: true })
+    expect(buildRequest(f, false)).not.toHaveProperty('no_volumes')
+    expect(buildRequest({ ...f, passphrase: 'correct horse battery' }, false)).toMatchObject({ passphrase: 'correct horse battery' })
+    expect(buildRequest(f, false)).not.toHaveProperty('passphrase')
+    expect(requestKey({ ...f, passphrase: 'one' })).toBe(requestKey({ ...f, passphrase: 'two' }))
+    expect(requestKey({ ...f, passphrase: 'one' })).not.toBe(requestKey(f))
+    expect(requestKey({ ...f, noVolumes: true })).not.toBe(requestKey(f))
   })
 })
 

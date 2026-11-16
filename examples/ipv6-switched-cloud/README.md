@@ -17,27 +17,20 @@ the carved `/80`s.
 
 - **Proxy-mode networks** (`ipv6.mode: proxy`, gateway `fe80::1`, uplink `vtnet0`, a range inside the `/80`). A network
   belongs to one project; the two `/80`s cannot overlap (`validate` checks that offline).
-- **The floor**: both projects name `firewall: floor`, a policy with `default_in: deny`. A jail's own policy adds rules but cannot
+- **The floor**: both projects name `firewall_policies: [floor]`, a policy with `default_in: deny`. A jail's own policies add rules but cannot
   weaken it. Projects cannot reach each other: there is no rule that says they can.
-- **A firewall per jail**: `web` has `public-web` (HTTP and HTTPS from anywhere, SSH from `@admins`), `app` has
-  `app-private` (port 8080 only from `@web_tier`).
+- **A firewall per jail**: `web` has `public-web` (HTTP and HTTPS from anywhere, SSH from `set:admins`), `app` has
+  `app-private` (port 8080 only from `set:web-tier`).
 - **A public web jail** with a fixed IPv6 address (`2001:db8:1:2:100::80`, your AAAA record) and, for IPv4, `proxy:` devices that
   forward the host's ports 80 and 443.
 - Explicit network and storage on every jail; the image is built once by `build: true`.
 
 ## Before you apply
 
-1. **Approve the prefix, once, as root**, in `/usr/local/etc/jailops/priv.conf`, then `service jailops_priv restart`. One line per
-   uplink; this one covers both `/80`s:
-
-       ndp-proxy = vtnet0=2001:db8:1:2:100::/79
-
-   Without it the helper refuses every proxy request and says which line to add. The same thing is in the install script
-   of [provisioning](../provisioning) (`JAILOPS_NDP_PROXY`).
-2. Let packets in: pf's default for the uplink is yours. Admit the jails' addresses and the ports you want, for example
+1. Let packets in: pf's default for the uplink is yours. Admit the jails' addresses and the ports you want, for example
    `pass in quick on vtnet0 inet6 proto tcp from any to 2001:db8:1:2:100::/80 port { 80 443 }`. The jail's anchor
    still decides afterwards (see install.md section 3).
-3. Run `jailops doctor`: it fails `network.ndproxy` while a proxy network is not answering.
+2. Run `jailops doctor`: it fails `network.ndproxy` while a proxy network is not answering.
 
 ## Run it
 

@@ -78,14 +78,14 @@ repository's .sops.yaml (the plaintext key never touches the disk), and prints t
 command an administrator runs on the host to trust the certificate.
 
 The server fingerprint is the hex SHA-256 of the host's certificate. Take it from
-the host itself ('jailops trust add' prints a token that carries it) rather than
+the host itself ('jailops cert enroll' prints a token that carries it) rather than
 from the network: there is no trust on first use.
 
 The certificate PEM goes to standard output, everything else to standard error,
 so the certificate can be piped to the host:
 
   jailops-sync remote bootstrap web1 --url https://web1:39110 --fingerprint 3f9a... \
-      | ssh admin@web1 'cat > /tmp/sync.pem && jailops cert create sync-prod --pem /tmp/sync.pem --permission admin --global'
+      | ssh admin@web1 'cat > /tmp/sync.pem && jailops cert create sync-prod --pem /tmp/sync.pem --role admin --global'
 
 Needs a key that is a recipient of the matching creation_rule.`,
 		Args: cobra.ExactArgs(1),
@@ -131,7 +131,7 @@ Needs a key that is a recipient of the matching creation_rule.`,
 			fmt.Fprintf(e, "wrote %s (encrypted; the key is only in that file)\n", vault.RemoteRel(host))
 			fmt.Fprintf(e, "client certificate fingerprint %s\n\n", cfp)
 			fmt.Fprintln(e, "The certificate PEM is on standard output. Trust it on the host as an administrator:")
-			trust := fmt.Sprintf("  jailops cert create %s --pem CERT.pem --permission %s", name, perm)
+			trust := fmt.Sprintf("  jailops cert create %s --pem CERT.pem --role %s", name, perm)
 			switch {
 			case projects != "":
 				trust += " --projects " + projects

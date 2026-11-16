@@ -31,7 +31,7 @@ type AppAccessDef struct {
 
 // Source kinds of an access grant.
 const (
-	AccessSourceJail = "jail"        // @jail, or @project/jail
+	AccessSourceJail = "jail"        // @jail, a jail of the same project
 	AccessSourceSet  = "address-set" // @set, an address set of the project
 	AccessSourceCIDR = "cidr"        // an address or a prefix
 	AccessSourceHost = "host"        // the host itself: the gateway addresses of the jail's networks
@@ -39,13 +39,11 @@ const (
 
 // AppAccessGrant is one source allowed to reach an installed app.
 type AppAccessGrant struct {
-	// Source is what was allowed, in its canonical form: "@web", "@shop/web",
-	// "@office", "192.0.2.0/24", "host".
+	// Source is what was allowed, in its canonical form: "@web", "@office",
+	// "192.0.2.0/24", "host".
 	Source string `json:"source"`
 	// SourceKind is jail, address-set, cidr or host.
 	SourceKind string `json:"source_kind"`
-	// SourceProject is the project of a jail source in another project.
-	SourceProject string `json:"source_project,omitempty"`
 	// Addresses are the prefixes the source stood for when the grant was last
 	// applied (an address set stays a reference in the firewall).
 	Addresses []string `json:"addresses,omitempty"`
@@ -101,7 +99,7 @@ type AppAccess struct {
 
 // AppAllow is the body of POST /api/v1/jails/<name>/access.
 type AppAllow struct {
-	// Source is @jail, @project/jail, @address-set, an address or a prefix, or host.
+	// Source is @jail, @address-set, an address or a prefix, or host.
 	Source string `json:"source"`
 	// Ports are "N" or "N/proto"; default: the definition's ports (the access
 	// block's port for an app that has one).

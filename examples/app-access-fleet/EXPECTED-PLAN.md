@@ -13,8 +13,8 @@ host db1
               install app postgresql as jail db
   create    App/shop/web
               install app nginx as jail web
-  create    AppAccess/shop/db from @web
-              allow @web, database shop
+  create    AppAccess/shop/db from jail:web
+              allow jail:web, database shop
   create    AppAccess/shop/web from 203.0.113.0/24
               allow 203.0.113.0/24 on 80/tcp
 

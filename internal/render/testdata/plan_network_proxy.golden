@@ -1,12 +1,2 @@
 01 require sysctl net.inet6.ip6.forwarding=1
-02 ifconfig bridge create name jo1
-03 ifconfig jo1 description jailops net=wan6 bridge
-04 ifconfig epair create; rename ends to jo1ga and jo1gb
-05 ifconfig jo1ga description jailops net=wan6 gateway (bridge side)
-06 ifconfig jo1gb description jailops net=wan6 gateway (host side)
-07 ifconfig jo1 addm jo1ga
-08 ifconfig jo1gb inet6 fe80::1/64 alias
-09 ifconfig jo1 up
-10 ifconfig jo1ga up
-11 ifconfig jo1gb up
-12 pfctl -a jailops/net.wan6 -f <rendered>
+02 pfctl -a jailops/net.wan6 -f <rendered>

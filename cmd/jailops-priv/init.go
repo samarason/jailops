@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,7 +13,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// logDir is where the jails' exec.consolelog files are (render.ConsoleLog); its dataset is <dataset>/logs.
+const logDir = "/var/log/jailops"
 
 // initCmd is `jailops-priv init -pool tank`: the one-time setup of a host. It makes what the daemon cannot make
 // for itself, because it is not root: the user and groups, the storage root dataset and the state dataset
@@ -20,6 +25,7 @@ import (
 // is changed except to say so.
 type initOptions struct {
 	pool, dataset, mount  string
+	mountSet              bool // -mount was given: a mount that differs from the existing dataset's is an error, not a surprise
 	user, group           string
 	etc                   string // /usr/local/etc/jailops
 	dbDir                 string // /var/db/jailops
@@ -35,7 +41,10 @@ type initOptions struct {
 
 func defaultRun(name string, args ...string) (string, error) {
 	var out bytes.Buffer
-	c := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), initCommandTimeout)
+	defer cancel()
+	c := exec.CommandContext(ctx, name, args...)
+	c.WaitDelay = time.Second
 	c.Stdout, c.Stderr = &out, &out
 	err := c.Run()
 	return strings.TrimSpace(out.String()), err
@@ -47,7 +56,7 @@ func initMain(args []string, stdout, stderr io.Writer, euid int) int {
 	fs.SetOutput(stderr)
 	fs.StringVar(&o.pool, "pool", "", "the ZFS pool JailOps lives on (required)")
 	fs.StringVar(&o.dataset, "dataset", "", "the storage root dataset (default <pool>/jailops)")
-	fs.StringVar(&o.mount, "mount", "/jailops", "where the storage root is mounted")
+	fs.StringVar(&o.mount, "mount", "/usr/local/jailops", "where the storage root is mounted")
 	fs.StringVar(&o.user, "user", "jailops", "the unprivileged user jailopsd runs as")
 	fs.StringVar(&o.group, "group", "jailops", "the group of that user, which may talk to the helper")
 	fs.StringVar(&o.etc, "etc", "/usr/local/etc/jailops", "configuration directory")
@@ -69,6 +78,11 @@ func initMain(args []string, stdout, stderr io.Writer, euid int) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "mount" {
+			o.mountSet = true
+		}
+	})
 	// the arguments are checked before the root check, so a mistake is reported to anyone
 	if err := o.validate(); err != nil {
 		fmt.Fprintf(stderr, "jailops-priv init: %v\n%s", err, synopsis)
@@ -91,7 +105,8 @@ func (o *initOptions) say(w io.Writer, format string, a ...any) { fmt.Fprintf(w,
 
 // validate checks the arguments without touching the system.
 func (o *initOptions) validate() error {
-	if o.pool == "" || strings.ContainsAny(o.pool, "/ @#") {
+	// a leading "-" would reach zfs and zpool as an option
+	if o.pool == "" || strings.ContainsAny(o.pool, "/ @#") || strings.HasPrefix(o.pool, "-") {
 		return errors.New("-pool names the pool (for example -pool tank), not a dataset")
 	}
 	if o.dataset == "" {
@@ -145,6 +160,17 @@ func (o *initOptions) do(w io.Writer) error {
 		}
 	} else if v, _ := managed(o.dataset); !strings.HasPrefix(v, "on\tlocal") && !strings.HasPrefix(v, "on local") {
 		return fmt.Errorf("dataset %s exists but is not marked jailops:managed=on; mark it yourself if it is meant for JailOps: zfs set jailops:managed=on %s", o.dataset, o.dataset)
+	} else if mp, err := o.run("zfs", "get", "-H", "-o", "value", "mountpoint", o.dataset); err == nil {
+		// An installed host keeps the mount point its images and jails were made under (their datasets carry absolute
+		// mount points below it): running init again on a newer release, whose default differs, must not point
+		// mount-base somewhere else, where the helper would refuse every path.
+		if have := strings.TrimSpace(mp); have != o.mount && filepath.IsAbs(have) {
+			if o.mountSet {
+				return fmt.Errorf("dataset %s is mounted at %s, not at %s: its images and jails live there, and moving them is not supported (omit -mount to keep %s)", o.dataset, have, o.mount, have)
+			}
+			o.say(w, "dataset %s is already mounted at %s: keeping it (the default of this release is %s)", o.dataset, have, o.mount)
+			o.mount = have
+		}
 	}
 	// The state dataset is mounted outside the storage root: the daemon owns it, and a directory the daemon can
 	// modify must not sit inside a tree the helper (root) walks.
@@ -155,6 +181,17 @@ func (o *initOptions) do(w io.Writer) error {
 		if !o.dryRun {
 			if out, err := o.run("zfs", "create", "-o", "mountpoint="+stateDir, "-o", "jailops:managed=on", state); err != nil {
 				return fmt.Errorf("zfs create %s: %v: %s", state, err, out)
+			}
+		}
+	}
+	// The logs of the jails (exec.consolelog) have a dataset of their own, where FreeBSD keeps logs: /var/log/jailops,
+	// rotated by newsyslog, with its own compression and a quota the administrator can set.
+	logs := o.dataset + "/logs"
+	if _, err := o.run("zfs", "list", "-H", "-o", "name", logs); err != nil {
+		o.say(w, "creating dataset %s (mounted at %s)", logs, logDir)
+		if !o.dryRun {
+			if out, err := o.run("zfs", "create", "-o", "mountpoint="+logDir, "-o", "compression=lz4", "-o", "jailops:managed=on", logs); err != nil {
+				return fmt.Errorf("zfs create %s: %v: %s", logs, err, out)
 			}
 		}
 	}
@@ -205,6 +242,33 @@ func (o *initOptions) do(w io.Writer) error {
 			if err := os.MkdirAll(o.path(d), 0o755); err != nil {
 				return err
 			}
+		}
+	}
+	// the files of log sinks set through the API (logging.secrets_dir): root writes them, the daemon's group reads
+	sinks := filepath.Join(o.etc, "sinks")
+	o.say(w, "directory %s: owner root, group %s, mode 0750", sinks, o.group)
+	if !o.dryRun {
+		if err := os.MkdirAll(o.path(sinks), 0o750); err != nil {
+			return err
+		}
+		if err := os.Chmod(o.path(sinks), 0o750); err != nil {
+			return err
+		}
+		if err := o.chown(o.path(sinks), 0, gid); err != nil {
+			return err
+		}
+	}
+	// the logs of the jails: root writes them (jail(8)), the daemon's group reads
+	o.say(w, "directory %s: owner root, group %s, mode 0750", logDir, o.group)
+	if !o.dryRun {
+		if err := os.MkdirAll(o.path(logDir), 0o750); err != nil {
+			return err
+		}
+		if err := os.Chmod(o.path(logDir), 0o750); err != nil {
+			return err
+		}
+		if err := o.chown(o.path(logDir), 0, gid); err != nil {
+			return err
 		}
 	}
 	files := []struct {
@@ -286,7 +350,7 @@ mount-base = %s
 state-dir = %s
 work-dir = /var/tmp/jailops
 helper-path = /usr/local/libexec/jailops-priv
-socket = /var/run/jailops/priv.sock
+socket = /var/run/jailops-priv/priv.sock
 group = %s
 mode = 0660
 allow-user = %s
@@ -315,6 +379,10 @@ listen:
     path: /var/run/jailops/jailops.sock
     mode: 0666
 %s%spriv:
-  socket: /var/run/jailops/priv.sock
+  socket: /var/run/jailops-priv/priv.sock
 `, o.pool, o.dataset, o.mount, o.dbDir, filepath.Join(o.dbDir, "state"), listen, web)
 }
+
+// initCommandTimeout bounds each command of `jailops-priv init` (zfs, mkdir and the like): a command that never
+// returns must not leave the setup hanging.
+const initCommandTimeout = 10 * time.Minute

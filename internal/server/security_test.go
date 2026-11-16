@@ -100,7 +100,7 @@ func TestSecretsNeverLeak(t *testing.T) {
 		resp.Body.Close()
 	}
 	cancel()
-	time.Sleep(300 * time.Millisecond) // the access log line is written when the stream ends
+	time.Sleep(2 * time.Second) // the access log line is written when the stream ends (a slow CI machine takes its time)
 
 	// Everything that can be read back.
 	var all strings.Builder
@@ -205,5 +205,28 @@ func TestJailAnchorHoldsTheJailsOwnLinkLocalAddress(t *testing.T) {
 	}
 	if strings.Contains(m[1], "fe80::/10") || !strings.Contains(m[1], "fe80::") {
 		t.Errorf("table %q must hold the jail's own link-local address and not the whole range", m[1])
+	}
+}
+
+// A token in the query string authenticates nothing on the upgrade of an exec session or on a console route either:
+// clients send it in the Authorization header (the SDK does for exec), the web console uses its session cookie.
+func TestQueryTokenOnExecAndConsoleIsRefused(t *testing.T) {
+	e := seeded(t)
+	mustJail(t, e, "web")
+	tok := e.Token(api.PermAdmin)
+	up := map[string]string{"Connection": "Upgrade", "Upgrade": api.ExecProtocol}
+	for _, q := range []string{"token", "access_token"} {
+		if code, body := e.RawHdr("POST", "/api/v1/jails/web/exec?project=alpha&"+q+"="+tok, "", `{"argv":["id"]}`, up); code != http.StatusUnauthorized {
+			t.Errorf("exec with ?%s=: %d %s", q, code, body)
+		}
+		for _, m := range []string{"GET", "POST"} {
+			if code, body := e.RawHdr(m, "/api/v1/jails/web/console?project=alpha&"+q+"="+tok, "", "", nil); code != http.StatusUnauthorized {
+				t.Errorf("%s console with ?%s=: %d %s", m, q, code, body)
+			}
+		}
+	}
+	// the same token in the header is accepted (the exec itself answers 101 or an ordinary error, never 401)
+	if code, body := e.RawHdr("GET", "/api/v1/jails/web/console?project=alpha", tok, "", nil); code == http.StatusUnauthorized {
+		t.Errorf("console with the header: %d %s", code, body)
 	}
 }

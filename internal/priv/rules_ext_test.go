@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"jailops.net/jailops/internal/sys/ifconfig"
 	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/sdk/api"
 )
@@ -26,6 +27,14 @@ func newRuleEnv(t *testing.T) *ruleEnv {
 	os.MkdirAll(filepath.Join(e.cfg.MountBase, "projects", "default", "jails", "plain", "root", "etc"), 0o755)
 	e.conf(t, "shop_web")
 	e.conf(t, "default_plain")
+	r.trustDirs(t)
+	// the jail ends of their epairs, in their vnets, with the marker they were created with
+	e.net.AddToJail("shop_web", ifconfig.Iface{Name: "jo0123456789ab", Groups: []string{"epair"}, Description: "jailops jail=shop/web net=lan (jail side)"})
+	e.net.AddToJail("default_plain", ifconfig.Iface{Name: "jo0123456789cb", Groups: []string{"epair"}, Description: ifconfig.Marker})
+	// what a jail's root could make in its own vnet: an interface without the marker, one with a description of its own
+	e.net.AddToJail("shop_web", ifconfig.Iface{Name: "mine0x", Groups: []string{"epair"}})
+	e.net.AddToJail("shop_web", ifconfig.Iface{Name: "forged", Groups: []string{"epair"}, Description: "my own"})
+	e.net.AddToJail("shop_web", ifconfig.Iface{Name: "tunnel", Groups: []string{"tun"}, Description: ifconfig.Marker})
 	return r
 }
 
@@ -71,7 +80,7 @@ func TestSysctlFallbackBrand(t *testing.T) {
 		r.bad(t, "sysctl", "kern.elf64.fallback_brand="+v)
 	}
 	r.ok(t, "sysctl", "-n", "kern.elf64.fallback_brand")
-	r.ok(t, "sysctl", "-n", "net.link.bridge.pfil_onlyip")
+	r.ok(t, "sysctl", "-n", "net.inet.ip.forwarding")
 	r.bad(t, "sysctl", "kern.elf64.fallback_brand")
 	r.bad(t, "sysctl", "kern.elf32.fallback_brand=3")
 }
@@ -166,8 +175,9 @@ func TestTarRuleListsBeforeExtracting(t *testing.T) {
 		e := r.env
 		e.runner = run.NewFake()
 		l, _ := NewLocal(e.cfg, Deps{ZFS: e.zfs, Runner: e.runner}, WithoutChown())
-		e.runner.On("/usr/bin/tar", []string{"-tzf", archive}, list)
-		e.runner.On("/usr/bin/tar", []string{"-C", dest, "-xpzf", archive}, "")
+		// the archive is copied into a directory of the helper's: listed and extracted from the copy
+		e.runner.On("/usr/bin/tar", []string{"-tzf", run.AnyArg}, list)
+		e.runner.On("/usr/bin/tar", []string{"-C", dest, "-xpzf", run.AnyArg}, "")
 		_, err := l.Runner().Run(ctx, run.Cmd{Name: "tar", Args: []string{"-C", dest, "-xpzf", archive}})
 		return err
 	}
@@ -364,17 +374,11 @@ func TestJexecApkRule(t *testing.T) {
 func TestIfconfigRules(t *testing.T) {
 	r := newRuleEnv(t)
 	i := "jo0123456789ab"
-	r.ok(t, "ifconfig", "bridge", "create")
-	r.ok(t, "ifconfig", "epair", "create")
-	r.ok(t, "ifconfig", "bridge0", "name", "jo0")
-	r.ok(t, "ifconfig", "bridge12", "name", "jo12")
-	r.ok(t, "ifconfig", "epair3a", "name", i+"a")
-	r.ok(t, "ifconfig", "epair3b", "name", i+"b")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "up")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "down")
 	r.ok(t, "ifconfig", "-j", "shop_web", i)
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "description", "jailops jail=shop/web net=lan (jail side)")
-	r.ok(t, "ifconfig", "-j", "shop_web", i, "description", "jailops:0b0e7f3e-5c4b-4f6e-9d3e-111111111111")
+	r.ok(t, "ifconfig", "-j", "shop_web", i, "description", "jailops managed")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "mtu", "1400")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "inet", "10.20.0.12/24", "up")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "inet", "10.20.0.12", "prefixlen", "24")
@@ -382,14 +386,21 @@ func TestIfconfigRules(t *testing.T) {
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "inet", "10.20.0.12", "-alias")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "inet6", "fd00:20::12", "prefixlen", "64")
 	r.ok(t, "ifconfig", "-j", "shop_web", i, "inet6", "fd00:20::12", "-alias")
-	r.ok(t, "ifconfig", "-j", "default_plain", i, "inet6", "2001:db8::5", "prefixlen", "128", "alias")
+	r.ok(t, "ifconfig", "-j", "default_plain", "jo0123456789cb", "inet6", "2001:db8::5", "prefixlen", "128", "alias")
+	r.ok(t, "ifconfig", "-j", "shop_web", "em0") // reading is not changing
 	for _, a := range [][]string{
+		// interfaces of the host are made and renamed by the typed operations only (they mark them), never here
+		{"bridge", "create"}, {"epair", "create"}, {"bridge0", "name", "jo0"}, {"bridge12", "name", "office"}, {"epair3a", "name", i + "a"},
+		{"bridge0", "name", "mybr"}, {"bridge0", "name", "jo7"},
+		// inside the jail: only an interface with the marker
+		{"-j", "shop_web", "mine0x", "up"}, {"-j", "shop_web", "forged", "up"}, {"-j", "shop_web", "forged", "description", "jailops x"},
+		{"-j", "shop_web", "tunnel", "up"}, {"-j", "shop_web", "jo0123456789cb", "up"}, // another jail's
 		{"create"}, {"bridge"}, {"bridge", "create", "x"}, {"lo", "create"}, {"vlan", "create"}, {"tap", "create"}, {"bridge0", "destroy"}, {"bridge0", "name", "em0"}, {"bridge0", "name", "lo0"},
 		{"bridge0", "name", "jo"}, {"bridge0", "name", "-x"}, {"bridge0", "name", "jo0", "extra"}, {"em0", "name", "jo0"}, {"bridge", "name", "jo0"}, {"epair3", "name", "jo0"}, {"epair3c", "name", "jo0"},
 		{"bridge0", "addm", "em0"}, {"em0", "up"}, {"em0", "inet", "10.0.0.1/24"}, {"-a"}, {"-l"}, {}, {"jo0", "mtu", "1400"}, {"jo0", "up"},
 		// -j forms
 		{"-j", "ghost", i, "up"}, {"-j", "shop_web", "em0", "up"}, {"-j", "shop_web", "lo0", "up"}, {"-j", "shop_web", "-x", "up"}, {"-j", "shop_web", i, "destroy"},
-		{"-j", "shop_web", "em0"}, {"-j", "ghost", i}, {"-j", "shop_web", i, "description"}, {"-j", "shop_web", i, "description", ""},
+		{"-j", "ghost", i}, {"-j", "shop_web", i, "description"}, {"-j", "shop_web", i, "description", ""},
 		{"-j", "shop_web", i, "description", "my text"}, {"-j", "shop_web", i, "description", "jailops a;b"}, {"-j", "shop_web", i, "description", "jailops a\nb"},
 		{"-j", "shop_web", i, "description", "jailops " + strings.Repeat("x", 60)}, {"-j", "shop_web", i, "description", "jailops ok", "up"}, {"-j", "shop_web", i, "-description"},
 		{"-j", "shop_web", i, "mtu", "100"}, {"-j", "shop_web", i, "mtu", "99999"}, {"-j", "shop_web", i, "mtu", "x"}, {"-j", "shop_web", i, "mtu"}, {"-j", "shop_web", i, "up", "down"},
@@ -426,6 +437,9 @@ func TestJailRouteCommandRules(t *testing.T) {
 		{"-j", "shop_web", "add", "-inet6", "default", "fd00::1%" + i}, {"-j", "shop_web", "add", "default", "10.20.0.1%" + i}, {"-j", "shop_web", "add", "-inet6", "default", "fe80::1%"},
 		{"-n", "-j", "shop_web", "add", "default", "10.20.0.1"}, {"-j", "shop_web;id", "add", "default", "10.20.0.1"}, {"-j", "-x", "add", "default", "10.20.0.1"}, {"-j", "shop_web", "add", "-inet6", "-inet6", "default", "fd00::1"},
 		{"-j", "shop_web", "add", "default", "10.20.0.1\n"}, {"-j", "shop_web", "add", "-inet6", "::", "fd00::1"}, {"-j"},
+		// an interface of the jail's vnet without the marker
+		{"-j", "shop_web", "add", "-inet6", "default", "fe80::1%forged"}, {"-j", "shop_web", "add", "-inet6", "default", "fe80::1%mine0x"},
+		{"-j", "shop_web", "add", "-host", "10.20.0.1", "-interface", "forged"}, {"-j", "shop_web", "add", "-host", "10.20.0.1", "-interface", "em0"},
 	} {
 		r.bad(t, append([]string{"route"}, a...)...)
 	}
@@ -530,7 +544,7 @@ func TestExtendedRulesRunThroughTheRunner(t *testing.T) {
 }
 
 func TestCommandTableIsComplete(t *testing.T) {
-	want := []string{"sysctl", "kldstat", "kldload", "pfctl", "fetch", "tar", "chmod", "mount", "umount", "jail", "devfs", "jexec", "ifconfig", "route", "uname", "rctl", "pkg", "etcupdate", "pwd_mkdb", "freebsd-version", "freebsd-update", "debootstrap"}
+	want := []string{"sysctl", "kldstat", "kldload", "pfctl", "fetch", "tar", "chmod", "mount", "umount", "jail", "devfs", "jexec", "ifconfig", "route", "uname", "rctl", "dnctl", "pkg", "etcupdate", "pwd_mkdb", "freebsd-version", "debootstrap"}
 	have := map[string]bool{}
 	for _, r := range CommandRules {
 		have[r.Name] = true
@@ -572,4 +586,26 @@ func TestBuildJailForms(t *testing.T) {
 	if err := r.check(admin, "jail", "-r", "alpha_web"); err == nil {
 		t.Error("removed a jail that is not a build jail")
 	}
+}
+
+// trustDirs makes the root-owned key and keyring directories the helper trusts (the test's user stands in for root).
+func (r *ruleEnv) trustDirs(t *testing.T) {
+	t.Helper()
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	oldUID, oldAnchor := trustUID, trustAnchor
+	trustUID, trustAnchor = uint32(os.Getuid()), base
+	t.Cleanup(func() { trustUID, trustAnchor = oldUID, oldAnchor })
+	r.cfg.PkgKeysDir = filepath.Join(base, "trust", "keys")
+	r.cfg.KeyringDir = filepath.Join(base, "trust", "keyrings")
+	for _, d := range []string{filepath.Join(r.cfg.PkgKeysDir, "vendor", "trusted"), r.cfg.KeyringDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{filepath.Join(r.cfg.PkgKeysDir, "vendor", "trusted", "key1"), filepath.Join(r.cfg.KeyringDir, "debian-archive-keyring.gpg"), filepath.Join(r.cfg.KeyringDir, "k.gpg")} {
+		if err := os.WriteFile(f, []byte("key\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixModes(t, base)
 }

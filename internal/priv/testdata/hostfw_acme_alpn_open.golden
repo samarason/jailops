@@ -6,15 +6,11 @@ set skip on lo0
 set state-policy if-bound
 scrub in all fragment reassemble
 
-# translation: the NAT and the port forwards of the jails' networks
-nat-anchor "jailops/*"
-rdr-anchor "jailops/*"
-# ACME tls-alpn-01 challenges of the console's certificate: port 443 to the daemon's unprivileged port 39110
-rdr inet proto tcp from any to (self) port 443 -> 127.0.0.1 port 39110
-rdr inet6 proto tcp from any to (self) port 443 -> ::1 port 39110
-
-# filtering: the jails' own anchors first
+# the jails' anchors first: their filter rules and the NAT and port forwards of their networks
 anchor "jailops/*"
+# ACME tls-alpn-01 challenges of the console's certificate: port 443 to the daemon's unprivileged port 39110
+match in inet proto tcp from any to (self) port 443 rdr-to 127.0.0.1 port 39110
+match in inet6 proto tcp from any to (self) port 443 rdr-to ::1 port 39110
 # open template: everything may reach the host
 pass in all
 pass out all keep state

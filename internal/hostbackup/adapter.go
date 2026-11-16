@@ -16,9 +16,16 @@ type Backups interface {
 	Delete(ctx context.Context, id string) error
 	Preflight(ctx context.Context, req api.RestoreRequest) (api.RestorePreflight, error)
 	Restore(ctx context.Context, req api.RestoreRequest) (api.Jail, error)
+	// RestoreVolume restores a volume backup as a new volume of the project.
+	RestoreVolume(ctx context.Context, req api.RestoreRequest) (api.Volume, error)
 }
 
 var _ Backups = (*Service)(nil)
+
+// RestoreVolume implements Backups: it is RestoreVolumeBackup.
+func (s *Service) RestoreVolume(ctx context.Context, req api.RestoreRequest) (api.Volume, error) {
+	return s.RestoreVolumeBackup(ctx, req)
+}
 
 // List returns the backups this host knows about, newest first, from the
 // catalog (Reindex rebuilds it from the repository).

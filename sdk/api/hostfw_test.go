@@ -13,8 +13,8 @@ func TestHostFirewallValidateAndCanonical(t *testing.T) {
 		{Template: HostFirewallOpen},
 		{NAT: "none"},
 		{SSH: &HostFirewallSSH{Ports: []int{2222}, AllowFrom: []string{"192.0.2.7", "2001:DB8::/32", "0.0.0.0/0"}}},
-		{Template: HostFirewallCustom, Sets: []HostFirewallSet{{Name: "ops_1", Members: []string{"198.51.100.0/24"}}},
-			Allow: []HostFirewallAllow{{Proto: "udp", Ports: []string{"53", "60000-61000"}, From: []string{"@ops_1"}, Comment: "dns and mosh, ok: €"}}},
+		{Template: HostFirewallCustom, Sets: []HostFirewallSet{{Name: "ops-1", Members: []string{"198.51.100.0/24"}}},
+			Allow: []HostFirewallAllow{{Proto: "udp", Ports: []string{"53", "60000-61000"}, From: []string{"@ops-1"}, Comment: "dns and mosh, ok: €"}}},
 	}
 	for i, s := range ok {
 		if err := s.Validate(); err != nil {

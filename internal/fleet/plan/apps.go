@@ -93,7 +93,7 @@ func planApps(ctx context.Context, s *Session, c *sdk.Client, host string, live 
 		}
 		declared := map[string]bool{}
 		for _, g := range spec.Grants {
-			src, _ := model.CanonicalSource(o.Project, g.Source)
+			src, _ := model.CanonicalSource(g.Source)
 			ports, _ := model.NormalizePorts(g.Ports)
 			declared[src] = true
 			it := Item{Host: host, Kind: o.Kind, Project: o.Project, Name: o.Name + " from " + src, Desired: o,
@@ -115,7 +115,7 @@ func planApps(ctx context.Context, s *Session, c *sdk.Client, host string, live 
 				continue
 			case g.Database != "" && lg.Database != "" && g.Database != lg.Database:
 				it.Action = ActionError
-				it.Details = []string{fmt.Sprintf("%s has access to database %s on the host, %s is declared; the database of a grant does not change: deny it first (jailops app deny %s from %s)", src, lg.Database, g.Database, o.Name, src)}
+				it.Details = []string{fmt.Sprintf("%s has access to database %s on the host, %s is declared; the database of a grant does not change: deny it first (jailops app deny %s --from %s)", src, lg.Database, g.Database, o.Name, src)}
 				work = append(work, it)
 				continue
 			}

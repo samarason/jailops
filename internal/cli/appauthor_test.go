@@ -26,7 +26,7 @@ func TestAppNew(t *testing.T) {
 	tr.do("", "app", "validate", filepath.Join(dir, "memcached.yaml"))
 	tr.do("", "app", "new", "memcached", "--dir", dir)
 	icon := writeFile(t, dir, "memcached.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"/>", 0o644) // the author's own icon
-	tr.ok("app", "new", "memcached", "--package", "memcached,libevent", "--port", "11211", "--port", "11211/udp", "--dir", dir, "--force")
+	tr.ok("app", "new", "memcached", "--package", "memcached,libevent", "--port", "11211", "--port", "11211/udp", "--dir", dir, "--overwrite")
 	if b, _ := os.ReadFile(icon); !strings.HasPrefix(string(b), "<svg xmlns=\"http://www.w3.org/2000/svg\"/>") {
 		t.Errorf("the icon was overwritten: %s", b)
 	}
@@ -74,10 +74,10 @@ func TestAppNew(t *testing.T) {
 func TestAppExport(t *testing.T) {
 	h := newHarness(t)
 	h.srv.SeedJail(api.Jail{Metadata: api.ObjectMeta{Name: "cache", Project: "main"},
-		Spec:   api.JailSpec{Image: "freebsd-15@stable", Volumes: []api.VolumeMount{{Name: "var-db-memcached", Mount: "/var/db/memcached"}}},
+		Spec:   api.JailSpec{Image: "freebsd-15@stable", Volumes: []api.VolumeAttach{{Name: "var-db-memcached", Mount: "/var/db/memcached"}}},
 		Status: api.JailStatus{Power: api.PowerRunning, Generation: "g1"}})
 	h.srv.SeedJail(api.Jail{Metadata: api.ObjectMeta{Name: "plain", Project: "main"},
-		Spec:   api.JailSpec{Image: "freebsd-15@stable", Volumes: []api.VolumeMount{{Name: "srv", Mount: "/var/db/plain"}}},
+		Spec:   api.JailSpec{Image: "freebsd-15@stable", Volumes: []api.VolumeAttach{{Name: "srv", Mount: "/var/db/plain"}}},
 		Status: api.JailStatus{Power: api.PowerRunning, Generation: "g1"}})
 	h.srv.SeedJail(api.Jail{Metadata: api.ObjectMeta{Name: "off", Project: "main"}, Spec: api.JailSpec{Image: "freebsd-15@stable"}})
 	// what the daemon would answer for a jail that runs memcached (internal/apps builds it from the jail's answers)
@@ -92,11 +92,12 @@ func TestAppExport(t *testing.T) {
 	out := filepath.Join(h.dir, "cache.yaml")
 	tr := h.transcript()
 	tr.ok("app", "export", "cache")
-	tr.ok("app", "export", "cache", "-o", out)
+	tr.ok("app", "export", "cache", "--file", out)
 	tr.do("", "app", "validate", out)
-	tr.do("", "app", "export", "cache", "-o", out)
-	tr.ok("app", "export", "cache", "-o", filepath.Join(h.dir, "other.yaml"))
-	tr.ok("app", "export", "cache", "--output", out, "--force", "-q")
+	tr.do("", "app", "export", "cache", "--file", out)
+	tr.ok("app", "export", "cache", "--file", filepath.Join(h.dir, "other.yaml"))
+	tr.ok("app", "export", "cache", "-o", "json")
+	tr.do("", "app", "export", "cache", "-o", "csv")
 	tr.ok("app", "export", "plain")
 	tr.do("", "app", "export", "off")
 	tr.do("", "app", "export", "missing")
@@ -110,17 +111,14 @@ func TestAppExport(t *testing.T) {
 	if _, err := apps.Parse("cache", data); err != nil {
 		t.Fatalf("%v\n%s", err, data)
 	}
-	// -o is the file here, never an output format
+	// -o is the output format, as everywhere: -o json prints the draft as data and writes no file named json
 	t.Chdir(h.dir)
-	if _, errs, code := h.run("", "app", "export", "cache", "-o", "json", "--force"); code != 0 {
-		t.Fatal(errs)
+	out2, errs, code := h.run("", "app", "export", "cache", "-o", "json")
+	if code != 0 || !strings.Contains(out2, `"definition"`) {
+		t.Fatalf("%d %q %s", code, out2, errs)
 	}
-	if b, err := os.ReadFile("json"); err == nil {
-		if !strings.Contains(string(b), "name: cache") {
-			t.Errorf("%s", b)
-		}
-	} else {
-		t.Error(err)
+	if _, err := os.Stat("json"); err == nil {
+		t.Error("-o json wrote a file")
 	}
 }
 

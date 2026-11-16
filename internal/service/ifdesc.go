@@ -13,8 +13,8 @@ import (
 	"jailops.net/jailops/sdk/api"
 )
 
-// doctorDescriptions is the check net.descriptions: every interface JailOps owns carries its description (a bridge,
-// the two ends of a network's gateway pair, both ends of every running jail's epairs, every WireGuard interface).
+// doctorDescriptions is the check net.descriptions: every interface JailOps owns carries its description (both ends of
+// every running jail's epairs, every WireGuard interface).
 // What is missing or different is listed; the reconcile loop sets it on its next pass. An interface with a name
 // JailOps would use but a description it does not write is foreign and left to the network checks.
 func (s *Service) doctorDescriptions(ctx context.Context, c *checkSet) {
@@ -43,15 +43,7 @@ func (s *Service) doctorDescriptions(ctx context.Context, c *checkSet) {
 		}
 		return "\"" + d + "\""
 	}
-	for _, n := range des.Networks {
-		for _, st := range n.Steps {
-			// a bridge or gateway end without the network's text (or its earlier marker) is not taken as ours
-			if i, ok := ifs[st.Iface]; ok && st.Op == render.OpSetDescription && st.Arg != "" && i.Description != st.Arg && render.OwnsIface(i.Description, n.ID, st.Arg) {
-				bad = append(bad, st.Iface+" ("+quote(i.Description)+")")
-			}
-		}
-	}
-	// a jail's epairs are named after the jail: one with no description or an earlier one of JailOps is the jail's
+	// a jail's epairs are named after the jail: one with no description or another JailOps text is the jail's
 	check := func(name, want string) {
 		if i, ok := ifs[name]; ok && want != "" && i.Description != want && (i.Description == "" || render.IsJailOpsDesc(i.Description)) {
 			bad = append(bad, name+" ("+quote(i.Description)+")")

@@ -106,8 +106,8 @@ func TestRegisterStorageValidation(t *testing.T) {
 	if err := e.local.RegisterStorage(adm, "tank/second"); err != nil {
 		t.Fatal(err)
 	}
-	e.addDS("tank/wide", map[string]string{"jailops:managed": "on", "mountpoint": filepath.Join(e.base, "wide")})
-	e.addDS("tank/wide/narrow", map[string]string{"jailops:managed": "on", "mountpoint": filepath.Join(e.base, "narrow")})
+	e.root("tank/wide")
+	e.root("tank/wide/narrow")
 	if err := e.local.RegisterStorage(adm, "tank/wide/narrow"); err != nil {
 		t.Fatal(err)
 	}

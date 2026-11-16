@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,61 +24,93 @@ import (
 )
 
 // Installing an app (docs/apps.md, "How the installation works") is one
-// operation: a thin jail with the data paths as volumes, started, the
-// packages installed from the host with pkg -r, rc.conf written, the setup
-// commands and the services run in the jail, the health check, the
-// snapshot. Every step is a plan step. A failure before the first start
-// undoes the creation; after it the jail is stopped and kept, so what went
-// wrong can be looked at. UNVERIFIED on FreeBSD: the pkg -r invocations
-// against a running jail and the rc.d calls through jexec.
+// operation: a thin jail with the data paths as volumes, the packages installed
+// from the host into its root with pkg -r while it has never run, then started,
+// rc.conf written, the setup commands and the services run in the jail, the
+// health check, the snapshot. Every step is a plan step. A failure before the
+// packages go in undoes the creation; from there on the jail is stopped and
+// kept, so what went wrong can be looked at.
 
 // installState is what the steps of one installation share.
 type installState struct {
 	started  bool
+	kept     bool // the root was mounted and the packages are going in: a failure leaves the jail, stopped, to look at
 	version  string
 	snapshot string
 }
 
 // defaultAppImage is the image an app is installed from when the request names
-// none: the only FreeBSD image the caller may use that has the alias stable,
-// as NAME@stable. None or several is refused with the images there are.
+// none, by its bare name (its newest generation): of the FreeBSD images the
+// caller may use, the one of the highest release the host's kernel can run,
+// the first by name when two have that release. No FreeBSD image, or only
+// images of a newer release than the host's, is refused with the images there are.
 func (s *Service) defaultAppImage(ctx context.Context) (string, error) {
 	objs, err := s.imgKind.list()
 	if err != nil {
 		return "", err
 	}
-	var all, found []string
+	host := s.hostBaseRelease()
+	var all []string
+	best, bestRel, freebsd := "", "", 0
 	for _, o := range objs {
 		if !s.imageVisible(ctx, o.Meta.Name) {
 			continue
 		}
 		all = append(all, o.Meta.Name)
-		if o.Spec.OS == api.OSFreeBSD && slices.Contains(o.Spec.Aliases, apps.DefaultAlias) {
-			found = append(found, o.Meta.Name)
+		if o.Spec.OS != api.OSFreeBSD {
+			continue
+		}
+		freebsd++
+		if _, err := apps.ReleaseAtLeast(o.Spec.Release, "15.1"); err != nil {
+			continue // a release that cannot be compared is never a default
+		}
+		if host != "" {
+			if ok, err := apps.ReleaseAtLeast(host, o.Spec.Release); err == nil && !ok {
+				continue // newer than the running kernel
+			}
+		}
+		if best == "" || newerRelease(o.Spec.Release, bestRel) || sameRelease(o.Spec.Release, bestRel) && o.Meta.Name < best {
+			best, bestRel = o.Meta.Name, o.Spec.Release
 		}
 	}
-	if len(found) == 1 {
-		return found[0] + "@" + apps.DefaultAlias, nil
+	if best != "" {
+		return best, nil
 	}
 	sort.Strings(all)
-	sort.Strings(found)
-	example, yours := "freebsd-15@"+apps.DefaultAlias, "you have no images"
-	if len(found) > 1 {
-		example = found[0] + "@" + apps.DefaultAlias
-	}
+	yours := "you have no images"
 	if len(all) > 0 {
 		yours = "your images: " + strings.Join(all, ", ")
 	}
-	msg := fmt.Sprintf("no image named, and no FreeBSD image has the alias %s to default to", apps.DefaultAlias)
-	if len(found) > 1 {
-		msg = fmt.Sprintf("no image named, and %d FreeBSD images have the alias %s (%s), so there is no default", len(found), apps.DefaultAlias, strings.Join(found, ", "))
+	if freebsd == 0 {
+		// nothing to name: the base image is missing, and the hint says how to make it
+		hint := api.ImageCreateHint("the base image", "", "", host)
+		if len(all) > 0 {
+			hint += "; " + yours
+		}
+		return "", invalid("no image named, and there is no FreeBSD image yet").WithHint(hint)
 	}
-	return "", invalid("%s", msg).WithHint("name an image with --image, for example " + example + "; " + yours)
+	msg := "no image named, and no FreeBSD image has a release this host can run"
+	if host != "" {
+		msg = fmt.Sprintf("no image named, and every FreeBSD image is of a newer release than this host (%s)", host)
+	}
+	return "", invalid("%s", msg).WithHint("name an image with --image; " + yours)
+}
+
+// newerRelease reports whether release a is newer than release b; both compare.
+func newerRelease(a, b string) bool {
+	ok, err := apps.ReleaseAtLeast(b, a)
+	return err == nil && !ok
+}
+
+func sameRelease(a, b string) bool {
+	x, err1 := apps.ReleaseAtLeast(a, b)
+	y, err2 := apps.ReleaseAtLeast(b, a)
+	return err1 == nil && err2 == nil && x && y
 }
 
 // InstallApp answers POST /api/v1/apps/<name>/install. Everything that can
 // be refused is refused before the operation starts: an unknown or invalid
-// definition, a jail that exists, an image of an older release, a network or
+// definition, a jail that exists, an image that is not present, a network or
 // storage the project is not granted.
 func (s *Service) InstallApp(ctx context.Context, name string, req api.AppInstall) (api.Operation, error) {
 	if err := s.requireHost("apps"); err != nil {
@@ -138,15 +169,21 @@ func (s *Service) InstallApp(ctx context.Context, name string, req api.AppInstal
 	if _, _, err := s.accessPolicy(proj, jail); err != nil {
 		return api.Operation{}, err
 	}
+	for _, v := range apps.Volumes(jail, app.Data) {
+		if s.volKind.p(proj).exists(v.Name) {
+			return api.Operation{}, api.Errorf(api.CodeAlreadyExists, "volume %q already exists", v.Name).
+				WithHint("an earlier jail of this name left it: keep its files by attaching it to a jail made by hand, or delete it with jailops volume delete " + v.Name)
+		}
+	}
 	if err := validate.Name("policy", apps.AccessPolicyName(jail)); err != nil {
 		return api.Operation{}, invalid("jail name %q is too long: its firewall policy %s must be a name too", jail, apps.AccessPolicyName(jail))
 	}
 	network, storage := req.Network, req.Storage
-	if network == "" && len(p.Spec.Networks) == 1 {
-		network = p.Spec.Networks[0].Network
+	if network == "" {
+		network = p.Spec.SoleNetwork()
 	}
-	if storage == "" && len(p.Spec.Storage) == 1 && p.Spec.Storage[0].Storage != "*" {
-		storage = p.Spec.Storage[0].Storage
+	if storage == "" {
+		storage = p.Spec.SoleStorage()
 	}
 	if network == "" {
 		return api.Operation{}, invalid("name the network the jail is attached to (--network NAME); project %q is granted %s", proj, grantedNames(p.Spec)).
@@ -169,9 +206,10 @@ func (s *Service) InstallApp(ctx context.Context, name string, req api.AppInstal
 	spec := api.JailSpec{
 		Image: image, Storage: storage, Hostname: jail, Layout: api.LayoutThin,
 		Network:   []api.NetworkAttach{{Network: network}},
-		Volumes:   apps.Volumes(app.Data),
+		Volumes:   apps.Volumes(jail, app.Data),
 		Resources: limits,
 		SysVIPC:   app.SysVIPC,
+		Boot:      api.BootPolicy{StopTimeout: app.StopTimeout},
 	}
 	im, ref, err := s.imageFor(spec)
 	if err != nil {
@@ -199,7 +237,14 @@ func (s *Service) InstallApp(ctx context.Context, name string, req api.AppInstal
 	if err := s.validateJail(proj, jail, spec); err != nil {
 		return api.Operation{}, err
 	}
+	if err := canonicalJailSizes(&spec); err != nil {
+		return api.Operation{}, err
+	}
+	if err := s.checkNewJail(proj, jail, spec); err != nil {
+		return api.Operation{}, err
+	}
 	spec.OS = im.Spec.OS
+	s.shellDefaults(&spec, nil)
 	now := s.now().UTC()
 	meta := api.ObjectMeta{Name: jail, Project: proj, UUID: state_uuid(), Scope: api.ScopeHost, Host: s.d.HostUUID, Generation: 1,
 		Labels: map[string]string{api.LabelApp: name, api.LabelAppHash: e.Hash}, CreatedAt: now, UpdatedAt: now}
@@ -288,11 +333,11 @@ func (s *Service) appInstallRun(ctx context.Context, h *OpHandle, p project, e a
 		return nil, err
 	}
 	err = s.life.Executor.Run(ctx, "app-install/"+key, pl)
-	kept = st.started
+	kept = st.started || st.kept
 	if err != nil {
 		s.emitIn(ctx, proj, "app.install.failed", "/api/v1/jails/"+jail)
 		s.kick()
-		return nil, installError(err, app.Name, jail, st.started)
+		return nil, installError(err, app.Name, jail, st.started || st.kept)
 	}
 	s.emitIn(ctx, proj, "app.installed", "/api/v1/jails/"+jail)
 	s.kick()
@@ -341,16 +386,41 @@ func installError(err error, app, jail string, kept bool) error {
 	return out.WithHint(hint)
 }
 
-// appInstallPlan builds the eight steps of docs/apps.md as plan steps. The
-// create step undoes itself (the jail is deleted) only while the jail was
-// never started, also when it fails after the jail was made; from the start
-// on, a failure stops the jail and keeps it.
+// appInstallPlan builds the steps of docs/apps.md as plan steps. The create step
+// undoes itself (the jail is deleted) only until the root is mounted for the
+// packages; from there on, a failure stops the jail if it runs and keeps it.
 func (s *Service) appInstallPlan(h *OpHandle, nj api.Jail, app api.App, st *installState, created func()) *plan.Plan {
 	key := jailKey(nj)
 	proj, jail := nj.Metadata.Project, nj.Metadata.Name
 	root := s.rootMount(key)
 	pl := plan.New("install-app " + app.Name + " " + key)
-	pl.Add(plan.Step{Name: "create-jail", Describe: fmt.Sprintf("create thin jail %s from %s with %d data volume(s) and the labels %s, %s", jail, nj.Spec.Image, len(nj.Spec.Volumes), api.LabelApp, api.LabelAppHash),
+	// The data of the app are volumes of the project, <jail>-<name>, made before the jail that attaches them. They
+	// are never deleted with the jail; a failed installation removes the ones it made.
+	for _, v := range nj.Spec.Volumes {
+		v := v
+		pl.Add(plan.Step{Name: "create-volume-" + v.Name, Describe: fmt.Sprintf("create volume %s for %s", v.Name, v.Mount),
+			Do: func(ctx context.Context) error {
+				p, err := s.projKind.get(proj)
+				if err != nil {
+					return err
+				}
+				si, ok := s.storage(nj.Spec.Storage)
+				if !ok {
+					return notFound("storage", nj.Spec.Storage)
+				}
+				spec := api.VolumeSpec{Storage: si.Name, Mode: "0755", Comment: "data of " + jail + " (" + app.Name + "): " + v.Mount}
+				meta := api.ObjectMeta{Name: v.Name, Project: proj, Labels: map[string]string{api.LabelApp: app.Name}}
+				_, err = s.makeVolume(ctx, project{Meta: p.Meta, Spec: p.Spec}, si, meta, spec, 0o755, nil, false)
+				return err
+			},
+			Undo: func(ctx context.Context) error {
+				if st.started || st.kept {
+					return nil // kept with the jail for inspection
+				}
+				return s.dropVolume(ctx, proj, v.Name)
+			}, UndoOnFail: true})
+	}
+	pl.Add(plan.Step{Name: "create-jail", Describe: fmt.Sprintf("create thin jail %s from %s attaching %d volume(s), with the labels %s, %s", jail, nj.Spec.Image, len(nj.Spec.Volumes), api.LabelApp, api.LabelAppHash),
 		Do: func(ctx context.Context) error {
 			defer created()
 			if err := h.Bind("create/"+key, &opRequest{Kind: "create", Jail: key, Create: &nj}); err != nil {
@@ -366,11 +436,74 @@ func (s *Service) appInstallPlan(h *OpHandle, nj api.Jail, app api.App, st *inst
 			return nil
 		},
 		Undo: func(ctx context.Context) error {
-			if st.started {
+			if st.started || st.kept {
 				return nil // kept for inspection
 			}
 			return s.dropCreatedJail(ctx, proj, key)
 		}, UndoOnFail: true})
+	// The packages go in while the jail has never run: the host writes into its root as root, and the root of a
+	// jail that runs belongs to whatever runs in it. The datasets are mounted for that and the start mounts them anyway.
+	pl.Add(plan.Step{Name: "mount-jail", Describe: "mount the datasets of " + jail + " on the host, so the packages can be installed before it first runs",
+		Do: func(ctx context.Context) error {
+			if err := s.life.MountTree(ctx, key); err != nil {
+				return err
+			}
+			st.kept = true
+			return nil
+		},
+		Undo: func(ctx context.Context) error { return s.life.UnmountTree(ctx, key) }, UndoOnFail: true})
+	if len(nj.Spec.Volumes) > 0 {
+		// The volumes of the app cover directories of the packages (/usr/local/www, /var/db/postgres): bound into the
+		// root as they are when the jail runs, the files of the packages land in them.
+		pl.Add(plan.Step{Name: "bind-volumes", Describe: "mount the volumes of " + jail + " into its root, as its start does, so the files of the packages go into them",
+			Do:   func(ctx context.Context) error { return s.life.BindVolumes(ctx, key) },
+			Undo: func(ctx context.Context) error { return s.life.UnbindVolumes(ctx, key) }, UndoOnFail: true})
+	}
+	ports, jailops := apps.PackageGroups(app.Packages)
+	for _, grp := range []struct {
+		repo  string
+		names []string
+	}{{"ports", ports}, {apps.JailopsRepo, jailops}} {
+		if len(grp.names) == 0 {
+			continue
+		}
+		argv := apps.PkgInstallCachedArgv(root, grp.repo, s.pkgCache(), grp.names)
+		pl.Add(plan.Step{Name: "install-packages-" + grp.repo, Describe: strings.Join(argv, " "),
+			Do: func(ctx context.Context) error { return s.runHost(ctx, 60*time.Minute, argv) }})
+		if grp.repo == apps.JailopsRepo {
+			pl.Add(plan.Step{Name: "seed-jailops-repo", Describe: "copy the configuration and the key of the " + apps.JailopsRepo + " repository into the jail, so that its packages are updated from it",
+				Do: func(ctx context.Context) error { return s.seedJailopsRepo(ctx, root) }})
+		}
+	}
+	if nj.Spec.OS == api.OSFreeBSD && nj.Spec.Shell == api.BashPath {
+		// the jail's shell goes in with the packages, while nothing runs in the root (docs/shell.md)
+		argv := apps.PkgInstallCachedArgv(root, "ports", s.pkgCache(), []string{api.BashPackage})
+		pl.Add(plan.Step{Name: "install-bash", Describe: strings.Join(argv, " ") + ", the shell of the jail",
+			Do: func(ctx context.Context) error {
+				if ok, _ := s.d.Files.Exists(ctx, root+api.BashPath); ok {
+					return nil
+				}
+				return s.runHost(ctx, 30*time.Minute, argv)
+			}})
+	}
+	first := app.Packages[0].Name
+	pl.Add(plan.Step{Name: "record-version", Describe: strings.Join(apps.PkgVersionArgv(root, first), " ") + ", then label " + api.LabelAppVersion,
+		Do: func(ctx context.Context) error {
+			out, err := s.d.Run.Run(ctx, run.Cmd{Name: "pkg", Args: apps.PkgVersionArgv(root, first)[1:], Timeout: 5 * time.Minute})
+			if err != nil {
+				return fmt.Errorf("pkg query %s: %w: %s", first, err, tailOf(append(out.Stdout, out.Stderr...)))
+			}
+			v, ok := packageVersion(out.Stdout)
+			if !ok {
+				return fmt.Errorf("pkg query %s answered %q, not a version", first, tailOf(out.Stdout))
+			}
+			st.version = v
+			return s.setJailLabels(ctx, key, map[string]string{api.LabelAppVersion: v})
+		}})
+	if len(nj.Spec.Volumes) > 0 {
+		pl.Add(plan.Step{Name: "unbind-volumes", Describe: "unmount them again: the start mounts them",
+			Do: func(ctx context.Context) error { return s.life.UnbindVolumes(ctx, key) }})
+	}
 	pl.Add(plan.Step{Name: "start-jail", Describe: "start " + jail,
 		Do: func(ctx context.Context) error {
 			if err := s.life.StartJail(ctx, key); err != nil {
@@ -389,17 +522,16 @@ func (s *Service) appInstallPlan(h *OpHandle, nj api.Jail, app api.App, st *inst
 			s.emitIn(ctx, proj, "jail-stopped", "/api/v1/jails/"+jail)
 			return nil
 		}, UndoOnFail: true})
-	ports, jailops := apps.PackageGroups(app.Packages)
-	for _, grp := range []struct {
-		repo  string
-		names []string
-	}{{"ports", ports}, {apps.JailopsRepo, jailops}} {
-		if len(grp.names) == 0 {
-			continue
-		}
-		argv := apps.PkgInstallArgv(root, grp.repo, grp.names)
-		pl.Add(plan.Step{Name: "install-packages-" + grp.repo, Describe: strings.Join(argv, " "),
-			Do: func(ctx context.Context) error { return s.runHost(ctx, 60*time.Minute, argv) }})
+	if desc := s.shellStepDescribe(key, nj.Spec); desc != "" {
+		// like a jail created by hand: bash and the prompt (docs/shell.md). A failure does not stop the
+		// installation; it is the jail's ShellSetup condition and `jailops jail shell-setup` tries again.
+		pl.Add(plan.Step{Name: "set-up-shell", Describe: desc,
+			Do: func(ctx context.Context) error {
+				if _, err := s.setUpShell(ctx, key, nj.Spec, true); err != nil {
+					s.log.Warn("shell setup", "jail", key, "err", err)
+				}
+				return nil
+			}})
 	}
 	// The library cache of a running jail was built before the packages put their libraries in /usr/local/lib; pkg
 	// -r does not run the ldconfig trigger of the jail, so a program would not find them.
@@ -407,20 +539,6 @@ func (s *Service) appInstallPlan(h *OpHandle, nj api.Jail, app api.App, st *inst
 		Do: func(ctx context.Context) error {
 			_, err := s.runInJail(ctx, key, 5*time.Minute, "/sbin/ldconfig", "-m", "/usr/local/lib")
 			return err
-		}})
-	first := app.Packages[0].Name
-	pl.Add(plan.Step{Name: "record-version", Describe: strings.Join(apps.PkgVersionArgv(root, first), " ") + ", then label " + api.LabelAppVersion,
-		Do: func(ctx context.Context) error {
-			out, err := s.d.Run.Run(ctx, run.Cmd{Name: "pkg", Args: apps.PkgVersionArgv(root, first)[1:], Timeout: 5 * time.Minute})
-			if err != nil {
-				return fmt.Errorf("pkg query %s: %w: %s", first, err, tailOf(append(out.Stdout, out.Stderr...)))
-			}
-			v, ok := packageVersion(out.Stdout)
-			if !ok {
-				return fmt.Errorf("pkg query %s answered %q, not a version", first, tailOf(out.Stdout))
-			}
-			st.version = v
-			return s.setJailLabels(ctx, key, map[string]string{api.LabelAppVersion: v})
 		}})
 	if vars := apps.RcVars(app.Services); len(vars) > 0 {
 		var names []string
@@ -479,7 +597,7 @@ func (s *Service) appInstallPlan(h *OpHandle, nj api.Jail, app api.App, st *inst
 	}
 	// Default closed: from here on nothing reaches the jail until a source is allowed (docs/apps.md, "Who may
 	// connect"). It comes after the health check, which connects from the host.
-	pl.Add(plan.Step{Name: "close-firewall", Describe: "firewall policy " + apps.AccessPolicyName(jail) + " (managed by app access): deny every inbound connection until jailops app allow " + jail + " from SOURCE",
+	pl.Add(plan.Step{Name: "close-firewall", Describe: "firewall policy " + apps.AccessPolicyName(jail) + " (managed by app access): deny every inbound connection until jailops app allow " + jail + " --from SOURCE",
 		Do: func(ctx context.Context) error { return s.closeApp(ctx, proj, jail) }})
 	pl.Add(plan.Step{Name: "snapshot", Describe: "snapshot every dataset of " + jail + " as " + apps.SnapshotName,
 		Do: func(ctx context.Context) error {
@@ -491,6 +609,10 @@ func (s *Service) appInstallPlan(h *OpHandle, nj api.Jail, app api.App, st *inst
 			s.emitIn(ctx, proj, "jail-snapshot-created", "/api/v1/jails/"+jail+"/snapshots/"+r.Name)
 			return nil
 		}})
+	// An installed service is meant to run: it comes back when the host boots. The last step, so that an interrupted
+	// or failed installation, which is kept stopped for inspection, never starts again by itself.
+	pl.Add(plan.Step{Name: "enable-autostart", Describe: "boot.autostart of " + jail + ": start with the host",
+		Do: func(ctx context.Context) error { return s.setJailAutostart(ctx, key, true) }})
 	return pl
 }
 
@@ -561,6 +683,27 @@ func (s *Service) setJailLabels(ctx context.Context, key string, set map[string]
 	for k, v := range set {
 		nj.Metadata.Labels[k] = v
 	}
+	nj.Metadata.Generation++
+	nj.Metadata.UpdatedAt = s.now().UTC()
+	if err := s.writeJailRecord(ctx, nj); err != nil {
+		return internal(err)
+	}
+	s.mu.Lock()
+	if e := s.jails[key]; e != nil {
+		nj.Status.Generation = e.jail.Status.Generation
+		e.jail = nj
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// setJailAutostart writes boot.autostart of a jail without touching anything else of it.
+func (s *Service) setJailAutostart(ctx context.Context, key string, on bool) error {
+	nj, err := s.jailSnapshot(key)
+	if err != nil {
+		return err
+	}
+	nj.Spec.Boot.Autostart = on
 	nj.Metadata.Generation++
 	nj.Metadata.UpdatedAt = s.now().UTC()
 	if err := s.writeJailRecord(ctx, nj); err != nil {

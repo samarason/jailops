@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # the end-to-end tests run `vite preview` on the built consoles (web/host/playwright.config.ts: "build first")
+      # the end-to-end tests build a demo of each console (JAILOPS_DEMO_BUILD=1) and serve it with `vite preview`
       - uses: actions/download-artifact@v8
         with:
           name: console-dist
@@ -100,7 +100,8 @@ jobs:
       # trustworthy mirrors (Canonical's three and kernel.org's edge mirror, all serving Ubuntu-signed indexes) download the
       # package index for 5 seconds at once, and the list apt reads is rewritten in speed order with every mirror kept as a
       # fallback: a download that stalls for 10 seconds is dropped and apt moves to the next mirror; failed downloads are
-      # retried. The retry file keeps the image's own name, as apt.conf.d files sort and the later one wins.
+      # retried. The retry file keeps the image's own name, as apt.conf.d files sort and the later one wins. Every mirror is
+      # named with https (apt checks the signed indexes either way; a mirror that does not answer https ranks last).
       - name: Fastest apt mirror, retries
         run: |
           printf 'Acquire::Retries "5";\nAcquire::http::Timeout "10";\nAcquire::https::Timeout "10";\n' | sudo tee /etc/apt/apt.conf.d/zz-retries >/dev/null
@@ -108,7 +109,7 @@ jobs:
           list=/etc/apt/apt-mirrors.txt
           [ -f "$list" ] || exit 0
           . /etc/os-release
-          mirrors="http://azure.archive.ubuntu.com/ubuntu/ https://archive.ubuntu.com/ubuntu/ https://security.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/"
+          mirrors="https://azure.archive.ubuntu.com/ubuntu/ https://archive.ubuntu.com/ubuntu/ https://security.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/"
           speeds=$(mktemp)
           for m in $mirrors; do
             curl -sf -o /dev/null --max-time 5 -w "%{speed_download} $m\n" "${m}dists/$VERSION_CODENAME/main/binary-amd64/Packages.gz" >>"$speeds" &
@@ -175,6 +176,8 @@ jobs:
       - run: go build ./...
       - name: Wire types are current
         run: go run ./scripts/gen-ts -check
+      - name: The end-to-end scripts wait for conditions, not for seconds
+        run: sh scripts/lint-e2e.sh
       - name: The race shards cover every package exactly once
         run: bash scripts/ci-race.sh --check
       - name: SDK module (stdlib only, outside the go.work workspace so that only its own go.mod counts)
@@ -185,6 +188,10 @@ jobs:
           go vet ./...
           CGO_ENABLED=1 go test ./... -race -count=1
           test -z "$(go list -m all | tail -n +2)" || { echo "the SDK must have no dependencies"; go list -m all; exit 1; }
+      - name: jailops-setup (the installer script, against fake pfctl, sysrc, zpool and service)
+        run: |
+          sh scripts/jailops-setup-test.sh
+          command -v dash >/dev/null && SH=dash sh scripts/jailops-setup-test.sh || true
 
   # Fuzzing beside the other Go jobs (go allows one fuzz target per run; longer on the nightly run).
   fuzz:

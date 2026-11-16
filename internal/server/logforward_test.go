@@ -5,6 +5,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,6 +168,8 @@ func TestLogForwardOverHTTP(t *testing.T) {
 		},
 		LogForwardTune: func(env *logfwd.Env) {
 			env.Poll, env.Refresh = 5*time.Millisecond, 5*time.Millisecond
+			// the receivers of this test listen on the loopback address; TestLogForwardAPISinkLimits checks the guard
+			env.TargetCheck = func(netip.AddrPort) error { return nil }
 			env.CheckFile = func(p string, _ bool) error {
 				if strings.HasPrefix(p, "/bad") {
 					return errors.New(p + " is not owned by root")
@@ -318,7 +323,7 @@ func TestLogForwardDoctor(t *testing.T) {
 		clk.move(2 * time.Second)
 	}
 	check := func() api.DoctorCheck {
-		rep, err := e.Client(api.PermReadonly).Doctor(c)
+		rep, err := e.Global().Doctor(c)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -337,5 +342,60 @@ func TestLogForwardDoctor(t *testing.T) {
 	ch := check()
 	if ch.Status != api.DoctorWarn || !strings.Contains(ch.Message, "down (since ") || strings.Contains(ch.Message, dead) {
 		t.Fatalf("%+v", ch)
+	}
+}
+
+// A sink set through the API may not send to this host's loopback or link-local addresses (a name is checked on
+// the address it resolves to, when it is dialled) and reads its files only from logging.secrets_dir; a sink of
+// jailopsd.yaml still delivers to the loopback address. The forward test answers a short class, not what the
+// receiver said.
+func TestLogForwardAPISinkLimits(t *testing.T) {
+	a := newListener(t)
+	secrets := t.TempDir()
+	tok := filepath.Join(secrets, "hook.token")
+	if err := os.WriteFile(tok, []byte("t0k3n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := dtest.New(t, dtest.Options{
+		Mutate: func(c *daemon.Config) {
+			c.Logging.Forward = []api.LogSink{{Name: "file", Type: api.LogSinkSyslog, To: "tcp://" + a.ln.Addr().String(), Sources: api.LogSinkSource{NoJails: true, Audit: true}}}
+			c.Logging.SecretsDir = secrets
+		},
+		LogForwardTune: func(env *logfwd.Env) {
+			env.Poll, env.Refresh = 5*time.Millisecond, 5*time.Millisecond
+			env.CheckFile = func(string, bool) error { return nil } // the test's files are not root's
+			env.CheckDir = func(string) error { return nil }
+		},
+	})
+	e.Seed()
+	c := ctxT(t)
+	adm := e.Global()
+	// the file's sink delivers to the loopback address
+	res, err := adm.Logs().TestForward(c, "file")
+	if err != nil || !res.OK {
+		t.Fatalf("%v %+v", err, res)
+	}
+	a.await(t, res.Line)
+	_, port, _ := net.SplitHostPort(a.ln.Addr().String())
+	for _, bad := range []api.LogSink{
+		{Name: "lo", Type: api.LogSinkSyslog, To: "tcp://127.0.0.1:" + port},
+		{Name: "lo", Type: api.LogSinkSyslog, To: "udp://[::1]:514"},
+		{Name: "lo", Type: api.LogSinkSyslog, To: "tcp://localhost:" + port},
+		{Name: "md", Type: api.LogSinkWebhook, To: "https://169.254.169.254/latest"},
+		{Name: "w", Type: api.LogSinkWebhook, To: "https://hooks.example.com/in", TokenFile: "/usr/local/etc/jailops/priv.conf"},
+		{Name: "w", Type: api.LogSinkWebhook, To: "https://hooks.example.com/in", TokenFile: filepath.Join(secrets, "sub", "t")},
+		{Name: "w", Type: api.LogSinkWebhook, To: "https://hooks.example.com/in", CAFile: "/etc/ssl/cert.pem"},
+	} {
+		_, err := adm.Logs().SetForward(c, api.LogForwardSpec{Sinks: []api.LogSink{bad}}, 0)
+		wantCode(t, err, api.CodeInvalid)
+	}
+	ok := api.LogSink{Name: "w", Type: api.LogSinkWebhook, To: "https://hooks.example.com/in", TokenFile: tok}
+	if _, err := adm.Logs().SetForward(c, api.LogForwardSpec{Sinks: []api.LogSink{ok}}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// the stored list is the API's: its sink reads the token from the secrets directory at each send
+	f, err := adm.Logs().Forward(c)
+	if err != nil || f.Status.Origin != api.LogForwardFromAPI || f.Spec.Sinks[0].TokenFile != tok {
+		t.Fatalf("%v %+v", err, f)
 	}
 }

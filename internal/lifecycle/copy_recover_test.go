@@ -34,8 +34,12 @@ func TestCopyIsIndependentFullCopy(t *testing.T) {
 	if len(res.Warnings) != 0 {
 		t.Fatal(res.Warnings)
 	}
+	// a copy attaches no volume: two jails writing one by accident is not what a copy is for
+	if r, err := w.S.Rebuild(bg, "alpha_web2"); err != nil || len(r.Jail.Spec.Volumes) != 0 || len(w.attach["alpha_web2"]) != 0 {
+		t.Fatalf("the copy attaches %v (%v)", r.Jail.Spec.Volumes, err)
+	}
 	c2 := "tank/jailops/projects/alpha/jails/web2"
-	for _, d := range []string{c2, c2 + "/root", c2 + "/etc", c2 + "/home", c2 + "/data/db"} {
+	for _, d := range []string{c2, c2 + "/root", c2 + "/etc", c2 + "/home"} {
 		if o, _ := w.Z.Origin(bg, d); o != "" {
 			t.Errorf("%s is a clone of %s: a copy must be a full send/receive", d, o)
 		}
@@ -148,7 +152,7 @@ func TestRebuildProblems(t *testing.T) {
 			delete(w.Files.Data, "/jailops/projects/alpha/jails/web/spec.json.previous")
 		}, "spec.json", true},
 		{"missing persistent dataset", func(w *world) { w.Z.DestroyRecursive(bg, jc+"/home") }, "persistent dataset is missing: " + jc + "/home", false},
-		{"missing volume", func(w *world) { w.Z.DestroyRecursive(bg, jc+"/data/db") }, "volume dataset is missing: db", false},
+		{"missing volume", func(w *world) { w.Z.DestroyRecursive(bg, "tank/jailops/projects/alpha/volumes/db") }, "volume dataset is missing: db", false},
 		{"incomplete creation", func(w *world) { w.Z.Set(bg, jc, map[string]string{PropComplete: "off"}) }, "creation did not complete", false},
 		{"uuid mismatch", func(w *world) { w.Z.Set(bg, jc, map[string]string{PropID: "other"}) }, "uuid mismatch", false},
 	}

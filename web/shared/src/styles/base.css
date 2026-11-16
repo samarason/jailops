@@ -13,7 +13,9 @@ h3 { font-size: 13px; color: var(--text-2); text-transform: uppercase; letter-sp
 p { margin: 0 0 8px; }
 a { color: var(--accent); text-underline-offset: 2px; }
 a:hover { color: var(--accent-hover); }
-code, .mono, kbd { font-family: var(--font-mono); font-size: 0.93em; }
+code, kbd { font-family: var(--font-mono); font-size: 0.93em; }
+/* .mono changes the family only: a mono heading keeps the heading's size */
+.mono { font-family: var(--font-mono); }
 .num { font-variant-numeric: tabular-nums; text-align: right; }
 .muted { color: var(--text-2); }
 .faint { color: var(--text-3); }
@@ -46,10 +48,14 @@ button, input, select, textarea { font: inherit; color: inherit; }
 textarea { font-family: var(--font-mono); font-size: 13px; resize: vertical; }
 input[type='checkbox'], input[type='radio'] { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
 .invalid { border-color: var(--danger) !important; }
+input[readonly] { background: var(--surface-2); color: var(--text-2); }
 .field { display: grid; gap: 4px; margin-bottom: 12px; }
 .field > label, .field > .label { font-weight: 500; font-size: 13px; }
 .field .hint { color: var(--text-3); font-size: 12px; }
 .field .err { color: var(--danger); font-size: 12px; }
+/* a required field carries a visible marker; the reason a primary button does nothing yet sits next to it */
+.req { color: var(--danger); font-weight: 600; margin-left: 2px; }
+.why-disabled { color: var(--text-2); font-size: 12px; margin-right: auto; align-self: center; max-width: 100%; }
 .check { display: flex; gap: 8px; align-items: center; }
 
 /* Surfaces */
@@ -59,7 +65,14 @@ input[type='checkbox'], input[type='radio'] { width: 16px; height: 16px; accent-
 .stack { display: grid; gap: 12px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1 1 auto; min-width: 0; }
-.grid-2 { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+.grid-2 { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); align-items: start; }
+/* two fields side by side in a dialog: tops aligned, so a hint under one does not shift the other */
+.form-2 { display: grid; gap: 0 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); align-items: start; }
+/* buttons of one row or card: always a gap, wrapping on a narrow screen */
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+td.row-actions, td > .row-actions { white-space: normal; }
+/* the padded inner block of a panel, also when a wrapper (LoadState) sits between them */
+.panel-body { padding: 12px; overflow-wrap: anywhere; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 
 /* Tables: dense, scroll inside their wrapper rather than the page */
@@ -85,7 +98,9 @@ dl.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .pill.danger { background: var(--danger-bg); color: var(--danger); }
 .pill.info { background: var(--info-bg); color: var(--info); }
 .pill.pulse::before { animation: pulse 1.2s ease-in-out infinite; }
-.badge { display: inline-block; padding: 0 6px; border: 1px solid currentColor; border-radius: var(--radius); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.badge { display: inline-block; padding: 0 6px; border: 1px solid currentColor; border-radius: var(--radius); font-size: 12px; font-weight: 600; }
+/* pills and badges are in sentence case (lib/format sentence() for words that come from the server) */
+.badge::first-letter { text-transform: uppercase; }
 .badge.warn { color: var(--warn); }
 .badge.info { color: var(--info); }
 .badge.danger { color: var(--danger); }
@@ -126,6 +141,33 @@ dl.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 /* Grid and flex children may shrink below their content, so wide tables scroll inside their own wrapper */
 .stack > *, .grid-2 > *, .panel, .shell > * { min-width: 0; }
 @media (max-width: 800px) { .hide-sm { display: none; } }
+
+/* Responsive tables: below 600px a table with class rtable shows each row as a card. Every cell names its column
+   with data-label; the cell of row buttons (class actions) goes to the bottom of the card, full width. */
+@media (max-width: 600px) {
+  table.rtable thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  table.rtable, table.rtable tbody, table.rtable tr, table.rtable td, table.rtable tbody th { display: block; width: 100%; }
+  table.rtable tr { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  table.rtable tr:last-child { border-bottom: 0; }
+  table.rtable td, table.rtable tbody th { border: 0; padding: 2px 0; overflow-wrap: anywhere; white-space: normal; background: none; text-align: left; }
+  table.rtable td[data-label]:not([data-label=''])::before { content: attr(data-label); display: block; color: var(--text-2); font-family: var(--font-sans); font-size: 12px; font-weight: 500; }
+  table.rtable td.actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 8px; }
+  table.rtable td.actions::before { display: none !important; }
+  table.rtable td.check-cell { float: right; width: auto; }
+  table.rtable td:empty { display: none; }
+  table.rtable tr.drift { background: var(--warn-bg); }
+  table.rtable tr.drift td, table.rtable tr.drift th { background: none; }
+  .table-wrap:has(> table.rtable) { overflow-x: visible; }
+}
+
+/* Touch screens: every control at least 40px tall, icons buttons 40px wide */
+@media (pointer: coarse) {
+  .btn, .btn-sm, input[type='text'], input[type='password'], input[type='number'], input[type='search'], input[type='date'], select, .apps-chip { min-height: 40px; }
+  .btn-icon, .addr-copy { min-width: 40px; min-height: 40px; }
+  .navlink { min-height: 40px; }
+  .tabs a, .tabs button { min-height: 40px; }
+  input[type='checkbox'], input[type='radio'] { width: 22px; height: 22px; }
+}
 .toolbar { margin-bottom: 12px; }
 .plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
 tr.drift td, tr.drift th { background: var(--warn-bg); }
@@ -136,3 +178,4 @@ tr.drift td, tr.drift th { background: var(--warn-bg); }
 .scope-box .check { margin-bottom: 4px; }
 
 .field-error { display: block; margin-top: 4px; color: var(--danger); font-size: 12px; }
+.field-error:empty { display: none; }

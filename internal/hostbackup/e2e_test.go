@@ -153,7 +153,7 @@ func TestBackupTwiceUploadsOnlyChangedChunks(t *testing.T) {
 			t.Fatal("the thin root was captured")
 		}
 	}
-	if len(f.Result.Streams) != 4 { // ".", etc, local, data/db
+	if len(f.Result.Streams) != 4 { // ".", etc, local, db
 		t.Fatalf("streams = %+v", f.Result.Streams)
 	}
 
@@ -226,7 +226,7 @@ func TestRestoreToNewNameWithNetworkMap(t *testing.T) {
 		t.Fatalf("placement = %+v", pl)
 	}
 	// datasets: container, thin root cloned from the generation, persistent, volume with its parent
-	for _, ds := range []string{"", "/root", "/etc", "/local", "/data", "/data/db"} {
+	for _, ds := range []string{"", "/root", "/etc", "/local", "/db"} {
 		if ok, _ := r.w.Exists(bg, pl.Container+ds); !ok {
 			t.Fatalf("dataset %s%s missing", pl.Container, ds)
 		}
@@ -234,7 +234,7 @@ func TestRestoreToNewNameWithNetworkMap(t *testing.T) {
 	if o, _ := r.w.Origin(bg, pl.Container+"/root"); o != "tank/jailops/images/fbsd/g1@ro" {
 		t.Fatalf("root origin = %q", o)
 	}
-	props, _ := r.w.Get(bg, pl.Container+"/data/db", "mountpoint", "quota", "jailops:path", "jailops:id")
+	props, _ := r.w.Get(bg, pl.Container+"/db", "mountpoint", "quota", "jailops:path", "jailops:id")
 	if props["mountpoint"].Value != "/jo2/alpha/web2/root/var/db/app" || props["quota"].Value != "1G" || props["jailops:id"].Value != jl.Metadata.UUID {
 		t.Fatalf("volume props = %+v", props)
 	}
@@ -242,7 +242,7 @@ func TestRestoreToNewNameWithNetworkMap(t *testing.T) {
 		t.Fatalf("container props = %+v", c)
 	}
 	// the data is byte for byte the data of the source
-	for _, rel := range []string{"", "/etc", "/local", "/data/db"} {
+	for _, rel := range []string{"", "/etc", "/local", "/db"} {
 		want := readTree(t, r.w.m.liveDir(j.Container+rel))
 		got := readTree(t, r.w.m.liveDir(pl.Container+rel))
 		if len(want) != len(got) {
@@ -312,8 +312,8 @@ func TestRestoreRefusedWithoutTheKeyAndOnNewHost(t *testing.T) {
 	if jl.Metadata.Name != "web1" || jl.Metadata.UUID == "uuid-web1" {
 		t.Fatalf("restored = %+v", jl.Metadata)
 	}
-	want := readTree(t, r.w.m.liveDir(j.Container+"/data/db"))
-	gotT := readTree(t, h3.w.m.liveDir("tank/jailops/projects/alpha/jails/web1/data/db"))
+	want := readTree(t, r.w.m.liveDir(j.Container+"/db"))
+	gotT := readTree(t, h3.w.m.liveDir("tank/jailops/projects/alpha/jails/web1/db"))
 	if len(want) != len(gotT) {
 		t.Fatalf("restored %d entries, want %d", len(gotT), len(want))
 	}
@@ -367,7 +367,7 @@ func TestRestoreFilesAndSubtree(t *testing.T) {
 		t.Fatal("a single-file restore extracted other files")
 	}
 	dest2 := filepath.Join(t.TempDir(), "out2")
-	if _, err := r.svc.RestoreFiles(bg, FileRestore{Backup: bk.Metadata.Name, Dataset: "data/db", Paths: []string{"small"}, Dest: dest2}); err != nil {
+	if _, err := r.svc.RestoreFiles(bg, FileRestore{Backup: bk.Metadata.Name, Dataset: "db", Paths: []string{"small"}, Dest: dest2}); err != nil {
 		t.Fatal(err)
 	}
 	ents, _ := os.ReadDir(filepath.Join(dest2, "small"))
@@ -421,7 +421,7 @@ func TestReplaceParksTheOldJail(t *testing.T) {
 func TestHostPinsTheNodesKeyDomain(t *testing.T) {
 	env, nc := nodeServer(t)
 	foreign := "0123456789abcdef"
-	blob := []byte("age-encryption.org/v1 blob")
+	blob := []byte("age-encryption.org/v1\n-> X25519 stanza\nblob")
 	if err := env.Node.PutEscrow(bg, env.Host(t, "stranger"), foreign, bytes.NewReader(blob), int64(len(blob))); err != nil {
 		t.Fatal(err)
 	}

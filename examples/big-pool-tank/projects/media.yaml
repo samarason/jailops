@@ -10,4 +10,4 @@ spec:
     - {storage: default, quota: 100G}
     - {storage: bulk, quota: 12T}
   quotas: {jails: 10, memory: 24G}
-  firewall: floor
+  firewall_policies: [floor]

@@ -1,18 +1,5 @@
 01 require sysctl net.inet.ip.forwarding=1
 02 require sysctl net.inet6.ip6.forwarding=1
-03 ifconfig bridge create name jo0
-04 ifconfig jo0 description jailops net=lan bridge
-05 ifconfig epair create; rename ends to jo0ga and jo0gb
-06 ifconfig jo0ga description jailops net=lan gateway (bridge side)
-07 ifconfig jo0gb description jailops net=lan gateway (host side)
-08 ifconfig jo0 mtu 1500
-09 ifconfig jo0ga mtu 1500
-10 ifconfig jo0gb mtu 1500
-11 ifconfig jo0 addm jo0ga
-12 ifconfig jo0gb inet 10.20.0.1/24 alias
-13 ifconfig jo0gb inet6 2001:db8:1::1/64 alias
-14 ifconfig jo0gb inet6 fe80::1/64 alias
-15 ifconfig jo0 up
-16 ifconfig jo0ga up
-17 ifconfig jo0gb up
-18 pfctl -a jailops/net.lan -f <rendered>
+03 route add -inet 10.20.0.0/24 127.0.0.1 -reject
+04 route add -inet6 2001:db8:1::/64 ::1 -reject
+05 pfctl -a jailops/net.lan -f <rendered>

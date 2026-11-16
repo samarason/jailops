@@ -39,8 +39,11 @@ $ jailops backup run ghost
 ! hint: List the kind to see the names, check --host and --remote, and check the spelling. (jailops explain not_found)
 [exit 4]
 
-$ jailops project create restored --storage default
+$ jailops project create restored
 project/restored created
+
+$ jailops storage grant default --project restored
+storage/default granted to project restored
 
 $ jailops backup restore <snapshot-id> --project restored --as web-r -y
 Preflight: restore backup <snapshot-id> (jail web) as web-r

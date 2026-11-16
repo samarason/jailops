@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"jailops.net/jailops/internal/backup"
+	"jailops.net/jailops/internal/repo/catalog"
 	"jailops.net/jailops/internal/repo/engine"
 	"jailops.net/jailops/internal/sys/zfs"
 	"jailops.net/jailops/sdk/api"
@@ -27,7 +29,8 @@ const (
 	metaLayout    = "layout"           // thin or thick
 	metaStorage   = "storage"          // storage name of the jail
 	metaContainer = "container"        // the dataset name at backup time (informational)
-	metaKind      = "kind"             // "jail" or "state"
+	metaKind      = "kind"             // "jail", "state" or "volume"
+	metaVolume    = "volume_spec"      // the JSON of the volume spec of a volume backup
 	snapProp      = "jailops:backup"   // run id on the JailOps snapshot
 	snapManaged   = "jailops:managed"  // ownership mark of the snapshot
 	rootRel       = "."
@@ -87,8 +90,6 @@ func capturable(j JailRecord) ([]Dataset, error) {
 		switch {
 		case d.Name == "":
 			return nil, api.Errorf(api.CodeInvalid, "jail %q lists a dataset without a name", j.Name)
-		case d.Kind == KindVolumes:
-			continue
 		case d.Kind == KindRoot && !thick && !j.IsState:
 			continue
 		}
@@ -114,7 +115,7 @@ func capturable(j JailRecord) ([]Dataset, error) {
 }
 
 // withoutSkipped leaves out the datasets that cannot be captured now and says which, as run warnings
-// ("skipped: locked: volume db ...").
+// ("skipped: delegated: zfs ...").
 func withoutSkipped(j JailRecord) (JailRecord, []string) {
 	var keep []Dataset
 	var warnings []string
@@ -123,13 +124,9 @@ func withoutSkipped(j JailRecord) (JailRecord, []string) {
 			keep = append(keep, d)
 			continue
 		}
-		what := relName(j.Container, d.Name)
-		if d.Kind == KindVolume {
-			what = "volume " + strings.TrimPrefix(what, "data/")
-		}
-		w := "skipped: " + d.Skip + ": " + what
-		if d.Skip == SkipLocked {
-			w += " (encrypted and waiting for its passphrase; unlock the jail and back it up again)"
+		w := "skipped: " + d.Skip + ": " + relName(j.Container, d.Name)
+		if d.Skip == SkipDelegated {
+			w += " (managed by the jail and not mounted on the host: back it up from inside the jail, or with zfs send)"
 		}
 		warnings = append(warnings, w)
 	}
@@ -189,7 +186,7 @@ func streamProps(j JailRecord, d Dataset, cmp string) map[string]string {
 }
 
 func (s *Service) snapshotName() string {
-	return SnapshotPrefix + s.now().Format("20060102T150405") + "-" + randHex(2)
+	return SnapshotPrefix + s.now().Format("20060102T150405") + "-" + randHex(4)
 }
 
 // BackupJail backs up one jail now: one atomic snapshot of its data datasets,
@@ -244,17 +241,36 @@ func (s *Service) BackupJail(ctx context.Context, j JailRecord, o CaptureOptions
 		remotes[i] = r
 	}
 	key := s.currentKey()
+	if j.IsVolume {
+		for _, d := range j.Datasets {
+			if d.Name == j.Container && d.Skip == SkipLocked {
+				return nil, api.Errorf(api.CodeLocked, "volume %q is locked: its files cannot be read", j.Name).
+					WithHint("unlock it (jailops volume unlock " + j.Name + "); the next run backs it up")
+			}
+		}
+	}
 	j, skipped := withoutSkipped(j)
 	sets, err := capturable(j)
 	if err != nil {
 		return nil, err
 	}
 	var bundle json.RawMessage
-	if !j.IsState {
+	if !j.IsState && !j.IsVolume {
 		b, err := backup.BuildBundle(j.Spec, j.Image, s.objectsFor(j.Project), j.SecretRefs)
 		if err != nil {
 			return nil, err
 		}
+		// the volumes of the jail are named with the identity of each, which a restore matches its backups on
+		for name, id := range j.VolumeIDs {
+			if b.VolumeIDs == nil {
+				b.VolumeIDs = map[string]string{}
+			}
+			b.VolumeIDs[name] = id
+			if !slices.Contains(b.Volumes, name) {
+				b.Volumes = append(b.Volumes, name)
+			}
+		}
+		sort.Strings(b.Volumes)
 		if bundle, err = json.Marshal(b); err != nil {
 			return nil, err
 		}
@@ -314,14 +330,11 @@ func (s *Service) BackupJail(ctx context.Context, j JailRecord, o CaptureOptions
 		warnings = append(warnings, "the post-backup hook failed: "+postErr.Error())
 	}
 
+	if err := s.mountForRead(ctx, &rev, j, sets); err != nil {
+		return nil, err
+	}
 	cmp := containerMountpoint(j)
 	streams := make([]engine.Stream, len(sets))
-	var closers []func()
-	defer func() {
-		for _, c := range closers {
-			c()
-		}
-	}()
 	for i, d := range sets {
 		if err := s.fail("capture.read." + relName(j.Container, d.Name)); err != nil {
 			return nil, err
@@ -338,13 +351,14 @@ func (s *Service) BackupJail(ctx context.Context, j JailRecord, o CaptureOptions
 		streams[i] = engine.Stream{Name: relName(j.Container, d.Name), Root: dir, ZFSSnapshot: snap, GUID: guid,
 			CreateTxg: s.createTxg(ctx, full), Props: streamProps(j, d, cmp)}
 		if s.deps.Agents != nil {
-			// The daemon is not root: a file agent reads the snapshot for it and the tree is seen from there.
-			fsys, closeFS, err := s.deps.Agents.ReadSnapshot(ctx, dir)
-			if err != nil {
-				return nil, fmt.Errorf("starting a file agent for %s: %w", streams[i].Name, err)
+			// The daemon is not root: a file agent reads the snapshot for it and the tree is seen from there. The
+			// agent lives while the engine reads this one dataset, so a jail of ten datasets holds one agent at a
+			// time and not ten for the length of the backup.
+			name := streams[i].Name
+			streams[i].Root = "/"
+			streams[i].OpenFS = func(ctx context.Context) (catalog.ScanFS, func(), error) {
+				return s.openAgent(ctx, dir, name)
 			}
-			closers = append(closers, closeFS)
-			streams[i].Root, streams[i].FS = "/", fsys
 		}
 	}
 
@@ -353,12 +367,90 @@ func (s *Service) BackupJail(ctx context.Context, j JailRecord, o CaptureOptions
 	if j.IsState {
 		meta[metaKind] = "state"
 	}
+	if j.IsVolume {
+		meta[metaKind] = "volume"
+		if j.Volume != nil {
+			raw, err := json.Marshal(j.Volume)
+			if err != nil {
+				return nil, err
+			}
+			meta[metaVolume] = string(raw)
+		}
+	}
 	for i, t := range targets {
 		tr := s.upload(ctx, upload{j: j, o: o, key: key, remote: remotes[i], target: t, runID: runID, snap: snap, streams: streams,
 			bundle: bundle, meta: meta, warnings: warnings, multi: len(targets) > 1})
 		res.Targets = append(res.Targets, tr)
 	}
 	return res, res.Err()
+}
+
+// openAgent starts the file agent of one dataset. The helper allows few agents at once and one that has just been
+// closed is still ending, so a busy answer is tried again for a short while.
+func (s *Service) openAgent(ctx context.Context, dir, name string) (catalog.ScanFS, func(), error) {
+	var err error
+	for try := 0; try < busyTries; try++ {
+		var fsys catalog.ScanFS
+		var closeFS func()
+		if fsys, closeFS, err = s.deps.Agents.ReadSnapshot(ctx, dir); err == nil {
+			return fsys, closeFS, nil
+		}
+		if !api.IsCode(err, api.CodeBusy) {
+			break
+		}
+		if serr := s.cfg.Sleep(ctx, busyWait); serr != nil {
+			return nil, nil, serr
+		}
+	}
+	return nil, nil, fmt.Errorf("starting a file agent for %s: %w", name, err)
+}
+
+// busyTries and busyWait bound how long a busy helper or a busy dataset is waited for.
+const (
+	busyTries = 20
+	busyWait  = 500 * time.Millisecond
+)
+
+// unmountRetry unmounts a dataset a capture mounted. A file agent that was just closed may still hold the dataset for
+// a moment, so a busy answer is tried again for a few seconds.
+func (s *Service) unmountRetry(ctx context.Context, ds string) error {
+	var err error
+	for try := 0; try < busyTries; try++ {
+		if err = s.deps.Datasets.Unmount(ctx, ds); err == nil || !(api.IsCode(err, api.CodeBusy) || zfs.IsBusy(err)) {
+			return err
+		}
+		if serr := s.cfg.Sleep(ctx, busyWait); serr != nil {
+			return errors.Join(err, serr)
+		}
+	}
+	return err
+}
+
+// mountForRead mounts the datasets of a capture that are not mounted, parents first, because the snapshot is read
+// through <mountpoint>/.zfs/snapshot: a stopped jail or a volume that nothing mounts is backed up like a running one.
+// Each is unmounted again when the capture ends, in reverse order, whatever happens.
+func (s *Service) mountForRead(ctx context.Context, rev *reverter, j JailRecord, sets []Dataset) error {
+	for _, d := range sets {
+		p, err := s.zfs.Get(ctx, d.Name, "mounted", "canmount")
+		if err != nil {
+			return fmt.Errorf("reading the mount state of %s: %w", d.Name, err)
+		}
+		if p["mounted"].Value != "no" || p["canmount"].Value == "off" {
+			continue
+		}
+		if s.deps.Datasets == nil {
+			return api.Errorf(api.CodeUnsupported, "dataset %s of %q is not mounted and this daemon cannot mount it for the backup", relName(j.Container, d.Name), j.Name)
+		}
+		if err := s.fail("capture.mount." + relName(j.Container, d.Name)); err != nil {
+			return err
+		}
+		if err := s.deps.Datasets.Mount(ctx, d.Name); err != nil {
+			return fmt.Errorf("mounting %s for the backup: %w", d.Name, err)
+		}
+		name := d.Name
+		rev.add(func(ctx context.Context) error { return s.unmountRetry(ctx, name) })
+	}
+	return nil
 }
 
 type upload struct {
@@ -493,10 +585,14 @@ func (s *Service) backupObject(j JailRecord, o CaptureOptions, target, zsnap str
 	if res.Receipt != nil {
 		chunks = res.Receipt.ChunkCount
 	}
+	kind := ""
+	if j.IsVolume {
+		kind = "volume"
+	}
 	return api.Backup{
 		Metadata: api.ObjectMeta{Name: res.Snapshot, UUID: res.Snapshot, Project: j.Project, Host: s.cfg.HostUUID, Scope: api.ScopeHost,
 			Generation: 1, CreatedAt: created, UpdatedAt: created},
-		Spec: api.BackupSpec{Jail: j.Name, JailUUID: j.UUID, HostUUID: s.cfg.HostUUID, Policy: o.Policy, Target: target,
+		Spec: api.BackupSpec{Kind: kind, Volume: j.Volume, Jail: j.Name, JailUUID: j.UUID, HostUUID: s.cfg.HostUUID, Policy: o.Policy, Target: target,
 			Snapshot: res.Snapshot, ZFSSnapshot: zsnap, KeyDomain: s.currentKey().DomainID(), Full: res.Full, Bundle: rb},
 		Status: api.BackupStatus{Bytes: int64(res.LogicalBytes), NewBytes: int64(res.UploadedBytes), Chunks: chunks, Files: files},
 	}

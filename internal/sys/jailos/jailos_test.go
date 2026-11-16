@@ -3,8 +3,12 @@ package jailos
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
+	"time"
 
 	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/sdk/api"
@@ -85,7 +89,7 @@ func TestCommandCreateFailureNamesConsoleLog(t *testing.T) {
 	c := NewCommand(f)
 	err := c.Create(ctx, "/etc/jail.d/alpha_web.conf", "alpha_web")
 	var ae *api.Error
-	if !errors.As(err, &ae) || ae.Code != api.CodeInternal || ae.Hint != "what the jail's start and stop commands printed is in /var/log/jail_alpha_web_console.log on the host" {
+	if !errors.As(err, &ae) || ae.Code != api.CodeInternal || ae.Hint != "what the jail's start and stop commands printed is in /var/log/jailops/jail_alpha_web_console.log on the host" {
 		t.Fatalf("%#v", err)
 	}
 	if err := c.Create(ctx, "/etc/jail.d/alpha_db.conf", "alpha_db"); !errors.As(err, &ae) || ae.Code != api.CodeAlreadyExists || ae.Hint != "" {
@@ -194,9 +198,71 @@ func TestFake(t *testing.T) {
 	}
 }
 
-func TestKernelObserverOtherOS(t *testing.T) {
-	// On non-FreeBSD hosts the reader must refuse, never return success.
-	if _, err := NewKernelObserver().List(context.Background()); err != nil && !api.IsCode(err, api.CodeUnsupported) {
+// jail -r may run as long as the jail's stop.timeout asked for, on top of the time of the stop hooks: a stop that waits
+// longer than ten seconds is not cut short by the helper.
+func TestRemoveGivesTheStopTimeoutOfTheJail(t *testing.T) {
+	dir := t.TempDir()
+	withTimeout := filepath.Join(dir, "db.conf")
+	if err := os.WriteFile(withTimeout, []byte("db {\n\texec.stop = \"/bin/sh /etc/rc.shutdown jail\";\n\tstop.timeout = 90;\n}\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	without := filepath.Join(dir, "web.conf")
+	if err := os.WriteFile(without, []byte("web {\n\texec.stop = \"/bin/sh /etc/rc.shutdown jail\";\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := run.NewFake()
+	f.Add(run.Rule{Name: "jail", Args: []string{run.RestArgs}})
+	c := NewCommand(f)
+	if err := c.Remove(context.Background(), withTimeout, "db"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Remove(context.Background(), without, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Remove(context.Background(), "/etc/jail.d/missing.conf", "gone"); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.Calls()
+	if len(calls) != 3 {
+		t.Fatalf("%d calls", len(calls))
+	}
+	// the stop commands get the stop timeout, the jail the same time again after SIGTERM, five seconds on top
+	if got, want := calls[0].Cmd.Timeout, 185*time.Second; got != want {
+		t.Errorf("stop.timeout = 90: %v, want %v", got, want)
+	}
+	if got, want := calls[1].Cmd.Timeout, 65*time.Second; got != want {
+		t.Errorf("no stop.timeout: %v, want %v", got, want)
+	}
+	if got, want := calls[2].Cmd.Timeout, 65*time.Second; got != want {
+		t.Errorf("a conf that cannot be read: %v, want %v", got, want)
+	}
+}
+
+// A stop whose commands never return is bounded: after the budget the jail is removed without its stop commands
+// (jail -R), which kills what is left, and the stop succeeds.
+func TestRemoveForcesAStopThatHangs(t *testing.T) {
+	conf := filepath.Join(t.TempDir(), "db.conf")
+	if err := os.WriteFile(conf, []byte("db {\n\texec.stop = \"/bin/sh /etc/rc.shutdown jail\";\n\tstop.timeout = 1;\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := run.NewFake()
+	f.Add(run.Rule{Name: "jail", Args: []string{run.RestArgs}})
+	f.HangOn = func(c run.Cmd) bool { return c.Name == "jail" && slices.Contains(c.Args, "-r") }
+	defer func(b int) { stopSlack = b }(stopSlack)
+	stopSlack = 0 // the budget is the jail's own stop.timeout twice: two seconds
+	c := NewCommand(f)
+	ctx := context.Background()
+	// the jail is gone and the answer says it was forced (a warning for the daemon, which takes it as a stop)
+	if err := c.Remove(ctx, conf, "db"); !api.IsCode(err, api.CodeStopForced) {
+		t.Fatalf("a stop that hangs: %v, want the code %s", err, api.CodeStopForced)
+	}
+	forced := false
+	for _, call := range f.Calls() {
+		if call.Cmd.Name == "jail" && slices.Equal(call.Cmd.Args, []string{"-R", "db"}) {
+			forced = true
+		}
+	}
+	if !forced {
+		t.Errorf("the jail was not removed with jail -R: %v", f.Argv())
 	}
 }

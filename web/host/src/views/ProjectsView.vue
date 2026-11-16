@@ -34,18 +34,18 @@ async function done(): Promise<void> {
     <LoadState :loading="l.loading.value" :error="l.error.value" :has-data="!!l.data.value" @retry="l.reload">
       <div class="panel" style="margin-top: 12px">
         <p v-if="!l.data.value?.projects.length" class="empty">{{ s.projects.empty }}</p>
-        <div v-else class="table-wrap"><table data-test="projects-table">
-          <thead><tr><th>{{ s.projects.name }}</th><th class="hide-sm">{{ s.projects.networks }}</th><th class="hide-sm">{{ s.projects.storage }}</th><th style="min-width: 220px">{{ s.projects.usage }}</th><th></th></tr></thead>
+        <div v-else class="table-wrap"><table data-test="projects-table" class="rtable">
+          <thead><tr><th>{{ s.projects.name }}</th><th>{{ s.projects.networks }}</th><th>{{ s.projects.storage }}</th><th style="min-width: 220px">{{ s.projects.usage }}</th><th><span class="sr-only">{{ s.app.actions }}</span></th></tr></thead>
           <tbody><tr v-for="p in l.data.value?.projects" :key="p.metadata.name" :data-project="p.metadata.name">
-            <td>
+            <td :data-label="s.projects.name">
               <router-link class="mono" :to="`/projects/${p.metadata.name}`">{{ p.metadata.name }}</router-link>
-              <span v-if="p.metadata.name === projectState.current" class="pill info" style="margin-left: 6px">current</span>
+              <span v-if="p.metadata.name === projectState.current" class="pill info" style="margin-left: 6px">{{ s.projects.current }}</span>
               <span v-if="p.spec.hosts?.length" class="badge info" style="margin-left: 6px">{{ s.projects.fleet }}</span>
-              <div v-if="p.spec.description" class="faint">{{ p.spec.description }}</div>
+              <div v-if="p.spec.comment" class="faint">{{ p.spec.comment }}</div>
             </td>
-            <td class="mono hide-sm">{{ grants(p) }}</td><td class="mono hide-sm">{{ stor(p) }}</td>
-            <td><QuotaBars :project="p" /><span class="faint">{{ p.status.jails }} jails</span></td>
-            <td class="nowrap"><button class="btn btn-sm" type="button" :disabled="p.metadata.name === projectState.current" @click="switchProject(p.metadata.name)">{{ s.project.switch }}</button></td>
+            <td class="mono" :data-label="s.projects.networks">{{ grants(p) }}</td><td class="mono" :data-label="s.projects.storage">{{ stor(p) }}</td>
+            <td :data-label="s.projects.usage"><QuotaBars :project="p" /><span class="faint">{{ s.projects.jailsCount(p.status.jails ?? 0) }}</span></td>
+            <td class="nowrap actions"><button class="btn btn-sm" type="button" :disabled="p.metadata.name === projectState.current" @click="switchProject(p.metadata.name)">{{ s.project.switch }}</button></td>
           </tr></tbody></table></div>
       </div>
     </LoadState>

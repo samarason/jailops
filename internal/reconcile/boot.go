@@ -3,119 +3,54 @@ package reconcile
 import (
 	"context"
 	"fmt"
-	"slices"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"jailops.net/jailops/sdk/api"
 )
 
-// StartOrder returns the jails to start, in order, given the autostart jails
-// and the set already running. Rules:
-//   - a jail starts after everything in boot.depends is running;
-//   - a dependency that is not running is started first, even without
-//     autostart (the operator declared the need);
-//   - among jails that are ready, lower boot.priority starts first, then name;
-//   - a dependency cycle or an unknown dependency excludes the jails involved
-//     and is reported in skipped, never guessed around.
+// StartOrder returns the jails to start, in order, given the jails and the set already running (the rules are those
+// of api.BootOrder, which the boot plan of the API shares).
 func StartOrder(jails []JailDesired, running map[string]bool) (order []string, skipped map[string]string) {
-	by := map[string]JailDesired{}
-	for _, j := range jails {
-		by[j.Name] = j
+	nodes := make([]api.BootNode, len(jails))
+	for i, j := range jails {
+		nodes[i] = api.BootNode{Key: j.Name, Boot: j.Boot}
 	}
-	skipped = map[string]string{}
-	// The set to start: autostart jails not running plus their missing dependencies.
-	want := map[string]bool{}
-	var add func(name string, path []string) bool
-	add = func(name string, path []string) bool {
-		if running[name] || want[name] {
-			return true
-		}
-		if slices.Contains(path, name) {
-			for _, p := range path[slices.Index(path, name):] {
-				skipped[p] = "dependency cycle: " + strings.Join(append(slices.Clone(path[slices.Index(path, name):]), name), " -> ")
-			}
-			return false
-		}
-		j, ok := by[name]
-		if !ok {
-			return false
-		}
-		ok2 := true
-		for _, d := range j.Boot.Depends {
-			if _, known := by[d]; !known && !running[d] {
-				skipped[name] = fmt.Sprintf("depends on %q, which does not exist", d)
-				ok2 = false
-				continue
-			}
-			if !add(d, append(slices.Clone(path), name)) {
-				if _, s := skipped[name]; !s {
-					skipped[name] = fmt.Sprintf("dependency %q cannot be started", d)
-				}
-				ok2 = false
-			}
-		}
-		if ok2 {
-			want[name] = true
-		}
-		return ok2
+	return api.BootOrder(nodes, running)
+}
+
+// hostBooted says whether the host booted since the boot pass last ran (and records the boot it ran for): a daemon that
+// starts again on a host that stayed up leaves the jails as they are.
+func (r *Reconciler) hostBooted(ctx context.Context) bool {
+	f := r.cfg.BootStateFile
+	if f == "" {
+		return true
 	}
-	var auto []string
-	for _, j := range jails {
-		if j.Boot.Autostart && !running[j.Name] {
-			auto = append(auto, j.Name)
-		}
+	prev, err := os.ReadFile(f)
+	known := err == nil
+	id := ""
+	if r.env.Sysctl != nil {
+		id, _ = r.env.Sysctl(ctx, "kern.boottime")
 	}
-	slices.Sort(auto)
-	for _, n := range auto {
-		if _, bad := skipped[n]; bad {
-			continue
-		}
-		if !add(n, nil) {
-			if _, s := skipped[n]; !s {
-				skipped[n] = "a dependency cannot be started"
-			}
-		}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		// the boot of the host cannot be read: a first start still boots the jails, a later one does not
+		return !known
 	}
-	// Kahn with a priority queue by (priority, name).
-	done := map[string]bool{}
-	for n := range running {
-		done[n] = true
-	}
-	for len(done)-len(running) < len(want) {
-		var ready []string
-		for n := range want {
-			if done[n] {
-				continue
-			}
-			ok := true
-			for _, d := range by[n].Boot.Depends {
-				if !done[d] {
-					ok = false
-				}
-			}
-			if ok {
-				ready = append(ready, n)
-			}
+	if known && sameBoot(strings.TrimSpace(string(prev)), id) {
+		r.log.Info("the daemon started again on a host that stayed up: no jail is started at boot")
+		if strings.TrimSpace(string(prev)) != id { // the clock was set: keep the new reading
+			_ = os.WriteFile(f, []byte(id+"\n"), 0o600)
 		}
-		if len(ready) == 0 {
-			for n := range want {
-				if !done[n] {
-					skipped[n] = "dependency cycle"
-				}
-			}
-			break
-		}
-		slices.SortFunc(ready, func(a, b string) int {
-			if pa, pb := by[a].Boot.Priority, by[b].Boot.Priority; pa != pb {
-				return pa - pb
-			}
-			return strings.Compare(a, b)
-		})
-		order = append(order, ready[0])
-		done[ready[0]] = true
+		return false
 	}
-	return order, skipped
+	if err := os.WriteFile(f, []byte(id+"\n"), 0o600); err != nil {
+		r.log.Warn("the boot of the host could not be recorded", "err", err)
+	}
+	return true
 }
 
 func (r *Reconciler) bootPass(ctx context.Context, des Desired, obs *Observed, rep *Report, now time.Time) {
@@ -151,7 +86,7 @@ func (r *Reconciler) bootPass(ctx context.Context, des Desired, obs *Observed, r
 			failed[name] = true
 			if api.IsCode(err, api.CodeLocked) {
 				// Not a failure: the jail waits for the passphrase of an encrypted volume and starts after its unlock.
-				r.setBootCond(name, cond(CondBoot, false, "Locked", "waiting for the passphrase of an encrypted volume (jailops jail unlock)", now))
+				r.setBootCond(name, cond(CondBoot, false, "Locked", "waiting for the passphrase of an encrypted volume (jailops volume unlock)", now))
 				continue
 			}
 			rep.Failures["jail/"+name] = err.Error()
@@ -167,4 +102,29 @@ func (r *Reconciler) setBootCond(name string, c api.Condition) {
 	r.mu.Lock()
 	r.bootCond[name] = c
 	r.mu.Unlock()
+}
+
+var bootSecRE = regexp.MustCompile(`sec = (\d+)`)
+
+// sameBoot says whether two readings of kern.boottime are the same boot of the host. FreeBSD moves the boot time when
+// the clock is set (ntpd, ntpdate), so the readings of one boot can differ by the step; a host that rebooted was down
+// for longer than ten minutes between two readings.
+func sameBoot(prev, now string) bool {
+	if prev == now {
+		return true
+	}
+	a, b := bootSecRE.FindStringSubmatch(prev), bootSecRE.FindStringSubmatch(now)
+	if a == nil || b == nil {
+		return false
+	}
+	x, err1 := strconv.ParseInt(a[1], 10, 64)
+	y, err2 := strconv.ParseInt(b[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	d := x - y
+	if d < 0 {
+		d = -d
+	}
+	return d <= 600
 }

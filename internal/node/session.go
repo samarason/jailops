@@ -77,6 +77,13 @@ func (n *Node) BeginWith(ctx context.Context, h Host, req wire.BeginRequest) (*S
 	if previous != "" && !format.ValidSnapshotID(previous) {
 		return nil, errf(api.CodeInvalid, "malformed previous snapshot id")
 	}
+	if req.KeyDomain != "" {
+		// The first host that backs up binds a repository that records no domain yet, as the first escrow does:
+		// from then on a host with another key is refused before it can store a chunk.
+		if err := n.bindDomain(ctx, req.KeyDomain); err != nil {
+			return nil, err
+		}
+	}
 	n.pinMu.Lock()
 	open := len(n.sessions)
 	n.pinMu.Unlock()

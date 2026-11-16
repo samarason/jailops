@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"jailops.net/jailops/internal/supervise"
 	"log/slog"
 	"math/big"
 	mrand "math/rand/v2"
@@ -235,7 +236,7 @@ func (m *acmeManager) start(parent context.Context, ln net.Listener) {
 	m.mu.Unlock()
 	go func() {
 		defer close(done)
-		m.run(ctx)
+		supervise.Run(ctx, m.log, "acme", m.run)
 	}()
 }
 

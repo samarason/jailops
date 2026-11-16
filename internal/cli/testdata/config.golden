@@ -44,7 +44,6 @@ $ jailops config set nginx limits.memory
 
 $ jailops config set nginx limits.cpu many
 ! invalid: limits.cpu: "many" must be a number between 0 and 4096
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops config set nginx no.such.key 1
@@ -54,7 +53,6 @@ $ jailops config set nginx no.such.key 1
 
 $ jailops config set nginx limits.cpu 4 limits.pids bad
 ! invalid: limits.pids: "bad" must be a number between 0 and 4194304
-! hint: Read the message, correct the named field and retry; 'jailops firewall validate' checks rules offline. (jailops explain invalid)
 [exit 2]
 
 $ jailops config get nginx limits.cpu
@@ -104,11 +102,12 @@ $ jailops config show nginx -o yaml
 
 $ jailops config keys limits
 KEY                       TYPE   RESTART   DESCRIPTION
-limits.cpu                int    yes       CPU cores the jail may use.
-limits.disk               size   no        ZFS quota of the jail's root.
-limits.disk_reservation   size   no        ZFS reservation of the jail's root.
-limits.memory             size   yes       Memory limit.
-limits.pids               int    yes       Process limit.
+limits.cpu                int    yes       CPU cores the jail may use: more is slowed down to that share (rctl pcpu); needs kern.racct.enable=1.
+limits.disk               size   no        ZFS quota of the jail's container: its root, persistent datasets, volumes and snapshots together.
+limits.disk_reservation   size   no        ZFS reservation of the jail's container.
+limits.memory             size   yes       Anonymous memory the jail may reserve in total (rctl swapuse): an allocation beyond it fails and nothing is killed; needs kern.racct.enable=1.
+limits.pids               int    yes       Processes the jail may have (rctl maxproc): fork fails beyond it; needs kern.racct.enable=1.
+limits.states             int    no        Pf states each rule of the jail's firewall may create, so that one jail cannot fill the host's state table; 0 is the host's default.
 
 $ jailops --dry-run config set nginx limits.cpu 8
 dry-run: would update the configuration of jail nginx

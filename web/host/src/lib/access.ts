@@ -102,8 +102,8 @@ export function portList(s: string): string[] {
 /** The source as the server reads it. */
 export function sourceOf(f: AllowForm): string {
   switch (f.kind) {
-    case 'jail': return '@' + f.jail
-    case 'set': return '@' + f.set
+    case 'jail': return 'jail:' + f.jail
+    case 'set': return 'set:' + f.set
     case 'cidr': return f.cidr.trim()
     case 'host': return 'host'
   }

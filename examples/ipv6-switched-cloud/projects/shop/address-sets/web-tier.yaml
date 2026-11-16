@@ -1,0 +1,11 @@
+apiVersion: jailops/v1
+kind: AddressSet
+metadata:
+  name: web-tier
+spec:
+  comment: The jails that serve the shop's pages.
+  addresses:
+    - address: "2001:db8:1:2:100::80"
+      comment: the front web jail (IPv6)
+    - address: 10.94.0.10
+      comment: the front web jail (IPv4)

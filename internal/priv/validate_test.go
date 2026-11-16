@@ -2,9 +2,11 @@ package priv
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"jailops.net/jailops/internal/render"
@@ -203,10 +205,9 @@ func TestInterfaceRules(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	n := e.local.Net()
-	e.net.AddForeign("em0", true)
-	for _, name := range []string{"em0", "lo0", "jo", "-jo0", "jo0;x", "jo0 x", "jo/0", "jo" + strings.Repeat("x", 20), ""} {
-		if err := n.BridgeCreate(ctx, name); err == nil {
-			t.Errorf("BridgeCreate(%q) succeeded", name)
+	for _, name := range []string{"em0", "lo0", "bridge0", "mybr", "-jo0", "jo0;x", "jo0 x", "jo/0", "jo" + strings.Repeat("x", 20), ""} {
+		if _, _, err := n.EpairCreate(ctx, name); err == nil && name != "mybr" && name != "" {
+			t.Errorf("EpairCreate(%q) succeeded", name)
 		}
 		if err := n.SetLink(ctx, name, true); err == nil {
 			t.Errorf("SetLink(%q) succeeded", name)
@@ -215,42 +216,37 @@ func TestInterfaceRules(t *testing.T) {
 			t.Errorf("EpairDestroy(%q) succeeded", name)
 		}
 	}
-	if err := n.BridgeCreate(ctx, "jo0"); err != nil {
+	if _, _, err := n.EpairCreate(ctx, "jo0"); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.BridgeAddMember(ctx, "jo0", "em0", false); !api.IsCode(err, api.CodeForbidden) {
-		t.Errorf("adding a physical interface to a bridge: %v", err)
-	}
-	if err := n.BridgeAddMember(ctx, "em0", "jo0", false); !api.IsCode(err, api.CodeForbidden) {
-		t.Errorf("modifying a foreign bridge: %v", err)
-	}
-	if err := n.SetDescription(ctx, "jo0", "line\nbreak"); !api.IsCode(err, api.CodeInvalid) {
+	if err := n.SetDescription(ctx, "jo0a", "line\nbreak"); !api.IsCode(err, api.CodeInvalid) {
 		t.Errorf("description: %v", err)
 	}
-	if _, _, err := n.EpairCreate(ctx, "em"); !api.IsCode(err, api.CodeForbidden) {
-		t.Errorf("epair outside the prefix: %v", err)
+	if _, _, err := n.EpairCreate(ctx, "em2"); !api.IsCode(err, api.CodeInvalid) {
+		t.Errorf("epair under a driver's names: %v", err)
 	}
-	if err := n.MoveToJail(ctx, "jo0", "alpha_nojail"); !api.IsCode(err, api.CodeForbidden) {
+	if err := n.MoveToJail(ctx, "jo0a", "alpha_nojail"); !api.IsCode(err, api.CodeForbidden) {
 		t.Errorf("moving into an unmanaged jail: %v", err)
 	}
-	if err := n.MoveToJail(ctx, "jo0", "-x"); err == nil {
+	if err := n.MoveToJail(ctx, "jo0a", "-x"); err == nil {
 		t.Error("jail name starting with a dash was accepted")
 	}
 }
 
 func TestRouteRules(t *testing.T) {
 	e := newEnv(t)
+	e.storeLan(t, "10.1.0.0/16")
 	ctx := context.Background()
 	n := e.local.Net()
-	if err := e.net.BridgeCreate(ctx, "jo0"); err != nil {
+	if _, _, err := e.net.EpairCreate(ctx, "jo0"); err != nil {
 		t.Fatal(err)
 	}
 	bad := []ifconfig.Route{
 		{Dest: "default", Gateway: "10.0.0.1"},
-		{Dest: "default", Interface: "jo0"},
-		{Dest: "10.0.0.0/8", Interface: "jo0"},
-		{Dest: "0.0.0.0/0", Interface: "jo0"},
-		{Dest: "2001:db8::/32", Interface: "jo0"},
+		{Dest: "default", Interface: "jo0a"},
+		{Dest: "10.0.0.0/8", Interface: "jo0a"},
+		{Dest: "0.0.0.0/0", Interface: "jo0a"},
+		{Dest: "2001:db8::/32", Interface: "jo0a"},
 		{Dest: "10.1.1.1", Gateway: "10.0.0.1"},
 		{Dest: "10.1.1.1", Interface: "em0"},
 		{Dest: "10.1.1.1"},
@@ -260,7 +256,7 @@ func TestRouteRules(t *testing.T) {
 			t.Errorf("route %+v was accepted", r)
 		}
 	}
-	for _, r := range []ifconfig.Route{{Dest: "10.1.1.1/32", Interface: "jo0"}, {Dest: "2001:db8::5/128", Interface: "jo0"}, {Dest: "10.1.1.2", Interface: "jo0"}} {
+	for _, r := range []ifconfig.Route{{Dest: "10.1.1.1/32", Interface: "jo0a"}, {Dest: "2001:db8:1:2:100::5/128", Interface: "jo0a"}, {Dest: "10.1.1.2", Interface: "jo0a"}} {
 		if err := n.RouteAdd(ctx, r); err != nil {
 			t.Errorf("route %+v: %v", r, err)
 		}
@@ -303,6 +299,9 @@ func TestPFRules(t *testing.T) {
 		if err := p.Load(ctx, "jailops/web", rs); err == nil {
 			t.Errorf("ruleset %.30q was accepted", rs)
 		}
+	}
+	if _, _, err := e.net.EpairCreate(ctx, "jo0"); err != nil {
+		t.Fatal(err)
 	}
 	if err := p.Load(ctx, "jailops/web", "pass in on jo0a proto tcp to port 22\n"); err != nil {
 		t.Errorf("good ruleset: %v", err)
@@ -465,11 +464,12 @@ func TestConfDirContent(t *testing.T) {
 	// what the renderer writes for a jail with System V IPC, FreeBSD and Linux, passes as it is
 	for _, osf := range []api.OS{api.OSFreeBSD, api.OSLinux} {
 		jc, err := render.JailConf(render.JailConfInput{Name: "alpha_web", Path: filepath.Join(e.cfg.MountBase, "projects", "alpha", "jails", "web", "root"),
-			Hostname: "web.example.org", OS: osf, Interfaces: []string{"jo0123456789a0b"}, SysVIPC: true})
+			Hostname: "web.example.org", OS: osf, Interfaces: []string{"jo0123456789a0b"}, SysVIPC: true,
+			Where: api.PromptContext{Jail: "web", Project: "alpha", Host: "babel"}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(jc, "sysvshm = new;") || !strings.Contains(jc, "exec.consolelog") {
+		if !strings.Contains(jc, "sysvshm = new;") || !strings.Contains(jc, "exec.consolelog") || !strings.Contains(jc, "env.jailops_host = \"babel\";") {
 			t.Fatalf("not rendered:\n%s", jc)
 		}
 		if err := w(ctx, "alpha_web.conf", jc); err != nil {
@@ -506,13 +506,22 @@ func TestConfDirContent(t *testing.T) {
 		"quote in string":      mut(`"web.example.org"`, `"a\"b"`),
 		"mount.fstab outside":  mut("\tmount.devfs;\n", "\tmount.fstab = \"/etc/fstab\";\n"),
 		"nul":                  mut("vnet;", "vnet;\x00"),
-		"consolelog elsewhere": mut(`"/var/log/jail_${name}_console.log"`, `"/etc/rc.conf"`),
-		"consolelog variable":  mut(`"/var/log/jail_${name}_console.log"`, `"/var/log/jail_${path}_console.log"`),
-		"consolelog bare":      mut(`exec.consolelog = "/var/log/jail_${name}_console.log";`, `exec.consolelog;`),
+		"consolelog elsewhere": mut(`"/var/log/jailops/jail_${name}_console.log"`, `"/etc/rc.conf"`),
+		"consolelog variable":  mut(`"/var/log/jailops/jail_${name}_console.log"`, `"/var/log/jailops/jail_${path}_console.log"`),
+		"consolelog bare":      mut(`exec.consolelog = "/var/log/jailops/jail_${name}_console.log";`, `exec.consolelog;`),
 		"sysvshm inherit":      mut("\tenforce_statfs = 2;\n", "\tenforce_statfs = 2;\n\tsysvshm = inherit;\n"),
 		"sysvsem quoted":       mut("\tenforce_statfs = 2;\n", "\tenforce_statfs = 2;\n\tsysvsem = \"new\";\n"),
 		"sysvmsg bare":         mut("\tenforce_statfs = 2;\n", "\tenforce_statfs = 2;\n\tsysvmsg;\n"),
 		"sysvmsg disable then": mut("\tenforce_statfs = 2;\n", "\tenforce_statfs = 2;\n\tsysvmsg = new; exec.start = \"id\";\n"),
+		"env other key":        mut("\tvnet;\n", "\tenv.PATH = \"/evil\";\n\tvnet;\n"),
+		"env short key":        mut("\tvnet;\n", "\tenv.jail = \"web\";\n\tvnet;\n"),
+		"env upper case key":   mut("\tvnet;\n", "\tenv.JAILOPS_JAIL = \"web\";\n\tvnet;\n"),
+		"env prefixed other":   mut("\tvnet;\n", "\tenv.jailops_x = \"web\";\n\tvnet;\n"),
+		"env value with space": mut("\tvnet;\n", "\tenv.jailops_jail = \"a b\";\n\tvnet;\n"),
+		"env value variable":   mut("\tvnet;\n", "\tenv.jailops_host = \"${x}\";\n\tvnet;\n"),
+		"env value upper case": mut("\tvnet;\n", "\tenv.jailops_project = \"Shop\";\n\tvnet;\n"),
+		"env bare":             mut("\tvnet;\n", "\tenv.jailops_jail;\n\tvnet;\n"),
+		"meta key":             mut("\tvnet;\n", "\tmeta.jailops_jail = \"web\";\n\tvnet;\n"),
 	}
 	for name, c := range hostile {
 		if err := w(ctx, "alpha_web.conf", c); err == nil {
@@ -565,18 +574,24 @@ func TestFstabContent(t *testing.T) {
 	good := "# device mountpoint fstype options dump pass\n" +
 		"devfs " + b + "/jails/alpine1/root/dev devfs rw,late 0 0\n" +
 		"tmpfs " + b + "/jails/alpine1/root/dev/shm tmpfs rw,late,size=536870912,mode=1777 0 0\n" +
-		b + "/jails/alpine1/data/db " + b + "/jails/alpine1/root/var/lib/db nullfs rw 0 0\n"
+		b + "/projects/alpha/volumes/db " + b + "/jails/alpine1/root/var/lib/db nullfs rw 0 0\n" +
+		b + "/projects/alpha/jails/alpine1/root " + b + "/projects/alpha/jails/alpine1/root/compat/linux nullfs rw,late 0 0\n"
 	if err := w(ctx, e.local, good); err != nil {
 		t.Fatalf("renderer style fstab refused: %v", err)
 	}
 	bad := map[string]string{
-		"host mount":         "/etc " + b + "/jails/a/root/etc nullfs ro 0 0\n",
-		"mountpoint outside": "devfs /dev devfs rw 0 0\n",
-		"traversal":          b + "/../etc " + b + "/jails/a/root/x nullfs ro 0 0\n",
-		"zfs type":           "tank/x " + b + "/jails/a/root/x zfs rw 0 0\n",
-		"fields":             "devfs " + b + "/x devfs rw 0\n",
-		"option injection":   "devfs " + b + "/jails/a/root/dev devfs rw;id 0 0\n",
-		"device mismatch":    "/dev/ada0 " + b + "/jails/a/root/x tmpfs rw 0 0\n",
+		"jail data as a source": b + "/projects/alpha/jails/web/data/db " + b + "/jails/a/root/x nullfs rw 0 0\n",
+		"below a volume":        b + "/projects/alpha/volumes/db/sub " + b + "/jails/a/root/x nullfs rw 0 0\n",
+		"the volumes parent":    b + "/projects/alpha/volumes " + b + "/jails/a/root/x nullfs rw 0 0\n",
+		"a whole project":       b + "/projects/alpha " + b + "/jails/a/root/x nullfs rw 0 0\n",
+		"another jail's root":   b + "/projects/alpha/jails/web/root " + b + "/jails/a/root/x nullfs rw 0 0\n",
+		"host mount":            "/etc " + b + "/jails/a/root/etc nullfs ro 0 0\n",
+		"mountpoint outside":    "devfs /dev devfs rw 0 0\n",
+		"traversal":             b + "/../etc " + b + "/jails/a/root/x nullfs ro 0 0\n",
+		"zfs type":              "tank/x " + b + "/jails/a/root/x zfs rw 0 0\n",
+		"fields":                "devfs " + b + "/x devfs rw 0\n",
+		"option injection":      "devfs " + b + "/jails/a/root/dev devfs rw;id 0 0\n",
+		"device mismatch":       "/dev/ada0 " + b + "/jails/a/root/x tmpfs rw 0 0\n",
 	}
 	for name, c := range bad {
 		if err := w(ctx, e.local, c); err == nil {
@@ -692,11 +707,74 @@ func TestConfigNormalize(t *testing.T) {
 		"relative file":  {StorageRoots: []string{"tank/a"}, MountBase: "/j", StorageFile: "x/storage.conf"},
 		"relative base":  {StorageRoots: []string{"tank/jailops"}, MountBase: "jailops"},
 		"slash base":     {StorageRoots: []string{"tank/jailops"}, MountBase: "/"},
-		"bad prefix":     {StorageRoots: []string{"tank/jailops"}, MountBase: "/j", IfPrefixes: []string{"-x"}},
 		"bad host mount": {StorageRoots: []string{"tank/jailops"}, MountBase: "/j", Admin: AdminPolicy{HostMountRoots: []string{"/"}}},
 	} {
 		if _, err := c.Normalize(); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// Two writes of one path do not disturb each other, and a directory that a tenant planted under the name an older
+// build used for the temporary file does not stop the write.
+func TestWriteFileTemporaryNamesAreUnique(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	p := filepath.Join(e.cfg.MountBase, "shared")
+	if err := os.MkdirAll(filepath.Join(e.cfg.MountBase, ".shared.jotmp", "planted"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- e.local.WriteFile(ctx, WriteFileReq{Path: p, Data: []byte(fmt.Sprintf("writer %d\n", i)), Mode: 0o644})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a concurrent write failed: %v", err)
+		}
+	}
+	b, err := os.ReadFile(p)
+	if err != nil || !strings.HasPrefix(string(b), "writer ") || strings.Count(string(b), "\n") != 1 {
+		t.Fatalf("the file is %q (%v)", b, err)
+	}
+	ents, _ := os.ReadDir(e.cfg.MountBase)
+	for _, en := range ents {
+		if strings.HasSuffix(en.Name(), ".jotmp") && en.Name() != ".shared.jotmp" {
+			t.Errorf("leftover %s", en.Name())
+		}
+	}
+}
+
+// stop.timeout is the jail's own time to shut down: what the renderer writes passes, and only a number of seconds
+// within the limit does.
+func TestConfDirStopTimeout(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	w := func(content string) error {
+		return e.local.WriteFile(ctx, WriteFileReq{Path: filepath.Join(e.cfg.ConfDir, "alpha_web.conf"), Data: []byte(content), Mode: 0o644})
+	}
+	jc, err := render.JailConf(render.JailConfInput{Name: "alpha_web", Path: filepath.Join(e.cfg.MountBase, "projects", "alpha", "jails", "web", "root"),
+		Hostname: "web.example.org", OS: api.OSFreeBSD, Interfaces: []string{"jo0123456789a0b"}, StopTimeout: 90,
+		Where: api.PromptContext{Jail: "web", Project: "alpha", Host: "babel"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jc, "\tstop.timeout = 90;\n") {
+		t.Fatalf("not rendered:\n%s", jc)
+	}
+	if err := w(jc); err != nil {
+		t.Fatalf("the renderer's output with a stop timeout was refused: %v", err)
+	}
+	for name, v := range map[string]string{"zero": "0", "too long": "3601", "negative": "-5", "text": "soon", "quoted": `"90"`, "variable": "${x}"} {
+		if err := w(strings.Replace(jc, "stop.timeout = 90;", "stop.timeout = "+v+";", 1)); err == nil {
+			t.Errorf("stop.timeout %s (%s) was accepted", name, v)
 		}
 	}
 }

@@ -10,13 +10,13 @@ spec:
   storage: default
   network:
     - {name: eth0, network: shop, ipv4: "10.60.0.30"}
-  firewall: {policy: postgres}
+  firewall: {policies: [postgres]}
   resources: {cpu: 2, memory: 4G, disk: 100G}
   boot: {autostart: true, priority: 10}
   volumes:
-    # The database lives in its own dataset: snapshotted, rolled back and backed up with the jail, and untouched
-    # when the OS root is replaced by an image update.
-    - {name: data, mount: /var/db/postgres, quota: 50G}
+    # The database lives in a volume of the project (volumes/postgres-data.yaml): untouched when the OS root is
+    # replaced by an image update, and still there when the jail is deleted.
+    - {volume: postgres-data, mount: /var/db/postgres}
   env:
     POSTGRES_PASSWORD: secret:db.password
   provision:

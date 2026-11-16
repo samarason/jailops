@@ -237,7 +237,7 @@ func TestHostFWRenderGolden(t *testing.T) {
 	noConsole := api.DefaultHostFirewall(0)
 	noConsole.SSH.AllowFrom = []string{"192.0.2.10"}
 	fwGolden(t, "hostfw_no_console", renderHostPF(noConsole.Canonical()))
-	// ACME: the redirect of the CA's port to the daemon, after the jails' translation anchors, and its pass rule
+	// ACME: the redirect of the CA's port to the daemon, after the jails' anchor, and its pass rule
 	acmeHTTP := api.DefaultHostFirewall(39110)
 	acmeHTTP.SSH.AllowFrom = []string{"192.0.2.10"}
 	acmeHTTP.ACME = &api.HostFirewallACME{Challenge: api.ACMEHTTP01, Port: 39080}
@@ -250,16 +250,16 @@ func TestHostFWRenderGolden(t *testing.T) {
 	fwGolden(t, "hostfw_acme_alpn_open", renderHostPF(acmeALPN.Canonical()))
 	for _, s := range []api.HostFirewallSpec{acmeHTTP.Canonical(), acmeALPN.Canonical()} {
 		out := renderHostPF(s)
-		if r, x := strings.Index(out, "\nrdr-anchor \"jailops/*\"\n"), strings.Index(out, "\nrdr inet proto tcp"); r < 0 || x < r || x > strings.Index(out, "\nanchor \"jailops/*\"\n") {
-			t.Errorf("the redirect is not among the translation rules after the anchor:\n%s", out)
+		if a, x := strings.Index(out, "\nanchor \"jailops/*\"\n"), strings.Index(out, "\nmatch in inet proto tcp"); a < 0 || x < a {
+			t.Errorf("the redirect does not come after the jails' anchor:\n%s", out)
 		}
 	}
-	// every rendering has the three anchor lines of design 5.2, in pf's order
+	// every rendering has the anchor line of design 5.2 (and no translation anchors) before the first rule
 	for _, s := range []api.HostFirewallSpec{def, custom.Canonical(), api.HostFirewallSpec{Template: api.HostFirewallOpen}.Canonical()} {
 		out := renderHostPF(s)
-		n, r, a, first := strings.Index(out, "\nnat-anchor \"jailops/*\"\n"), strings.Index(out, "\nrdr-anchor \"jailops/*\"\n"), strings.Index(out, "\nanchor \"jailops/*\"\n"), firstFilterRule(out)
-		if n < 0 || r < n || a < r || first < a || !strings.HasPrefix(out, HostResolvHeader+"\n") {
-			t.Errorf("order: nat %d rdr %d anchor %d first rule %d\n%s", n, r, a, first, out)
+		a, first := strings.Index(out, "\nanchor \"jailops/*\"\n"), firstFilterRule(out)
+		if a < 0 || first < a || strings.Contains(out, "nat-anchor") || strings.Contains(out, "rdr-anchor") || !strings.HasPrefix(out, HostResolvHeader+"\n") {
+			t.Errorf("order: anchor %d first rule %d\n%s", a, first, out)
 		}
 	}
 }
@@ -382,7 +382,7 @@ func TestHostFWRefusalsOverTheWire(t *testing.T) {
 		"comment too long":     custom(api.HostFirewallAllow{Proto: "tcp", Ports: []string{"80"}, Comment: long}),
 		"set name":             {Sets: []api.HostFirewallSet{{Name: "a b", Members: []string{"192.0.2.1"}}}},
 		"set name long":        {Sets: []api.HostFirewallSet{{Name: "a" + strings.Repeat("b", 24), Members: []string{"192.0.2.1"}}}},
-		"set name dash":        {Sets: []api.HostFirewallSet{{Name: "a-b", Members: []string{"192.0.2.1"}}}},
+		"set name underscore":  {Sets: []api.HostFirewallSet{{Name: "a_b", Members: []string{"192.0.2.1"}}}},
 		"set twice":            {Sets: []api.HostFirewallSet{{Name: "a", Members: []string{"192.0.2.1"}}, {Name: "a", Members: []string{"192.0.2.2"}}}},
 		"set empty":            {Sets: []api.HostFirewallSet{{Name: "a"}}},
 		"set member @":         {Sets: []api.HostFirewallSet{{Name: "a", Members: []string{"@b"}}}},
@@ -463,8 +463,8 @@ func TestHostFWACMERedirectOverTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"+rdr inet proto tcp from any to (self) port 80 -> 127.0.0.1 port 39080",
-		"+rdr inet6 proto tcp from any to (self) port 80 -> ::1 port 39080", "+pass in proto tcp from any to { 127.0.0.1, ::1 } port 39080"} {
+	for _, want := range []string{"+match in inet proto tcp from any to (self) port 80 rdr-to 127.0.0.1 port 39080",
+		"+match in inet6 proto tcp from any to (self) port 80 rdr-to ::1 port 39080", "+pass in proto tcp from any to { 127.0.0.1, ::1 } port 39080"} {
 		if !strings.Contains(dry.Diff, want) {
 			t.Errorf("the diff lacks %q:\n%s", want, dry.Diff)
 		}
@@ -476,7 +476,7 @@ func TestHostFWACMERedirectOverTheWire(t *testing.T) {
 	if err != nil || res.Pending == nil {
 		t.Fatalf("%v %+v", err, res)
 	}
-	if _, loaded, _ := f.pf.state(); !strings.Contains(loaded, "-> 127.0.0.1 port 39080") {
+	if _, loaded, _ := f.pf.state(); !strings.Contains(loaded, "rdr-to 127.0.0.1 port 39080") {
 		t.Errorf("not loaded:\n%s", loaded)
 	}
 	// every pfctl call was an allow-listed form
@@ -576,12 +576,12 @@ func TestHostFWLockoutGuard(t *testing.T) {
 		lockoutGuard(api.DefaultHostFirewall(39110).Canonical(), "2001:db8::1", false) != nil {
 		t.Error("open or default")
 	}
-	// unknown caller: refused without i_know, accepted with it
-	if err := lockoutGuard(spec, "", false); !api.IsCode(err, api.CodeInvalid) || !strings.Contains(err.(*api.Error).Hint, "--i-know") {
+	// unknown caller: refused without confirm_lockout, accepted with it
+	if err := lockoutGuard(spec, "", false); !api.IsCode(err, api.CodeInvalid) || !strings.Contains(err.(*api.Error).Hint, "--confirm-lockout") {
 		t.Errorf("unknown peer: %v", err)
 	}
 	if err := lockoutGuard(spec, "", true); err != nil {
-		t.Errorf("i_know: %v", err)
+		t.Errorf("confirm_lockout: %v", err)
 	}
 
 	// through the helper: refused before anything changes; the dry run says so
@@ -607,10 +607,10 @@ func TestHostFWLockoutGuard(t *testing.T) {
 	if snaps, _ := c.HostSnapshots(context.Background()); len(snaps) != 0 {
 		t.Errorf("a refused apply took a snapshot: %v", snaps)
 	}
-	req.IKnow = true
+	req.ConfirmLockout = true
 	res, err := c.HostFirewallApply(admin(), req)
 	if err != nil || res.Pending == nil {
-		t.Fatalf("i_know: %+v %v", res, err)
+		t.Fatalf("confirm_lockout: %+v %v", res, err)
 	}
 }
 

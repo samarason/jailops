@@ -1,0 +1,224 @@
+.\" jailops-setup.8, installed as /usr/local/share/man/man8/jailops-setup.8
+.Dd November 5, 2026
+.Dt JAILOPS-SETUP 8
+.Os
+.Sh NAME
+.Nm jailops-setup
+.Nd set a host up for JailOps after the package is installed
+.Sh SYNOPSIS
+.Nm
+.Op Fl pool Ar pool
+.Op Fl n | -dry-run
+.Op Fl y | -yes
+.Sh DESCRIPTION
+.Nm
+is the one command to run, as root, after
+.Ql pkg install jailops .
+It does what the manual installation guide describes, in this order, and only
+what is not done yet, so it is safe to run again:
+.Bl -enum
+.It
+Loads the kernel modules
+.Sy if_epair , pf
+and
+.Sy zfs
+and sets them to load at boot in
+.Pa /boot/loader.conf .
+Loading
+.Sy pf
+does not start it.
+.It
+Makes the one-time setup of the pool: the user and group, the datasets and the
+configuration files.
+.It
+Turns IP forwarding on now
+.Pq Xr sysctl 8
+and at boot
+.Pq Va gateway_enable , ipv6_gateway_enable .
+.It
+Offers to enable the host resolver of the base system
+.Pq Va local_unbound_enable , Xr local-unbound-setup 8 ,
+which answers the DNS of the jails and gives them names
+.Pq Ar jail Ns \&. Ns Ar project Ns \&.internal ;
+when it is enabled already it only makes its
+.Pa conf.d
+directory root's.
+It writes
+.Pa /etc/resolv.conf
+and
+.Pa /var/unbound ,
+so it asks.
+.It
+Puts the anchor line of JailOps into
+.Pa /etc/pf.conf
+(or the file
+.Va pf_rules
+of
+.Xr rc.conf 5
+names), loads it and starts
+.Xr pf 4 ;
+see
+.Sx PF .
+.It
+Enables
+.Sy jailopsd
+with the web console
+.Pq Va jailopsd_web
+in
+.Xr rc.conf 5 ,
+unless
+.Va jailopsd_web
+is set already, and starts them, the helper first.
+.It
+Runs
+.Ql jailops doctor .
+.It
+Offers to create the first administrator
+.Pq Ql jailops user create admin --admin --password-prompt
+when no user exists and standard input is a terminal.
+.It
+Prints the address of the web console.
+.El
+.Pp
+Every action is printed on one line starting with
+.Ql >
+before it runs.
+A step that fails is reported with a line starting with
+.Ql x ;
+the steps after it still run, except after a failed
+.Cm init .
+.Pp
+A host in appliance mode
+.Pq Va jailops_appliance
+is set up from the web console instead, and
+.Nm
+refuses to run there.
+.Pp
+The options are:
+.Bl -tag -width Ds
+.It Fl pool Ar pool
+The ZFS pool for JailOps.
+Needed only when more than one pool is imported; with one pool that one is
+taken.
+.It Fl n , -dry-run
+Print the actions and change nothing.
+The new
+.Pa pf.conf
+is shown and checked with
+.Ql pfctl -nf ,
+which changes nothing either.
+.It Fl y , -yes
+Do not ask: apply the pf changes, including starting pf.
+Read what a dry run prints first.
+.El
+.Sh PF
+Lines that are in
+.Pa pf.conf
+are never changed, moved or removed.
+What is missing is inserted where pf wants it: options, normalisation,
+filtering.
+.Bl -bullet
+.It
+.Ql set state-policy if-bound ,
+when no
+.Ql set state-policy
+line exists, before the first rule.
+Jails behind NAT need it.
+.It
+.Ql scrub in all fragment reassemble ,
+when there is no scrub rule, before the first translation or filter rule.
+.It
+.Ql anchor \&"jailops/*\&" ,
+before the first filter rule, so that a broad pass rule of the host does not
+decide for the jails.
+The anchor holds their rules and the NAT and port
+forwards of their networks.
+.El
+.Pp
+A comment that begins with
+.Ql # jailops-setup\&:
+marks each inserted line.
+When the file does not exist, a minimal one is written: the options, the
+anchor line and
+.Ql pass all ,
+which blocks nothing.
+A file that includes other files is not edited when an anchor line is missing:
+add the lines by hand.
+.Pp
+The new text is checked with
+.Ql pfctl -nf
+before anything is written; when pf refuses it, the file stays as it is and
+nothing is loaded.
+The old file is kept next to it as
+.Pa pf.conf.jailops-setup- Ns Ar YYYYMMDD-HHMMSS ,
+with the same mode and owner.
+The rules are then loaded with
+.Ql pfctl -f ,
+which keeps the states of open connections, so a running ssh session stays.
+.Nm
+never runs
+.Ql service pf restart
+or flushes states.
+.Pp
+Starting pf
+.Pq Ql pfctl -e
+and enabling it at boot
+.Pq Va pf_enable
+are said before they happen.
+When the rules contain a block rule,
+.Nm
+warns that an ssh session is cut unless a pass rule admits it.
+Every pf change is asked for, and the answer is no unless it is
+.Ql y ;
+.Fl y
+answers yes.
+.Sh ENVIRONMENT
+For tests only:
+.Bl -tag -width Ds
+.It Ev JAILOPS_SETUP_ROOT
+A prefix of every file path read or written.
+.It Ev JAILOPS_SETUP_PRIV
+The
+.Nm jailops-priv
+binary.
+.It Ev JAILOPS_SETUP_WAIT
+Seconds to wait for the socket of the daemon, default 20.
+.El
+.Sh FILES
+.Bl -tag -width Ds -compact
+.It Pa /etc/pf.conf
+The rules of pf, with the anchor line of JailOps.
+.It Pa /etc/rc.conf
+The variables of the services, forwarding and pf.
+.It Pa /boot/loader.conf
+The kernel modules loaded at boot.
+.It Pa /usr/local/libexec/jailops-priv
+The helper that runs
+.Cm init .
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds -compact
+.It 0
+Everything is set up, or a dry run.
+.It 1
+Not root, no pool, appliance mode, or a step is not done (a refused pf change
+included); the lines starting with
+.Ql x
+say which.
+.It 2
+Usage, an unknown pool, or more than one pool and no
+.Fl pool .
+.El
+.Sh EXAMPLES
+See what would be done, then do it:
+.Bd -literal -offset indent
+jailops-setup -n
+jailops-setup
+.Ed
+.Sh SEE ALSO
+.Xr jailops 1 ,
+.Xr pf.conf 5 ,
+.Xr rc.conf 5 ,
+.Xr jailops-priv 8 ,
+.Xr jailopsd 8 ,
+.Xr pfctl 8

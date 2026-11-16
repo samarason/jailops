@@ -13,7 +13,7 @@ vi.mock('@/api/endpoints', () => ({
 import AppAllowDialog from './AppAllowDialog.vue'
 
 const access = { jail: 'db', project: 'web', app: 'postgresql', type: 'postgresql', policy: 'app-db', closed: true, ports: ['5432/tcp'], grants: [] }
-const grant = { source: '@web', source_kind: 'jail', ports: ['5432/tcp'], rules: ['allow in tcp from 10.20.0.11 to port 5432'], hba: ['host web web 10.20.0.11/32 scram-sha-256'], database: 'web', role: 'web', created_at: '' }
+const grant = { source: 'jail:web', source_kind: 'jail', ports: ['5432/tcp'], rules: ['allow in tcp from 10.20.0.11 to port 5432'], hba: ['host web web 10.20.0.11/32 scram-sha-256'], database: 'web', role: 'web', created_at: '' }
 
 describe('AppAllowDialog', () => {
   beforeEach(() => allow.mockReset())
@@ -22,15 +22,15 @@ describe('AppAllowDialog', () => {
     const w = mount(AppAllowDialog, { props: { open: true, access: access as never }, global: { stubs: { Teleport: true } } })
     await flushPromises()
     const names = w.findAll('[data-test="allow-jails"] .mono').map((x) => x.text())
-    expect(names).toEqual(['@web', '@web-api'])
+    expect(names).toEqual(['jail:web', 'jail:web-api'])
     await w.get('#acc-filter').setValue('api')
-    expect(w.findAll('[data-test="allow-jails"] .mono').map((x) => x.text())).toEqual(['@web-api'])
+    expect(w.findAll('[data-test="allow-jails"] .mono').map((x) => x.text())).toEqual(['jail:web-api'])
     await w.get('#acc-filter').setValue('')
     await w.findAll('[data-test="allow-jails"] input')[0].setValue(true)
     expect(w.get('#acc-db').attributes('placeholder')).toBe('web')
     await w.get('form').trigger('submit')
     await flushPromises()
-    expect(allow).toHaveBeenCalledWith('db', { source: '@web' })
+    expect(allow).toHaveBeenCalledWith('db', { source: 'jail:web' })
     expect((w.get('[data-test="allow-secret"] input').element as HTMLInputElement).value).toContain('SECRET')
     expect(w.emitted('done')).toBeTruthy()
     await w.setProps({ open: false })
@@ -58,7 +58,7 @@ describe('AppAllowDialog', () => {
     await w.findAll('[data-test="allow-jails"] input')[0].setValue(true)
     await w.get('[data-test="allow-preview-btn"]').trigger('click')
     await flushPromises()
-    expect(allow).toHaveBeenCalledWith('db', { source: '@web', dry_run: true })
+    expect(allow).toHaveBeenCalledWith('db', { source: 'jail:web', dry_run: true })
     const p = w.get('[data-test="allow-preview"]').text()
     expect(p).toContain('host web web 10.20.0.11/32 scram-sha-256')
     expect(p).toContain('CREATE ROLE')

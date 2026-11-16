@@ -44,7 +44,7 @@ func HashPassword(password string, p PasswordParams) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("auth: entropy: %w", err)
 	}
-	key := argon2.IDKey([]byte(password), salt, p.Time, p.MemoryKiB, p.Threads, p.KeyLen)
+	key := derive(func() []byte { return argon2.IDKey([]byte(password), salt, p.Time, p.MemoryKiB, p.Threads, p.KeyLen) })
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, p.MemoryKiB, p.Time, p.Threads,
 		b64.EncodeToString(salt), b64.EncodeToString(key)), nil
 }
@@ -98,7 +98,9 @@ func VerifyPassword(password, hash string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	got := argon2.IDKey([]byte(password), salt, p.Time, p.MemoryKiB, p.Threads, uint32(len(key)))
+	got := derive(func() []byte {
+		return argon2.IDKey([]byte(password), salt, p.Time, p.MemoryKiB, p.Threads, uint32(len(key)))
+	})
 	return subtle.ConstantTimeCompare(got, key) == 1, nil
 }
 
@@ -114,7 +116,7 @@ func NeedsRehash(hash string, want PasswordParams) bool {
 // BurnPasswordTime spends one argon2id derivation at the given cost so that
 // login timing does not reveal whether a user exists.
 func BurnPasswordTime(password string, p PasswordParams) {
-	_ = argon2.IDKey([]byte(password), burnSalt, p.Time, p.MemoryKiB, p.Threads, 32)
+	_ = derive(func() []byte { return argon2.IDKey([]byte(password), burnSalt, p.Time, p.MemoryKiB, p.Threads, 32) })
 }
 
 var burnSalt = []byte("jailops-burn-salt")

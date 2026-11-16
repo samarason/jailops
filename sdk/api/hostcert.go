@@ -175,14 +175,14 @@ func ACMEChallengePort(c ACMEChallenge) int {
 	return 80
 }
 
-// ACMERedirectLines are the pf lines an administrator adds to /etc/pf.conf, in its translation section, when the host
-// firewall module does not manage the file: the CA's port is redirected to the daemon's port on the loopback
-// addresses, where an unprivileged listener can answer. "pass" lets the redirected connection through the filter.
+// ACMERedirectLines are the pf lines an administrator adds to /etc/pf.conf, after the line anchor "jailops/*", when the
+// host firewall module does not manage the file: the CA's port is redirected to the daemon's port on the loopback
+// addresses, where an unprivileged listener can answer. "pass in quick" lets the redirected connection through the filter.
 func ACMERedirectLines(c ACMEChallenge, port int) []string {
 	from := ACMEChallengePort(c)
 	return []string{
-		fmt.Sprintf("rdr pass inet proto tcp from any to (self) port %d -> 127.0.0.1 port %d", from, port),
-		fmt.Sprintf("rdr pass inet6 proto tcp from any to (self) port %d -> ::1 port %d", from, port),
+		fmt.Sprintf("pass in quick inet proto tcp from any to (self) port %d rdr-to 127.0.0.1 port %d", from, port),
+		fmt.Sprintf("pass in quick inet6 proto tcp from any to (self) port %d rdr-to ::1 port %d", from, port),
 	}
 }
 

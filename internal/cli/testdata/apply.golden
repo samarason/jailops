@@ -81,7 +81,7 @@ image/viastdin created
 
 $ jailops apply -f <dir>/site.yaml
 ! invalid: a project is required
-! hint: name one with --project NAME, or choose one with 'jailops project switch NAME' (list them with 'jailops project list'; create one with 'jailops project create NAME --new-network')
+! hint: name one with --project NAME or JAILOPS_PROJECT=NAME, or choose one with 'jailops project switch NAME' (list them with 'jailops project list'; create one with 'jailops project create NAME --new-network')
 [exit 2]
 
 $ jailops apply -f <dir>/img.yaml

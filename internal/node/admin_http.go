@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"jailops.net/jailops/internal/node/ctl"
+	"jailops.net/jailops/internal/node/wire"
 	"jailops.net/jailops/internal/repo/datastore"
+	"jailops.net/jailops/internal/repo/format"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -38,6 +40,9 @@ func (n *Node) AdminHandler() http.Handler {
 		"POST " + Base + "/admin/groups/{group}/snapshots/{snap}/deletion/execute": n.aExecuteDeletion,
 		"GET " + Base + "/admin/quarantine":                                        n.aQuarantine,
 		"POST " + Base + "/admin/quarantine/purge":                                 n.aPurgeQuarantine,
+		"POST " + Base + "/admin/quarantine/{id}":                                  n.aQuarantineChunk,
+		"GET " + Base + "/admin/escrow":                                            n.aEscrowList,
+		"DELETE " + Base + "/admin/escrow/{domain}":                                n.aDeleteEscrow,
 		"GET " + Base + "/admin/retention-policies":                                n.aPolicies,
 		"PUT " + Base + "/admin/retention-policies/{scope}":                        n.aSetPolicy,
 		"DELETE " + Base + "/admin/retention-policies/{scope}":                     n.aDeletePolicy,
@@ -315,6 +320,37 @@ func (n *Node) aPurgeQuarantine(w http.ResponseWriter, r *http.Request, a Actor)
 	}
 	n.audit(r.Context(), a.Name, "quarantine.purge", "", map[string]any{"removed": c}, a.Remote)
 	writeJSON(w, 200, map[string]int{"removed": c})
+}
+
+func (n *Node) aQuarantineChunk(w http.ResponseWriter, r *http.Request, a Actor) {
+	id, err := format.ParseID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, errf(api.CodeInvalid, "malformed chunk id"))
+		return
+	}
+	moved, err := n.QuarantineChunk(r.Context(), id, a.Name, a.Remote)
+	if err != nil {
+		writeErr(w, asAPIError(err))
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"moved": moved})
+}
+
+func (n *Node) aEscrowList(w http.ResponseWriter, r *http.Request, a Actor) {
+	d, err := n.ListEscrow(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, wire.EscrowList{Domains: d})
+}
+
+func (n *Node) aDeleteEscrow(w http.ResponseWriter, r *http.Request, a Actor) {
+	if err := n.DeleteEscrow(r.Context(), r.PathValue("domain"), a.Name, a.Remote); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, nil)
 }
 
 func (n *Node) aPolicies(w http.ResponseWriter, r *http.Request, a Actor) {

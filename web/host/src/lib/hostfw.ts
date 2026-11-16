@@ -2,6 +2,7 @@
 // spec it sends, and the countdown of a change that waits for its confirmation.
 import type { HostFirewall, HostFirewallSpec, HostPendingChange } from '@jailops/shared/api/types'
 import { ipv4, ipv6Groups, type FieldError } from './host'
+import { NAME_PATTERN } from '@jailops/shared/lib/names'
 
 export const TEMPLATES = ['default', 'custom-rules', 'open'] as const
 export const MAX_ALLOW = 64
@@ -62,7 +63,8 @@ export function parsePrefix(s: string): { p?: Prefix; error?: string } {
   return { p: { v6: ab.v6, bits, bytes: ab.bytes } }
 }
 
-const SET_NAME = /^[a-z][a-z0-9_]{0,23}$/
+/** A set name of the host firewall: the name rule, at most 24 characters (its pf table is jo_hf_ and the name). */
+const SET_NAME = { test: (v: string) => v.length <= 24 && NAME_PATTERN.test(v) }
 
 /** A port or a range N-M with 1 <= N < M <= 65535. */
 export function validPort(p: string): boolean {
@@ -106,7 +108,7 @@ export function validateFw(f: FwForm): FieldError[] {
   if (f.sets.length > MAX_SETS) out.push({ field: 'sets', message: `At most ${MAX_SETS} sets.` })
   f.sets.forEach((s, i) => {
     const name = s.name.trim()
-    if (!SET_NAME.test(name)) out.push({ field: `set-${i}-name`, message: 'A lower-case letter, then letters, digits or underscores, at most 24 characters.' })
+    if (!SET_NAME.test(name)) out.push({ field: `set-${i}-name`, message: 'Lowercase letters, digits and hyphens, starting with a letter, not ending in a hyphen, at most 24 characters.' })
     else if (setNames.includes(name)) out.push({ field: `set-${i}-name`, message: `Set ${name} is defined twice.` })
     setNames.push(name)
     const m = words(s.members)

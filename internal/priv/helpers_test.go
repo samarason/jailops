@@ -2,6 +2,7 @@ package priv
 
 import (
 	"context"
+	"encoding/json"
 	fmt "fmt"
 	"net/netip"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"jailops.net/jailops/internal/sys/pfctl"
 	"jailops.net/jailops/internal/sys/run"
 	"jailops.net/jailops/internal/sys/zfs"
+	"jailops.net/jailops/sdk/api"
 )
 
 type env struct {
@@ -53,12 +55,15 @@ func newEnv(t *testing.T) *env {
 		ConfDir:      filepath.Join(dir, "etc", "jails"),
 		StateDir:     filepath.Join(dir, "jailops", "state"),
 		HelperPath:   "/usr/local/libexec/jailops-priv",
-		NDPProxy:     []NDPUplink{{Uplink: "em0", Prefixes: []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2:100::/80")}}},
 	}
 	for _, d := range []string{e.cfg.MountBase, e.cfg.ConfDir, e.cfg.StateDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// a storage root's directory has mode 0700 (checkRootDir)
+	if err := os.Chmod(e.cfg.MountBase, 0o700); err != nil {
+		t.Fatal(err)
 	}
 	e.jexec = filepath.Join(dir, "jexec")
 	// A stand-in for jexec(8): it records its arguments and runs the command
@@ -73,7 +78,18 @@ func newEnv(t *testing.T) *env {
 	}
 	e.jails = jailos.NewFake()
 	e.pf = pfctl.NewFake()
-	e.net = ifconfig.NewFake(ifconfig.Options{Prefixes: []string{"jo"}})
+	e.net = ifconfig.NewFake(ifconfig.Options{})
+	e.net.AddForeign("em0", true) // the host's uplink: never JailOps's
+	// a bridge an administrator made by hand (ifconfig bridge create; ifconfig bridge0 name mybr): never JailOps's
+	e.net.AddIface(ifconfig.Iface{Name: "mybr", Groups: []string{"bridge"}, Flags: []string{"UP"}})
+	// an epair, through which the fake NDP routes its jail addresses (jo30gb)
+	if _, _, err := e.net.EpairCreate(context.Background(), "jo30g"); err != nil {
+		t.Fatal(err)
+	}
+	// a network in IPv6 proxy mode on the uplink: the prefix the NDP tests answer for
+	proxyNet, _ := json.Marshal(map[string]any{"kind": "Network", "metadata": api.ObjectMeta{Name: "edge", UUID: "bbbb-1111-2222"},
+		"spec": api.NetworkSpec{Uplink: "em0", IPv6: &api.IPv6Net{Mode: api.IPv6Proxy, Subnet: "2001:db8:1:2:100::/80"}}})
+	mustWrite(t, filepath.Join(e.cfg.StateDir, "objects", "Network", "bbbb-1111-2222.json"), string(proxyNet))
 	e.runner = run.NewFake()
 	l, err := NewLocal(e.cfg, Deps{ZFS: e.zfs, Jails: e.jails, PF: e.pf, Net: e.net, Runner: e.runner, Jexec: e.jexec,
 		NDP: newFakeNDP(dir)}, WithoutChown())
@@ -107,7 +123,7 @@ alpha_web {
 	exec.poststart = "/usr/local/libexec/jailops-priv hook poststart ${name}";
 	exec.prestop = "/usr/local/libexec/jailops-priv hook prestop ${name}";
 	exec.poststop = "/usr/local/libexec/jailops-priv hook poststop ${name}";
-	exec.consolelog = "/var/log/jail_${name}_console.log";
+	exec.consolelog = "/var/log/jailops/jail_${name}_console.log";
 	exec.start = "/bin/sh /etc/rc";
 	exec.stop = "/bin/sh /etc/rc.shutdown jail";
 	enforce_statfs = 2;
@@ -118,6 +134,22 @@ alpha_web {
 
 func (e *env) goodConf() string {
 	return sprintf(goodConf, filepath.Join(e.cfg.MountBase, "projects", "alpha", "jails", "web", "root"))
+}
+
+// storeLan stores a network with this IPv4 subnet: the addresses and routes a test puts on an epair lie in it.
+func (e *env) storeLan(t *testing.T, subnet string) {
+	t.Helper()
+	b, _ := json.Marshal(map[string]any{"kind": "Network", "metadata": api.ObjectMeta{Name: "lan", UUID: "cccc-1111-2222"},
+		"spec": api.NetworkSpec{Uplink: "em0", IPv4: &api.IPv4Net{Subnet: subnet, Gateway: subnet[:strings.LastIndex(subnet, ".")] + ".1"}}})
+	mustWrite(t, filepath.Join(e.cfg.StateDir, "objects", "Network", "cccc-1111-2222.json"), string(b))
+}
+
+// goodConfNamed is goodConf for the jail called name (<project>_<jail>), at the root path that name has.
+func (e *env) goodConfNamed(name string) string {
+	proj, jail, _ := strings.Cut(name, "_")
+	conf := strings.Replace(e.goodConf(), "alpha_web {", name+" {", 1)
+	return strings.Replace(conf, filepath.Join(e.cfg.MountBase, "projects", "alpha", "jails", "web", "root"),
+		filepath.Join(e.cfg.MountBase, "projects", proj, "jails", jail, "root"), 1)
 }
 
 func sprintf(f string, a ...any) string { return fmt.Sprintf(f, a...) }
@@ -135,5 +167,5 @@ func removeAll(p string) error { return os.RemoveAll(p) }
 // conf makes jail key a managed jail (its conf file exists).
 func (e *env) conf(t *testing.T, key string) {
 	t.Helper()
-	mustWrite(t, filepath.Join(e.cfg.ConfDir, key+".conf"), strings.Replace(e.goodConf(), "alpha_web {", key+" {", 1))
+	mustWrite(t, filepath.Join(e.cfg.ConfDir, key+".conf"), e.goodConfNamed(key))
 }

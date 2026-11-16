@@ -149,6 +149,10 @@ func RcConfFreeBSD(in NetInput) (string, error) {
 	return b.result()
 }
 
+// ResolvMarker starts the first line of a resolv.conf JailOps wrote. JailOps writes the file again only while the line
+// is there: a jail that removes it (or has a file of its own) keeps its resolver configuration.
+const ResolvMarker = "# written by JailOps"
+
 // ResolvConf renders resolv.conf: up to three nameservers and an optional
 // search list. It is shared by FreeBSD and Alpine guests.
 func ResolvConf(dns []netip.Addr, search []string) (string, error) {
@@ -159,7 +163,7 @@ func ResolvConf(dns []netip.Addr, search []string) (string, error) {
 		return "", fmt.Errorf("render: at most 6 search domains are honoured")
 	}
 	var b builder
-	b.line("%s", Header)
+	b.line("%s. Remove this line to keep your own changes: JailOps rewrites the file only while it is here.", ResolvMarker)
 	if len(search) > 0 {
 		for _, s := range search {
 			if err := validate.Hostname("search", s); err != nil {

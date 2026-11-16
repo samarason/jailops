@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Wildcards for Rule.Args.
@@ -53,6 +54,9 @@ type Fake struct {
 	// CaptureStdin reads Stdin fully into the recorded Call. Do not use it
 	// with huge streams.
 	CaptureStdin bool
+	// HangOn, when set and true for a command, makes Run wait until the context ends or the command's timeout passes,
+	// as a command that never returns would.
+	HangOn func(Cmd) bool
 }
 
 var _ Runner = (*Fake)(nil)
@@ -117,10 +121,36 @@ func matchArgs(pat, args []string) bool {
 	return len(pat) == len(args)
 }
 
+// SetHangOn sets HangOn while the fake is in use by other goroutines (a daemon that runs in the test).
+func (f *Fake) SetHangOn(fn func(Cmd) bool) {
+	f.mu.Lock()
+	f.HangOn = fn
+	f.mu.Unlock()
+}
+
 // Run implements Runner.
 func (f *Fake) Run(ctx context.Context, c Cmd) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
+	}
+	f.mu.Lock()
+	hang := f.HangOn
+	f.mu.Unlock()
+	if hang != nil && hang(c) {
+		// a command that never ends: only the request ending, or the command's own timeout, ends it
+		var timer <-chan time.Time
+		if c.Timeout > 0 {
+			timer = time.After(c.Timeout)
+		}
+		f.mu.Lock()
+		f.calls = append(f.calls, Call{Cmd: c})
+		f.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		case <-timer:
+			return Result{}, fmt.Errorf("%s: %w after %s", Redact(c), ErrTimeout, c.Timeout)
+		}
 	}
 	call := Call{Cmd: c}
 	if c.Stdin != nil && f.CaptureStdin {

@@ -25,6 +25,9 @@ const (
 	MaxEscrowBytes = 64 << 10
 )
 
+// ageHeader starts every binary age file with at least one recipient stanza; the hosts write only this form.
+const ageHeader = "age-encryption.org/v1\n-> "
+
 func escrowKey(domain string) string { return escrowDir + domain + escrowExt }
 
 // PutEscrow stores the escrow blob of a key domain, create-only. The same bytes
@@ -37,11 +40,6 @@ func (n *Node) PutEscrow(ctx context.Context, h Host, domain string, r io.Reader
 	if err := n.requireOnline(); err != nil {
 		return err
 	}
-	// The first escrow of a repository that recorded no domain binds it (trust on first use); after that only
-	// that domain may be escrowed, by anyone.
-	if err := n.bindDomain(ctx, domain); err != nil {
-		return err
-	}
 	if size <= 0 || size > MaxEscrowBytes {
 		return errf(api.CodeInvalid, "an escrow blob has between 1 and %d bytes", MaxEscrowBytes)
 	}
@@ -51,6 +49,15 @@ func (n *Node) PutEscrow(ctx context.Context, h Host, domain string, r io.Reader
 	}
 	if m, _ := r.Read(make([]byte, 1)); m > 0 {
 		return errf(api.CodeInvalid, "the body is longer than its declared size")
+	}
+	// The node cannot open the blob, but it can refuse what is not an age file at all, before it takes the name.
+	if !bytes.HasPrefix(b, []byte(ageHeader)) {
+		return errf(api.CodeInvalid, "an escrow blob is an age file (it starts with %q)", strings.TrimSpace(ageHeader))
+	}
+	// The first escrow of a repository that recorded no domain binds it (trust on first use); after that only
+	// that domain may be escrowed, by anyone.
+	if err := n.bindDomain(ctx, domain); err != nil {
+		return err
 	}
 	err := datastore.PutBytes(ctx, n.be, escrowKey(domain), b, datastore.PutOptions{IfAbsent: true})
 	switch {
@@ -65,6 +72,28 @@ func (n *Node) PutEscrow(ctx context.Context, h Host, domain string, r io.Reader
 		return errf(api.CodeAlreadyExists, "an escrow blob exists for key domain %s", domain)
 	}
 	return asAPIError(err)
+}
+
+// DeleteEscrow removes the escrow blob of a key domain: an administrator's remedy for a blob that does not open
+// with the recovery identity (a host of the key domain may have stored a wrong one first). A host then stores a
+// new one with PutEscrow, which is create-only as before. The repository stays bound to its key domain.
+func (n *Node) DeleteEscrow(ctx context.Context, domain, actor, remote string) error {
+	if !format.ValidDomainID(domain) {
+		return errf(api.CodeInvalid, "malformed key domain id")
+	}
+	if err := n.requireOnline(); err != nil {
+		return err
+	}
+	if _, err := n.be.Head(ctx, escrowKey(domain)); errors.Is(err, datastore.ErrNotFound) {
+		return errf(api.CodeNotFound, "no escrow blob for key domain %s", domain)
+	} else if err != nil {
+		return asAPIError(err)
+	}
+	if err := n.be.Delete(ctx, escrowKey(domain)); err != nil {
+		return asAPIError(err)
+	}
+	n.audit(ctx, actor, "escrow.delete", domain, nil, remote)
+	return nil
 }
 
 // GetEscrow returns the escrow blob of a key domain.

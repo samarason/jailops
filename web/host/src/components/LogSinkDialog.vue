@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { s } from '@/i18n'
 import { api } from '@/api/endpoints'
 import { ApiError } from '@jailops/shared/api/client'
@@ -25,6 +25,13 @@ const msg = (k: string): string => {
   return p ? s.forward.problems[p] ?? p : ''
 }
 const ready = computed(() => !!f.name && !!f.to && !Object.keys(problems.value).length)
+// the first problem with the name of its field, for the text next to Save
+const firstMsg = computed(() => {
+  const k = ['name', 'to', ...Object.keys(problems.value)].find((x) => msg(x))
+  if (!k) return ''
+  const label = (s.forward as Record<string, unknown>)[k]
+  return `${typeof label === 'string' ? label : k}: ${msg(k)}`
+})
 const clear = computed(() => plaintextRemote(f.type, f.to))
 
 watch(() => props.open, (o) => {
@@ -36,7 +43,12 @@ watch(() => props.open, (o) => {
 
 async function save(): Promise<void> {
   submitted.value = true
-  if (!ready.value) return
+  if (!ready.value) {
+    // the first field with a message gets the focus
+    await nextTick()
+    document.querySelector<HTMLElement>('#lsf [aria-invalid="true"]')?.focus()
+    return
+  }
   busy.value = true
   error.value = null
   try {
@@ -54,9 +66,9 @@ async function save(): Promise<void> {
 <template>
   <Modal :open="open" :title="sink ? s.forward.editTitle(sink.name) : s.forward.addTitle" wide @close="emit('close')">
     <form id="lsf" novalidate @submit.prevent="save">
-      <div class="grid-2">
+      <div class="form-2">
         <div class="field">
-          <label for="lsf-name">{{ s.forward.name }}</label>
+          <label for="lsf-name">{{ s.forward.name }} <span class="req" aria-hidden="true">*</span></label>
           <input id="lsf-name" v-model="f.name" class="mono" type="text" autocomplete="off" required :aria-invalid="!!msg('name')" aria-describedby="lsf-name-h lsf-name-e" />
           <span id="lsf-name-h" class="hint">{{ s.forward.nameHint }}</span>
           <span id="lsf-name-e" class="field-error" role="alert">{{ msg('name') }}</span>
@@ -67,13 +79,13 @@ async function save(): Promise<void> {
         </div>
       </div>
       <div class="field">
-        <label for="lsf-to">{{ s.forward.to }}</label>
+        <label for="lsf-to">{{ s.forward.to }} <span class="req" aria-hidden="true">*</span></label>
         <input id="lsf-to" v-model="f.to" class="mono" type="text" autocomplete="off" required :placeholder="f.type === 'syslog' ? 'tls://logs.example.com:6514' : 'https://hooks.example.com/logs'" :aria-invalid="!!msg('to')" aria-describedby="lsf-to-h lsf-to-e" />
         <span id="lsf-to-h" class="hint">{{ f.type === 'syslog' ? s.forward.toHintSyslog : s.forward.toHintWebhook }}</span>
         <span id="lsf-to-e" class="field-error" role="alert">{{ msg('to') }}</span>
       </div>
       <Callout v-if="clear" tone="warn" data-test="lsf-plaintext">{{ s.forward.plaintext }}</Callout>
-      <div class="grid-2">
+      <div class="form-2">
         <div v-if="f.type === 'syslog'" class="field">
           <label for="lsf-fac">{{ s.forward.facility }}</label>
           <select id="lsf-fac" v-model="f.facility"><option v-for="x in FACILITIES" :key="x" :value="x">{{ x }}</option></select>
@@ -87,13 +99,13 @@ async function save(): Promise<void> {
       </div>
       <div class="field">
         <label for="lsf-ca">{{ s.forward.caFile }}</label>
-        <input id="lsf-ca" v-model="f.caFile" class="mono" type="text" autocomplete="off" placeholder="/usr/local/etc/jailops/logs-ca.pem" :aria-invalid="!!msg('caFile')" aria-describedby="lsf-ca-h lsf-ca-e" />
+        <input id="lsf-ca" v-model="f.caFile" class="mono" type="text" autocomplete="off" placeholder="/usr/local/etc/jailops/sinks/logs-ca.pem" :aria-invalid="!!msg('caFile')" aria-describedby="lsf-ca-h lsf-ca-e" />
         <span id="lsf-ca-h" class="hint">{{ s.forward.caHint }}</span>
         <span id="lsf-ca-e" class="field-error" role="alert">{{ msg('caFile') }}</span>
       </div>
       <div v-if="f.type === 'webhook'" class="field">
         <label for="lsf-token">{{ s.forward.tokenFile }}</label>
-        <input id="lsf-token" v-model="f.tokenFile" class="mono" type="text" autocomplete="off" placeholder="/usr/local/etc/jailops/hook.token" :aria-invalid="!!msg('tokenFile')" aria-describedby="lsf-token-h lsf-token-e" />
+        <input id="lsf-token" v-model="f.tokenFile" class="mono" type="text" autocomplete="off" placeholder="/usr/local/etc/jailops/sinks/hook.token" :aria-invalid="!!msg('tokenFile')" aria-describedby="lsf-token-h lsf-token-e" />
         <span id="lsf-token-h" class="hint">{{ s.forward.tokenHint }}</span>
         <span id="lsf-token-e" class="field-error" role="alert">{{ msg('tokenFile') }}</span>
       </div>
@@ -115,6 +127,7 @@ async function save(): Promise<void> {
       <ErrorPanel v-if="error" :error="error" style="margin-top: 12px" />
     </form>
     <template #footer>
+      <span v-if="submitted && firstMsg" class="why-disabled" data-test="lsf-why">{{ s.form.fixFirst(firstMsg) }}</span>
       <button class="btn" type="button" @click="emit('close')">{{ s.app.cancel }}</button>
       <button class="btn btn-primary" type="submit" form="lsf" :disabled="busy" data-test="lsf-save">{{ s.forward.save }}</button>
     </template>

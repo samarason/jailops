@@ -291,6 +291,56 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, rp)
 }
 
+// handleShellSetup answers like the daemon: a running FreeBSD jail gets bash as its shell and the default prompt
+// where its keys are empty, and the steps say what a host would do.
+func (s *Server) handleShellSetup(w http.ResponseWriter, r *http.Request) {
+	if _, e := decodeOptional[api.ShellSetupRequest](r); e != nil {
+		writeErr(w, e)
+		return
+	}
+	name := r.PathValue("name")
+	rc := s.info(r)
+	jk := s.jails.key(r, name)
+	s.mu.Lock()
+	rp := func() reply {
+		j := s.jails.items[jk]
+		if j == nil {
+			return reply{err: notFound("jail", name)}
+		}
+		if j.Spec.OS == api.OSLinux {
+			return reply{err: api.Errorf(api.CodeInvalid, "jail %q is a linux jail: the shell setup is for FreeBSD jails", name)}
+		}
+		if j.Status.Power != api.PowerRunning {
+			return reply{err: api.Errorf(api.CodeBusy, "jail %q is not running; the shell is set up inside it", name).WithHint("start it first")}
+		}
+		op := s.startOp(rc.project, "jails.shell-setup", "Set up the shell of jail "+name, map[string][]string{"jails": {"/api/v1/jails/" + name}}, func() (any, *api.Error) {
+			j := s.jails.items[jk]
+			if j == nil {
+				return nil, notFound("jail", name)
+			}
+			if j.Spec.Shell == "" {
+				j.Spec.Shell = api.BashPath
+			}
+			if j.Spec.Prompt == "" && j.Spec.Shell == api.BashPath {
+				j.Spec.Prompt = api.PromptDefault
+			}
+			steps := []string{}
+			if j.Spec.Shell == api.BashPath {
+				steps = append(steps, "pkg -r ROOT install -y bash")
+			}
+			ps1 := api.EffectivePS1(j.Spec.Prompt, api.DefaultPromptColor)
+			if ps1 != "" {
+				steps = append(steps, "wrote "+api.PromptFile)
+			}
+			s.emitIn(rc.project, "jail-shell-set-up", "/api/v1/jails/"+name)
+			return api.ShellSetupResult{Jail: name, Shell: j.Spec.Shell, Prompt: j.Spec.Prompt, PS1: ps1, Steps: steps}, nil
+		})
+		return reply{op: &op}
+	}()
+	s.mu.Unlock()
+	s.respond(w, rp)
+}
+
 func containsString(l []string, s string) bool {
 	for _, x := range l {
 		if x == s {

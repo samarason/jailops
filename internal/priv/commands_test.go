@@ -30,13 +30,13 @@ func TestCommandRulesAreDocumentedAndFixed(t *testing.T) {
 			t.Errorf("rule %s: timeout %d", r.Name, r.MaxTimeoutSeconds)
 		}
 	}
-	for _, n := range []string{"pkg", "etcupdate", "freebsd-update", "sysctl", "kldstat", "kldload", "pfctl", "uname", "rctl"} {
+	for _, n := range []string{"pkg", "etcupdate", "sysctl", "kldstat", "kldload", "pfctl", "uname", "rctl"} {
 		if !seen[n] {
 			t.Errorf("no rule for %s", n)
 		}
 	}
 	// ifconfig is in the table only in the forms customIfconfig accepts: the
-	// bridge MTU and the host interfaces go through the net.* operations.
+	// MTU and the host interfaces go through the net.* operations.
 }
 
 func TestExtendedCommandRules(t *testing.T) {
@@ -64,21 +64,21 @@ func TestExtendedCommandRules(t *testing.T) {
 	}
 	// sysctl reads
 	ok(ctx, "/sbin/sysctl", "sysctl", "-n", "kern.osrelease")
-	ok(ctx, "/sbin/sysctl", "sysctl", "-n", "net.link.bridge.pfil_onlyip")
+	ok(ctx, "/sbin/sysctl", "sysctl", "-n", "net.inet.ip.forwarding")
 	ok(ctx, "/sbin/sysctl", "sysctl", "-n", "hw.ncpu")
 	// The doctor reads the answer-off-link-probes switch of a shared IPv6 segment; nobody writes it through the helper.
 	ok(ctx, "/sbin/sysctl", "sysctl", "-n", "net.inet6.icmp6.nd6_onlink_ns_rfc4861")
 	bad(adm, api.CodeForbidden, "sysctl", "net.inet6.icmp6.nd6_onlink_ns_rfc4861=1")
 	bad(adm, api.CodeForbidden, "sysctl", "-w", "net.inet6.icmp6.nd6_onlink_ns_rfc4861=1")
 	for _, a := range [][]string{
-		{"-n", "kern.securelevel"}, {"-n"}, {}, {"kern.osrelease"}, {"-a"}, {"-n", "kern.osrelease", "hw.ncpu"}, {"-n", "kern.osrelease=1"},
+		{"-n", "kern.securelevel"}, {"-n", "net.link.epair.q2"}, {"-n"}, {}, {"kern.osrelease"}, {"-a"}, {"-n", "kern.osrelease", "hw.ncpu"}, {"-n", "kern.osrelease=1"},
 		{"-n", "../kern"}, {"-N", "kern.osrelease"}, {"-w", "net.inet.ip.forwarding=1"}, {"-n", ""}, {"-n", "kern.osrelease\n"},
 		{"--", "-n", "kern.osrelease"}, {"-n", "-n"}, {"-f", "/etc/sysctl.conf"}, {"-n", "net.inet.ip.forwarding=1"},
 	} {
 		bad(ctx, api.CodeForbidden, append([]string{"sysctl"}, a...)...)
 	}
 	// sysctl writes: admin, allow-listed name, value 0 or 1
-	for _, n := range []string{"net.inet6.ip6.forwarding", "net.inet.ip.forwarding", "net.link.bridge.pfil_member", "net.link.bridge.pfil_bridge", "net.link.bridge.pfil_onlyip"} {
+	for _, n := range []string{"net.inet6.ip6.forwarding", "net.inet.ip.forwarding"} {
 		ok(adm, "/sbin/sysctl", "sysctl", n+"=1")
 		ok(adm, "/sbin/sysctl", "sysctl", n+"=0")
 		bad(ctx, api.CodeForbidden, "sysctl", n+"=1")
@@ -130,6 +130,21 @@ func TestExtendedCommandRules(t *testing.T) {
 			t.Errorf("rctl %q accepted", a)
 		}
 	}
+	// dnctl: the pipes of the bandwidth limits, in JailOps's own range only
+	ok(ctx, "/sbin/dnctl", "dnctl", "pipe", "40000", "config", "bw", "0")
+	ok(ctx, "/sbin/dnctl", "dnctl", "pipe", "59999", "config", "bw", "10000000bit/s")
+	ok(ctx, "/sbin/dnctl", "dnctl", "pipe", "delete", "40001")
+	ok(ctx, "/sbin/dnctl", "dnctl", "pipe", "list")
+	for _, a := range [][]string{
+		{"pipe", "39999", "config", "bw", "10000000bit/s"}, {"pipe", "60000", "config", "bw", "0"}, {"pipe", "1", "config", "bw", "0"},
+		{"pipe", "040000", "config", "bw", "0"}, {"pipe", "-1", "config", "bw", "0"}, {"pipe", "40000", "config", "bw", "10M"},
+		{"pipe", "40000", "config", "bw", "10Mbit/s"}, {"pipe", "40000", "config", "bw", "-5bit/s"}, {"pipe", "40000", "config", "bw", "tun0"},
+		{"pipe", "40000", "config", "delay", "250ms"}, {"pipe", "40000", "config", "bw", "10000bit/s", "queue", "50"},
+		{"pipe", "delete", "1"}, {"pipe", "delete", "all"}, {"pipe", "delete"}, {"pipe", "show"}, {"queue", "40000", "config", "bw", "0"},
+		{"sched", "40000", "config", "type", "wf2q+"}, {"-f", "pipe", "list"}, {"flush"}, {},
+	} {
+		bad(ctx, api.CodeForbidden, append([]string{"dnctl"}, a...)...)
+	}
 	// pfctl: read-only, jailops anchors only
 	ok(ctx, "/sbin/pfctl", "pfctl", "-s", "info")
 	ok(ctx, "/sbin/pfctl", "pfctl", "-a", "jailops/web/nginx", "-s", "rules")
@@ -163,11 +178,11 @@ func TestRunnerRunsExtendedRulesWithFixedBinaries(t *testing.T) {
 	ctx := context.Background()
 	adm := WithAdmin(ctx, "alice")
 	r := e.local.Runner()
-	e.runner.On("/sbin/kldload", []string{"if_bridge"}, "")
+	e.runner.On("/sbin/kldload", []string{"if_epair"}, "")
 	e.runner.On("/usr/bin/uname", []string{"-r"}, "15.0-RELEASE\n")
 	e.runner.On("/sbin/sysctl", []string{"net.inet.ip.forwarding=1"}, "")
 	e.runner.On("/sbin/pfctl", []string{"-a", "jailops/web/x", "-s", "rules"}, "pass\n")
-	if _, err := r.Run(ctx, run.Cmd{Name: "kldload", Args: []string{"if_bridge"}}); err != nil {
+	if _, err := r.Run(ctx, run.Cmd{Name: "kldload", Args: []string{"if_epair"}}); err != nil {
 		t.Error(err)
 	}
 	if res, err := r.Run(ctx, run.Cmd{Name: "uname", Args: []string{"-r"}}); err != nil || string(res.Stdout) != "15.0-RELEASE\n" {
@@ -182,7 +197,7 @@ func TestRunnerRunsExtendedRulesWithFixedBinaries(t *testing.T) {
 	if _, err := r.Run(adm, run.Cmd{Name: "sysctl", Args: []string{"net.inet.ip.forwarding=1"}}); err != nil {
 		t.Errorf("sysctl write with admin: %v", err)
 	}
-	if _, err := r.Run(ctx, run.Cmd{Name: "/sbin/kldload", Args: []string{"if_bridge"}}); !api.IsCode(err, api.CodeForbidden) {
+	if _, err := r.Run(ctx, run.Cmd{Name: "/sbin/kldload", Args: []string{"if_epair"}}); !api.IsCode(err, api.CodeForbidden) {
 		t.Errorf("a caller named binary: %v", err)
 	}
 	for _, c := range e.runner.Calls() {
@@ -223,8 +238,8 @@ func TestRunnerReadsUsageOfManagedJailsOnly(t *testing.T) {
 // through the socket only for an admin.
 func TestSysctlWriteOverTheSocket(t *testing.T) {
 	f := newFixture(t)
-	f.runner.On("/sbin/sysctl", []string{"net.link.bridge.pfil_member=0"}, "")
-	cmd := run.Cmd{Name: "sysctl", Args: []string{"net.link.bridge.pfil_member=0"}}
+	f.runner.On("/sbin/sysctl", []string{"net.inet.ip.forwarding=0"}, "")
+	cmd := run.Cmd{Name: "sysctl", Args: []string{"net.inet.ip.forwarding=0"}}
 	if _, err := f.client.Runner().Run(context.Background(), cmd); !api.IsCode(err, api.CodeForbidden) {
 		t.Errorf("without admin: %v", err)
 	}
@@ -236,34 +251,34 @@ func TestSysctlWriteOverTheSocket(t *testing.T) {
 func TestSetMTU(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	if err := e.net.BridgeCreate(ctx, "jo0"); err != nil {
+	if _, _, err := e.net.EpairCreate(ctx, "jo0"); err != nil {
 		t.Fatal(err)
 	}
-	e.runner.On("ifconfig", []string{"jo0", "mtu", "1400"}, "")
-	if err := e.local.SetMTU(ctx, "jo0", 1400); err != nil {
+	e.runner.On("ifconfig", []string{"jo0a", "mtu", "1400"}, "")
+	if err := e.local.SetMTU(ctx, "jo0a", 1400); err != nil {
 		t.Fatal(err)
 	}
 	last := e.runner.Calls()[len(e.runner.Calls())-1].Cmd
-	if last.Name != "ifconfig" || strings.Join(last.Args, " ") != "jo0 mtu 1400" {
+	if last.Name != "ifconfig" || strings.Join(last.Args, " ") != "jo0a mtu 1400" {
 		t.Errorf("ran %+v", last)
 	}
 	for _, c := range []struct {
 		iface string
 		mtu   int
-	}{{"em0", 1400}, {"jo0", 0}, {"jo0", -1}, {"jo0", 575}, {"jo0", 9217}, {"jo0", 1 << 40}, {"-x", 1400}, {"", 1400}, {"jo0 mtu 9", 1400}, {"jo", 1400}} {
+	}{{"em0", 1400}, {"jo0a", 0}, {"jo0a", -1}, {"jo0a", 575}, {"jo0a", 9217}, {"jo0a", 1 << 40}, {"-x", 1400}, {"", 1400}, {"jo0a mtu 9", 1400}, {"jo", 1400}} {
 		if err := e.local.SetMTU(ctx, c.iface, c.mtu); err == nil {
 			t.Errorf("SetMTU(%q, %d) accepted", c.iface, c.mtu)
 		}
 	}
 	// the Runner cannot do it
-	if _, err := e.local.Runner().Run(ctx, run.Cmd{Name: "ifconfig", Args: []string{"jo0", "mtu", "1400"}}); !api.IsCode(err, api.CodeForbidden) {
+	if _, err := e.local.Runner().Run(ctx, run.Cmd{Name: "ifconfig", Args: []string{"jo0a", "mtu", "1400"}}); !api.IsCode(err, api.CodeForbidden) {
 		t.Errorf("ifconfig through the runner: %v", err)
 	}
 }
 
 // A client that implements the proposed ifconfig.Client method is used.
 type mtuNet struct {
-	ifconfig.Client
+	*ifconfig.Fake
 	got string
 }
 
@@ -274,12 +289,15 @@ func (m *mtuNet) SetMTU(_ context.Context, iface string, mtu int) error {
 
 func TestSetMTUUsesTheInterfaceMethodWhenPresent(t *testing.T) {
 	e := newEnv(t)
-	m := &mtuNet{Client: e.net}
+	m := &mtuNet{Fake: e.net}
 	l, err := NewLocal(e.cfg, Deps{ZFS: e.zfs, Net: m, Runner: e.runner}, WithoutChown())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := l.SetMTU(context.Background(), "jo0", 1500); err != nil || m.got != "jo0:0" {
+	if _, _, err := e.net.EpairCreate(context.Background(), "jo0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SetMTU(context.Background(), "jo0a", 1500); err != nil || m.got != "jo0a:0" {
 		t.Errorf("%q %v", m.got, err)
 	}
 	for _, c := range e.runner.Calls() {
@@ -290,9 +308,13 @@ func TestSetMTUUsesTheInterfaceMethodWhenPresent(t *testing.T) {
 }
 
 func TestSetMTUOverTheSocket(t *testing.T) {
-	f := newFixture(t)
-	f.runner.On("ifconfig", []string{"jo0", "mtu", "9000"}, "")
-	if err := f.client.SetMTU(context.Background(), "jo0", 9000); err != nil {
+	f := newFixtureWith(t, func(e *env) {
+		if _, _, err := e.net.EpairCreate(context.Background(), "jo0"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	f.runner.On("ifconfig", []string{"jo0a", "mtu", "9000"}, "")
+	if err := f.client.SetMTU(context.Background(), "jo0a", 9000); err != nil {
 		t.Error(err)
 	}
 	if err := f.client.SetMTU(context.Background(), "em0", 9000); !api.IsCode(err, api.CodeForbidden) {

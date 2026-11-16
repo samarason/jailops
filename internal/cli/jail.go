@@ -28,25 +28,21 @@ func (a *app) jailDesc() *kindDesc[api.Jail] {
 	d.update = func(ctx context.Context, c *sdk.Client, n string, v api.Jail, etag string) (api.Jail, error) {
 		return c.Jails().Update(ctx, n, v, etag)
 	}
+	d.rename = func(ctx context.Context, c *sdk.Client, n string, req api.Rename, etag string) (*sdk.Operation[api.RenameResult], error) {
+		return c.Jails().Rename(ctx, n, req, etag)
+	}
+	d.renameLong = renameLong("jail", `its datasets (snapshots go with them) and their
+mountpoints, its records, its update history, the marks of its provisioning and shell setup, and the boot
+order of the jails that depend on it. The jail must be stopped: the kernel knows a running jail by its
+name, and its mounts, interfaces and firewall anchor are set up under it. Its hostname does not change`)
 	d.create = func(ctx context.Context, c *sdk.Client, v api.Jail) (opHandle, api.Jail, error) {
-		if hasEncryptedVolume(v.Spec) {
-			pass, err := a.newVolumePassphrase()
-			if err != nil {
-				return nil, api.Jail{}, err
-			}
-			h, err := handle(c.Jails().CreateWithPassphrase(ctx, v, pass))
-			return h, api.Jail{}, err
-		}
-		if a.passFile != "" {
-			return nil, api.Jail{}, usagef("--passphrase-file is given but no volume is encrypted (--volume NAME:MOUNT:encrypted)")
-		}
 		h, err := handle(c.Jails().Create(ctx, v))
 		return h, api.Jail{}, err
 	}
 	d.del = func(ctx context.Context, c *sdk.Client, n string) (opHandle, error) {
 		return handle(c.Jails().Delete(ctx, n))
 	}
-	d.head = []string{"NAME", "STATE", "IMAGE", "GEN", "ADDRESSES", "AGE"}
+	d.head = []string{"NAME", "STATE", "IMAGE", "GEN", "ADDRESSES", "AUTOSTART", "AGE"}
 	d.style = stateStyle(1)
 	d.row = func(now time.Time, j api.Jail) []string {
 		addrs := slices.Clone(j.Status.Addresses)
@@ -60,14 +56,14 @@ func (a *app) jailDesc() *kindDesc[api.Jail] {
 			}
 		}
 		return []string{j.Metadata.Name, dash(string(j.Status.Power)), j.Spec.Image, dash(j.Status.Generation),
-			joinOrDash(addrs), age(now, j.Metadata.CreatedAt)}
+			joinOrDash(addrs), autostartCell(j), age(now, j.Metadata.CreatedAt)}
 	}
 	// On a terminal: one address per line with its network, the generation
 	// next to the image, and no column a long IPv6 address would crowd out.
 	d.brief = &listView[api.Jail]{
-		head:  []string{"NAME", "STATE", "IPV4", "IPV6", "IMAGE", "AGE"},
+		head:  []string{"NAME", "STATE", "IPV4", "IPV6", "IMAGE", "AUTOSTART", "AGE"},
 		style: stateStyle(1),
-		drop:  []int{5, 4, 3, 2},
+		drop:  []int{6, 4, 3, 2},
 		row: func(now time.Time, j api.Jail) []string {
 			var v4, v6 []string
 			for _, n := range j.Spec.Network {
@@ -79,7 +75,7 @@ func (a *app) jailDesc() *kindDesc[api.Jail] {
 				}
 			}
 			return []string{j.Metadata.Name, dash(string(j.Status.Power)), linesOrDash(v4), linesOrDash(v6),
-				imageWithGen(j.Spec.Image, j.Status.Generation), age(now, j.Metadata.CreatedAt)}
+				imageWithGen(j.Spec.Image, j.Status.Generation, j.Status.FreeBSDVersion), autostartCell(j), age(now, j.Metadata.CreatedAt)}
 		},
 	}
 	d.filters = func(cmd *cobra.Command) func() (func(api.Jail) bool, error) {
@@ -121,7 +117,92 @@ func (a *app) jailDesc() *kindDesc[api.Jail] {
 	d.afterCreate = a.jailStartFlag
 	d.beforeDelete = a.jailForceFlag
 	d.targets = a.jailTargets
+	d.loss = jailLoss
+	d.emptyHint = "jailops jail create NAME --image IMAGE --network NETWORK --storage STORAGE"
+	d.prepare = a.jailDefaults
 	return &d
+}
+
+// jailLoss says what deleting a jail destroys: the sizes of its root and data, its volumes and the number of its
+// snapshots, as the server reports them now. A running jail without --stop is refused here, before any question;
+// a dry run reports it instead.
+func jailLoss(cmd *cobra.Command, ctx context.Context, c *sdk.Client, name string) (string, error) {
+	j, err := c.Jails().Get(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	force, _ := cmd.Flags().GetBool("stop")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	running := j.Status.Power == api.PowerRunning
+	// a dry run always shows the summary: the running state is part of it, not a reason to fail
+	if running && !force && !dryRun {
+		return "", api.Errorf(api.CodeConflict, "jail %q is running", name).
+			WithHint("stop it first ('jailops stop " + name + "'), or pass --stop to stop it before the delete")
+	}
+	var parts []string
+	u, err := c.Jails().Usage(ctx, name)
+	switch {
+	case err != nil:
+		parts = append(parts, "sizes unknown (the server does not report them)")
+	case u.Disk.Error != "":
+		parts = append(parts, "sizes unknown ("+u.Disk.Error+")")
+	default:
+		parts = append(parts, "root "+humanBytes(u.Disk.RootBytes), "data "+humanBytes(u.Disk.DataBytes))
+	}
+	if snaps, err := collect(c.Jails().Snapshots(name).List(ctx)); err != nil {
+		parts = append(parts, "snapshots unknown")
+	} else {
+		parts = append(parts, count(len(snaps), "snapshot", "snapshots"))
+	}
+	line := fmt.Sprintf("%s (%s): %s", name, dash(string(j.Status.Power)), strings.Join(parts, ", "))
+	if len(j.Spec.Volumes) > 0 {
+		var vols []string
+		for _, v := range j.Spec.Volumes {
+			vols = append(vols, v.Name)
+		}
+		line += "; its volumes stay: " + strings.Join(vols, ", ")
+	}
+	switch {
+	case running && force:
+		line += "; --stop stops it first"
+	case running:
+		line += "; the delete needs --stop to stop it first"
+	}
+	return line, nil
+}
+
+// jailDefaults gives a jail without a network or a storage (and without a profile, which may carry them) the
+// project's only grant of that kind, as app install does, and says which it took.
+func (a *app) jailDefaults(ctx context.Context, c *sdk.Client, j *api.Jail) error {
+	if len(j.Spec.Profiles) > 0 || (len(j.Spec.Network) > 0 && j.Spec.Storage != "") {
+		return nil
+	}
+	project := a.conn.CurrentProject()
+	p, err := c.Projects().Get(ctx, project)
+	if err != nil {
+		return err
+	}
+	if len(j.Spec.Network) == 0 {
+		if n := p.Spec.SoleNetwork(); n != "" {
+			j.Spec.Network = []api.NetworkAttach{{Network: n}}
+			fprintf(a.env.Stderr, "network %s: the only network of project %s\n", n, project)
+		}
+	}
+	if j.Spec.Storage == "" {
+		if s := p.Spec.SoleStorage(); s != "" {
+			j.Spec.Storage = s
+			fprintf(a.env.Stderr, "storage %s: the only storage of project %s\n", s, project)
+		}
+	}
+	return nil
+}
+
+// count is "1 snapshot", "3 snapshots".
+func count(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return strconv.Itoa(n) + " " + many
 }
 
 // powerStates are the states 'list --state' accepts.
@@ -151,13 +232,13 @@ func (a *app) jailStartFlag(cmd *cobra.Command) func(ctx context.Context, name s
 	}
 }
 
-// jailForceFlag registers --force on delete and stops a running jail before
+// jailForceFlag registers --stop on delete and stops a running jail before
 // it is deleted when the flag was given.
 func (a *app) jailForceFlag(cmd *cobra.Command) func(ctx context.Context, name string) error {
 	var force bool
-	cmd.Flags().BoolVar(&force, "force", false, "stop the jail first when it is running")
-	cmd.Long += "\nA running jail is refused unless --force is given, which stops it first."
-	cmd.Example += "\njailops @P@ delete --force web"
+	cmd.Flags().BoolVar(&force, "stop", false, "stop the jail first when it is running (the data-loss confirmation is still needed)")
+	cmd.Long += "\nA running jail is refused unless --stop is given, which stops it first; --stop does not\nconfirm the data loss."
+	cmd.Example += "\njailops @P@ delete --stop --confirm-data-loss web"
 	return func(ctx context.Context, name string) error {
 		if !force {
 			return nil
@@ -194,7 +275,7 @@ func (a *app) jailForceFlag(cmd *cobra.Command) func(ctx context.Context, name s
 func (a *app) jailTargets(cmd *cobra.Command) func(ctx context.Context, args []string) ([]string, bool, error) {
 	var selectors []string
 	var all bool
-	cmd.Flags().StringArrayVarP(&selectors, "selector", "l", nil, "act on the jails carrying these labels, key=value (comma separated or repeated), instead of naming them")
+	cmd.Flags().StringArrayVarP(&selectors, "selector", "l", nil, "act on the jails carrying these labels, key=value (comma separated or repeated), instead of naming them (--label is the same)")
 	cmd.Flags().BoolVar(&all, "all", false, "act on every jail of the project")
 	return func(ctx context.Context, args []string) ([]string, bool, error) {
 		switch {
@@ -254,7 +335,7 @@ func sideBySide(w interface{ Write([]byte) (int, error) }, lh, left, rh, right s
 		if b != "" {
 			line = a + strings.Repeat(" ", width-len([]rune(a))+4) + b
 		}
-		_, _ = fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fprintln(w, strings.TrimRight(line, " "))
 	}
 }
 
@@ -268,14 +349,14 @@ snapshots, rollback and upgrade).
 
 Use --host to act on a host behind a hub.`,
 		`jailops jail list --state running
-jailops jail create web --image freebsd-15@stable --network lan --memory 2G
+jailops jail create web --image freebsd-15-1 --network lan --memory 2G
 jailops jail show web
 jailops jail start web`, "jails")
 	crudCommands(a, jc, d, jailCreateLong, jailCreateExample, a.jailFlagBuild)
 	jc.AddCommand(a.jailInfo(d))
 	jc.AddCommand(a.jailLifecycleSet(d)...)
 	jc.AddCommand(a.jailExec(d), a.jailShell(d), a.provisionCmd(), a.labelCmd(), a.jailConsole(d), a.jailSnapshotCmd(d), a.jailRollback(d), a.jailUpgrade(d), a.jailCopy(d), a.jailLogs(d))
-	jc.AddCommand(a.jailUnlock(d), a.jailLock(d), a.jailPassphrase(d))
+	jc.AddCommand(a.jailShellSetup(d))
 	return jc
 }
 
@@ -289,20 +370,27 @@ func fixedAddr(s string) string {
 }
 
 const jailCreateLong = `Create a jail from flags or from a file. A jail needs a project, a network and a
-storage, and none of them is guessed: name them, or use a profile that carries them.
+storage. Name them, or use a profile that carries them; without either, a project
+that is granted exactly one network (or one storage) gives the jail that one, and
+the command says so on standard error. Several grants are never guessed from.
 The project is --project, JAILOPS_PROJECT or the one chosen with 'project switch'.
 The server allocates "auto" addresses from the network and writes them back into
 the specification.
 
-A volume marked encrypted (--volume NAME:MOUNT:encrypted, or encrypted: true in a
-file) is encrypted with ZFS (aes-256-gcm) under a passphrase you type twice; scripts
-give it with --passphrase-file. The passphrase is needed again after every host boot
-('jailops jail unlock'). A forgotten passphrase cannot be recovered.`
+Volumes are attached afterwards: 'jailops volume create' makes one and 'jailops volume attach JAIL
+VOLUME PATH' puts it into a stopped jail. Deleting the jail never deletes a volume.
 
-const jailCreateExample = `jailops @P@ create web --project web --image freebsd-15@stable --network lan --storage default --start
-jailops @P@ create db --project web --image freebsd-15@stable --network lan=10.20.0.50 --storage default --volume data:/var/db --memory 4G --autostart
-jailops @P@ create vault --project web --image freebsd-15@stable --network lan --storage default --volume secrets:/var/db/secrets:encrypted
-jailops @P@ create nginx --project web --image freebsd-15@stable --profile web
+A jail starts when the host boots only with --autostart (boot.autostart); a jail that
+was running before a reboot does not come back on its own.
+
+A new jail name has at most 32 characters. Sizes (--disk) are stored as bytes;
+4G, 4GiB and 4294967296 are the same size.`
+
+const jailCreateExample = `jailops @P@ create web --project web --image freebsd-15-1 --network lan --storage default --start --autostart
+jailops @P@ create db --project web --image freebsd-15-1 --network lan=10.20.0.50 --storage default --memory 4G --autostart
+jailops @P@ create mail --project web --image freebsd-15-1 --network lan --storage default
+jailops volume attach mail maildir /var/mail/vhosts --project web
+jailops @P@ create nginx --project web --image freebsd-15-1 --profile web
 jailops @P@ create -f web.yaml --project web`
 
 func (a *app) jailLifecycleSet(d *kindDesc[api.Jail]) []*cobra.Command {
@@ -326,6 +414,7 @@ func (a *app) addJailShortcuts(root *cobra.Command) {
 	addList(a, root, d, "")
 	addCreate(a, root, d, jailCreateLong, jailCreateExample, a.jailFlagBuild)
 	addDelete(a, root, d)
+	addRename(a, root, d, d.renameLong)
 	root.AddCommand(a.jailInfo(d))
 	root.AddCommand(a.jailLifecycleSet(d)...)
 	root.AddCommand(a.jailExec(d), a.jailShell(d), a.provisionCmd(), a.labelCmd(), a.logsCmd(d))
@@ -333,37 +422,43 @@ func (a *app) addJailShortcuts(root *cobra.Command) {
 
 func (a *app) jailFlagBuild(cmd *cobra.Command) func(string) (api.Jail, error) {
 	var (
-		image, layout, hostname, memory, disk, fwPolicy, strategy, window, storage string
-		cpu, pids, priority                                                        int
-		networks, volumes, hostMounts, envs, labels, depends, tags, profiles       []string
-		autostart                                                                  bool
+		image, layout, hostname, memory, disk, strategy, window, storage, comment string
+		shell, prompt                                                             string
+		cpu, pids, priority, stopTimeout                                          int
+		networks, envs, labels, depends, tags, profiles, fwPolicies               []string
+		autostart, zfsDelegation                                                  bool
 	)
 	f := cmd.Flags()
+	f.StringVar(&comment, "comment", "", "what the jail is for")
 	f.StringVar(&image, "image", "", "image reference: NAME@alias or NAME#gN (required without -f)")
-	f.StringVar(&storage, "storage", "", "storage to place the jail on, one granted to the project (required unless a profile supplies it)")
+	f.StringVar(&storage, "storage", "", "storage to place the jail on, one granted to the project (default: the project's only storage, unless a profile supplies it)")
 	f.StringArrayVar(&profiles, "profile", nil, "profile to apply, later ones override earlier ones (repeatable)")
 	f.StringVar(&layout, "layout", "", "root layout: thin or thick (default depends on the image)")
 	f.StringVar(&hostname, "hostname", "", "hostname inside the jail (default: the jail name)")
-	f.StringArrayVar(&networks, "network", nil, "attach a network granted to the project (repeatable; required unless a profile supplies one): NET (an address of every family it has), NET=IPV4 or NET=IPV4,IPV6 (an address, auto or none)")
-	f.IntVar(&cpu, "cpu", 0, "CPU limit in cores")
-	f.StringVar(&memory, "memory", "", "memory limit, for example 2G")
-	f.StringVar(&disk, "disk", "", "disk quota, for example 20G")
-	f.IntVar(&pids, "pids", 0, "process limit")
-	f.StringArrayVar(&volumes, "volume", nil, "data volume NAME:MOUNT[:ro][:encrypted][:QUOTA] (repeatable); encrypted asks for a passphrase")
-	f.StringVar(&a.passFile, "passphrase-file", "", "read the passphrase of the encrypted volumes from this file (its first line) instead of asking")
-	f.StringArrayVar(&hostMounts, "host-mount", nil, "mount an existing host directory SOURCE:TARGET[:ro] (repeatable; global administrators only, and the host operator must have approved the directory)")
-	f.StringVar(&fwPolicy, "firewall-policy", "", "firewall policy to apply")
+	f.StringArrayVar(&networks, "network", nil, "attach a network granted to the project (repeatable; default: the project's only network, unless a profile supplies one): NET (an address of every family it has), NET=IPV4 or NET=IPV4,IPV6 (an address, auto or none)")
+	f.IntVar(&cpu, "cpu", 0, "CPU cores: the jail is slowed down to that share (rctl pcpu; needs kern.racct.enable=1)")
+	f.StringVar(&memory, "memory", "", "anonymous memory the jail may reserve in total, for example 2G (rctl swapuse; needs kern.racct.enable=1)")
+	f.StringVar(&disk, "disk", "", "ZFS quota of the whole jail (root, data, volumes and snapshots), for example 20G")
+	f.IntVar(&pids, "pids", 0, "processes the jail may have (rctl maxproc; needs kern.racct.enable=1)")
+	f.StringArrayVar(&fwPolicies, "firewall-policy", nil, "firewall policy to apply (repeatable; they are rendered in the order given, after the project's)")
 	f.StringArrayVar(&tags, "tag", nil, "firewall tag of this jail (repeatable)")
 	f.BoolVar(&autostart, "autostart", false, "start the jail when the host boots")
+	f.BoolVar(&zfsDelegation, "zfs-delegation", false, "global administrators only: hand the jail a ZFS dataset of its own, <container>/delegated, which root in the jail manages (the host's priv.conf must allow it: admin-zfs-delegation)")
 	f.IntVar(&priority, "boot-priority", 0, "boot order, lower starts first")
+	f.IntVar(&stopTimeout, "stop-timeout", 0, "seconds the jail has to shut down by itself before it is killed (default: ten)")
 	f.StringArrayVar(&depends, "depends", nil, "jail that must start first (repeatable)")
 	f.StringArrayVar(&envs, "env", nil, "environment variable KEY=VALUE (repeatable)")
 	f.StringArrayVar(&labels, "label", nil, "label KEY=VALUE (repeatable)")
 	f.StringVar(&strategy, "update-strategy", "", "how the jail follows its image: rebase, inplace or manual")
 	f.StringVar(&window, "update-window", "", "update window, for example \"sun 03:00\"")
-	a.completeFlag(cmd, "image", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Images().List(ctx), imageName2) }))
+	f.StringVar(&shell, "shell", "", "shell of jailops shell and the console: bash, sh or a path inside the jail (default: the host's jails.shell, bash)")
+	f.StringVar(&prompt, "prompt", "", "bash prompt of the jail: default, short, none or a PS1 text that may hold {jail}, {project} and {host} (default: the host's jails.prompt)")
+	a.completeFlag(cmd, "image", imageRefs)
 	a.completeFlag(cmd, "network", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Networks().List(ctx), netName) }))
 	a.completeFlag(cmd, "storage", listNames(func(ctx context.Context, c *sdk.Client) iterNames { return namesOf(c.Storage().List(ctx), storName) }))
+	a.completeFlag(cmd, "volume", listNames(func(ctx context.Context, c *sdk.Client) iterNames {
+		return namesOf(c.Volumes().List(ctx), func(v api.Volume) string { return v.Metadata.Name + ":" })
+	}))
 	a.completeFlag(cmd, "profile", listNames(func(ctx context.Context, c *sdk.Client) iterNames {
 		return namesOf(c.Profiles().List(ctx), func(p api.Profile) string { return p.Metadata.Name })
 	}))
@@ -376,16 +471,23 @@ func (a *app) jailFlagBuild(cmd *cobra.Command) func(string) (api.Jail, error) {
 	enumFlag(cmd, "layout", string(api.LayoutThin), string(api.LayoutThick))
 	enumFlag(cmd, "update-strategy", string(api.UpdateRebase), string(api.UpdateInPlace), string(api.UpdateManual))
 	return func(name string) (api.Jail, error) {
-		if image == "" {
+		if image == "" && !a.partial {
 			return api.Jail{}, usagef("--image is required (or use -f FILE)")
 		}
 		spec := api.JailSpec{
-			Image: image, Layout: api.Layout(layout), Hostname: hostname,
-			Storage: storage, Profiles: profiles,
+			Comment: comment, Image: image, Layout: api.Layout(layout), Hostname: hostname,
+			Storage: storage, Profiles: dropEmpty(profiles),
 			Resources: api.Resources{CPU: cpu, Memory: memory, Disk: disk, PIDs: pids},
-			Firewall:  api.FirewallAttach{Policy: fwPolicy, Tags: tags},
-			Boot:      api.BootPolicy{Autostart: autostart, Priority: priority, Depends: depends},
+			Firewall:  api.FirewallAttach{Policies: dropEmpty(fwPolicies), Tags: dropEmpty(tags)},
+			Boot:      api.BootPolicy{Autostart: autostart, Priority: priority, Depends: dropEmpty(depends), StopTimeout: stopTimeout},
 			Update:    api.UpdatePolicy{Strategy: api.UpdateStrategy(strategy), Window: window},
+			Shell:     api.ShellPath(shell), Prompt: prompt,
+			Delegate: zfsDelegation,
+		}
+		if prompt != "" {
+			if err := api.CheckPrompt(prompt); err != nil {
+				return api.Jail{}, usagef("--prompt: %v", err)
+			}
 		}
 		for _, n := range networks {
 			net, addrs, _ := strings.Cut(n, "=")
@@ -395,31 +497,6 @@ func (a *app) jailFlagBuild(cmd *cobra.Command) func(string) (api.Jail, error) {
 				att.IPv4, att.IPv6 = v4, v6
 			}
 			spec.Network = append(spec.Network, att)
-		}
-		for _, v := range volumes {
-			p := strings.Split(v, ":")
-			if len(p) < 2 {
-				return api.Jail{}, usagef("volume %q must be NAME:MOUNT[:ro][:encrypted][:QUOTA]", v)
-			}
-			vm := api.VolumeMount{Name: p[0], Mount: p[1]}
-			for _, extra := range p[2:] {
-				switch extra {
-				case "ro":
-					vm.ReadOnly = true
-				case "encrypted":
-					vm.Encrypted = true
-				default:
-					vm.Quota = extra
-				}
-			}
-			spec.Volumes = append(spec.Volumes, vm)
-		}
-		for _, m := range hostMounts {
-			p := strings.Split(m, ":")
-			if len(p) < 2 || len(p) > 3 || (len(p) == 3 && p[2] != "ro") {
-				return api.Jail{}, usagef("host mount %q must be SOURCE:TARGET[:ro]", m)
-			}
-			spec.HostMounts = append(spec.HostMounts, api.HostMount{Source: p[0], Target: p[1], ReadOnly: len(p) == 3})
 		}
 		if len(envs) > 0 {
 			spec.Env = map[string]string{}
@@ -568,7 +645,7 @@ jailops jail snapshot delete web before-upgrade`, "snap", "snapshots")
 	create := &cobra.Command{
 		Use:               "create JAIL [SNAPSHOT]",
 		Short:             "Take a snapshot of a jail",
-		Long:              "Take a snapshot of all datasets of a jail. Without SNAPSHOT the server chooses a name.",
+		Long:              "Take a snapshot of all datasets of a jail. Without SNAPSHOT the server chooses a name.\nA snapshot name has at most 64 lower case letters, digits, '.', '_' and '-'; names starting with jo- are reserved.",
 		Example:           "jailops jail snapshot create web\njailops jail snapshot create web before-upgrade -m \"before 15.1\"",
 		Args:              cobra.RangeArgs(1, 2),
 		ValidArgsFunction: completeArgs(completeKind(a, d), completeNone),
@@ -922,7 +999,7 @@ addresses are replaced by "auto" so the copy does not collide with the source
 
 Only the specification is copied, not the data in the source's datasets. To
 copy data, snapshot or back up the source and restore it under a new name with
-'jailops backup restore --as'.`,
+'jailops backup restore --as'. NAME has at most 29 characters.`,
 		Example:           "jailops jail copy web web2\njailops --host host-b jail copy web web-b",
 		Args:              cobra.ExactArgs(2),
 		ValidArgsFunction: completeArgs(completeKind(a, d), completeNone),
@@ -962,4 +1039,80 @@ copy data, snapshot or back up the source and restore it under a new name with
 	}
 	cmd.Flags().BoolVar(&keepIP, "keep-ip", false, "keep fixed addresses instead of allocating new ones")
 	return cmd
+}
+
+func (a *app) jailShellSetup(d *kindDesc[api.Jail]) *cobra.Command {
+	return &cobra.Command{
+		Use:   "shell-setup NAME",
+		Short: "Give a jail bash and the JailOps prompt, as new jails get them",
+		Long: `Give a running FreeBSD jail the shell and prompt a new jail gets: the shell and
+prompt keys the jail leaves empty are set from the host's defaults (jails.shell
+and jails.prompt of jailopsd.yaml: bash and the default prompt), bash is
+installed into the jail from the host when it is the shell and missing, and the
+prompt is written. Running it again repairs the files and changes nothing else.
+
+Two files in /usr/local/etc/profile.d are sourced from a marked block at the top of
+/usr/local/etc/profile (login shells) and /usr/local/etc/bash.bashrc (other
+interactive shells), so they survive OS updates: jailops-env.sh exports
+JAILOPS_JAIL, JAILOPS_PROJECT and JAILOPS_HOST, and jailops-prompt.sh sets the
+prompt. A user's own ~/.bashrc, ~/.bash_profile or ~/.profile wins over them.
+The default prompt shows the jail, and in grey its project and the host it runs
+on: root@web [shop/babel]:/# . Change it with 'jailops config set NAME prompt ...'
+(default, short, none or a PS1 text); a text may hold {jail}, {project} and {host},
+which read the variables. 'short' has no grey tag; 'none' removes the prompt and keeps
+the variables. Existing jails are never changed on their own.`,
+		Example: `jailops jail shell-setup web
+jailops config set web prompt none
+jailops config set web prompt short
+jailops config set web prompt '\[\e[38;5;196m\]\u@{jail}\[\e[0m\] [{project}/{host}]:\w\$ '`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeKind(a, d),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ok, err := a.dry("set up the shell of jail "+args[0], api.ShellSetupRequest{}); ok || err != nil {
+				return err
+			}
+			c, err := a.connect(cmd.Context())
+			if err != nil {
+				return err
+			}
+			h, err := handle(c.Jails().ShellSetup(cmd.Context(), args[0]))
+			if err != nil {
+				return err
+			}
+			if !a.waiting() {
+				return a.finishOp(cmd.Context(), h, "jail", args[0], "shell setup", nil)
+			}
+			v, _, err := a.await(cmd.Context(), h)
+			if err != nil {
+				return err
+			}
+			res, _ := v.(api.ShellSetupResult)
+			if a.format != fmtTable {
+				return a.emit(res, nil, nil, func() []string { return []string{args[0]} })
+			}
+			fprintf(a.env.Stdout, "jail/%s: shell %s, prompt %s\n", args[0], res.Shell, orNone(res.Prompt))
+			if res.PS1 != "" {
+				fprintf(a.env.Stdout, "  PS1='%s'\n", res.PS1)
+			}
+			for _, s := range res.Steps {
+				fprintf(a.env.Stdout, "  %s\n", s)
+			}
+			return nil
+		},
+	}
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(not set)"
+	}
+	return s
+}
+
+// autostartCell is the AUTOSTART column of a jail list: whether the jail starts when the host boots.
+func autostartCell(j api.Jail) string {
+	if j.Spec.Boot.Autostart {
+		return "yes"
+	}
+	return "-"
 }

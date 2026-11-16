@@ -12,6 +12,6 @@ nothing until it is allowed.
 `sync --apply` installs the two apps, then allows the sources. The connection string of the new role `shop`
 (`postgres://shop:<password>@<db address>:5432/shop?sslmode=disable`) is printed **once**, in the output of that
 apply, and nowhere else: not in the apply log, not in the repository. Put it where the web application reads it. A
-second apply changes nothing and never makes a new password; `jailops app allow db from @web --rotate` does.
+second apply changes nothing and never makes a new password; `jailops app allow db --from jail:web --rotate` does.
 
 See [../../docs/fleet-sync.md](../../docs/fleet-sync.md) ("Apps and who may reach them").

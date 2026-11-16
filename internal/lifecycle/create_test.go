@@ -22,10 +22,14 @@ func TestCreateThin(t *testing.T) {
 	if o, _ := w.Z.Origin(bg, c+"/root"); o != "tank/jailops/images/fb/g1@ro" {
 		t.Fatalf("root origin %q", o)
 	}
-	want := []string{c, c + "/data", c + "/data/db", c + "/etc", c + "/home", c + "/local", c + "/rootdir", c + "/root", c + "/var-db", c + "/var-log", c + "/var-mail", c + "/var-spool"}
+	want := []string{c, c + "/etc", c + "/home", c + "/local", c + "/rootdir", c + "/root", c + "/var-db", c + "/var-log", c + "/var-mail", c + "/var-spool"}
 	have := map[string]bool{}
 	for _, n := range w.Z.Names() {
 		have[n] = true
+	}
+	// a jail owns no volume dataset: the volume it attaches is the project's
+	if have[c+"/data"] || have[c+"/data/db"] {
+		t.Error("the jail has volume datasets of its own")
 	}
 	for _, n := range want {
 		if !have[n] {
@@ -34,9 +38,9 @@ func TestCreateThin(t *testing.T) {
 	}
 	checks := map[[2]string]string{
 		{c, PropManaged}: "on", {c, PropID}: "uuid-web", {c, PropComplete}: "on", {c, PropKind}: KindContainer,
-		{c + "/root", PropGen}: "1", {c + "/root", "quota"}: "10G", {c + "/root", "mountpoint"}: "/jailops/projects/alpha/jails/web/root",
+		{c + "/root", PropGen}: "1", {c, "quota"}: "10G", {c + "/root", "quota"}: "", {c + "/root", "mountpoint"}: "/jailops/projects/alpha/jails/web/root",
 		{c + "/etc", "mountpoint"}: "/jailops/projects/alpha/jails/web/root/etc", {c + "/etc", PropClass}: "system", {c + "/etc", PropMerge}: "on",
-		{c + "/home", PropClass}: "data", {c + "/data/db", "quota"}: "5G", {c + "/data/db", "mountpoint"}: "/jailops/projects/alpha/jails/web/root/srv/db",
+		{c + "/home", PropClass}: "data",
 	}
 	for k, v := range checks {
 		if got := w.Z.PropOrEmpty(k[0], k[1]); got != v {
@@ -134,7 +138,7 @@ func TestCreateValidation(t *testing.T) {
 			w := newWorld(t)
 			before := w.state()
 			j := w.jail("web")
-			j.Spec.Volumes = append([]api.VolumeMount(nil), j.Spec.Volumes...)
+			j.Spec.Volumes = append([]api.VolumeAttach(nil), j.Spec.Volumes...)
 			tc.mut(&j)
 			if _, err := w.S.CreateJail(bg, j, false); !api.IsCode(err, tc.code) {
 				t.Fatalf("got %v", err)
@@ -225,5 +229,23 @@ func TestAJailBelongsToANamedProject(t *testing.T) {
 	}
 	if k, err := qualify("default", "web"); err != nil || k != "default_web" {
 		t.Fatalf("%q %v: default is only a name", k, err)
+	}
+}
+
+// The disk limit and the reservation of a jail are properties of its container, which cover everything below it; the
+// root clone carries neither.
+func TestDiskLimitIsOnTheContainer(t *testing.T) {
+	w := newWorld(t)
+	w.Files.Dirs["/jailops/projects/alpha/jails/web/root/etc"] = true
+	j := w.jail("web")
+	j.Spec.Resources.DiskReservation = "3G"
+	if _, err := w.S.CreateJail(bg, j, false); err != nil {
+		t.Fatal(err)
+	}
+	c := "tank/jailops/projects/alpha/jails/web"
+	for _, k := range [][3]string{{c, "quota", "10G"}, {c, "reservation", "3G"}, {c + "/root", "quota", ""}, {c + "/root", "reservation", ""}, {c + "/var-db", "quota", ""}} {
+		if got := w.Z.PropOrEmpty(k[0], k[1]); got != k[2] {
+			t.Errorf("%s %s = %q want %q", k[0], k[1], got, k[2])
+		}
 	}
 }

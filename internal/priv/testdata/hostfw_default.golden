@@ -6,11 +6,7 @@ set skip on lo0
 set state-policy if-bound
 scrub in all fragment reassemble
 
-# translation: the NAT and the port forwards of the jails' networks
-nat-anchor "jailops/*"
-rdr-anchor "jailops/*"
-
-# filtering: the jails' own anchors first
+# the jails' anchors first: their filter rules and the NAT and port forwards of their networks
 anchor "jailops/*"
 block in all
 pass out all keep state

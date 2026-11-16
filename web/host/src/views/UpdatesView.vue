@@ -4,7 +4,7 @@ import { s } from '@/i18n'
 import { api } from '@/api/endpoints'
 import { useLoad } from '@jailops/shared/composables/load'
 import { runOp } from '@jailops/shared/composables/ops'
-import { ago } from '@jailops/shared/lib/format'
+import TimeStamp from '@jailops/shared/components/TimeStamp.vue'
 import Callout from '@jailops/shared/components/Callout.vue'
 import Modal from '@jailops/shared/components/Modal.vue'
 import LoadState from '@jailops/shared/components/LoadState.vue'
@@ -53,13 +53,13 @@ async function go(): Promise<void> {
     <p class="muted">{{ s.updates.fleetLead }} <strong>{{ s.updates.withUpdates(withUpdates.length) }}</strong></p>
     <LoadState :loading="l.loading.value" :error="l.error.value" :has-data="!!l.data.value" @retry="l.reload">
       <div class="panel" style="margin-top: 12px"><p v-if="!rows.length" class="empty">{{ s.jails.emptyNone }}</p>
-        <div v-else class="table-wrap"><table data-test="updates-table">
-          <thead><tr><th style="width: 32px"><input type="checkbox" :checked="allSel" :aria-label="s.updates.selectAll" @change="toggleAll" /></th><th>{{ s.jails.name }}</th><th>{{ s.updates.mode }}</th><th class="hide-sm">{{ s.updates.lastCheck }}</th><th>{{ s.updates.available }}</th></tr></thead>
+        <div v-else class="table-wrap"><table data-test="updates-table" class="rtable">
+          <thead><tr><th style="width: 32px"><input type="checkbox" :checked="allSel" :aria-label="s.updates.selectAll" @change="toggleAll" /></th><th>{{ s.updates.jail }}</th><th>{{ s.updates.mode }}</th><th>{{ s.updates.lastCheck }}</th><th>{{ s.updates.available }}</th></tr></thead>
           <tbody><tr v-for="r in rows" :key="r.jail" :data-jail="r.jail">
-            <td><input type="checkbox" :checked="sel.has(r.jail)" :disabled="!r.available" :aria-label="r.jail" @change="toggle(r.jail)" /></td>
-            <td><router-link class="mono" :to="`/jails/${r.jail}`">{{ r.jail }}</router-link></td>
-            <td><span class="pill" :class="r.mode === 'managed' ? 'info' : ''">{{ s.updates.modes[r.mode ?? 'manual'] }}</span></td><td class="faint hide-sm">{{ ago(r.checked_at) }}</td>
-            <td><template v-if="r.available"><span v-if="r.packages?.length" class="chip">packages {{ r.packages.length }}</span><span v-if="r.os" class="chip">os {{ r.os.from }} &rarr; {{ r.os.to }}</span></template><span v-else-if="r.error" class="pill warn" :title="r.error">{{ s.updates.checkFailed }}</span><span v-else class="faint">{{ s.updates.none }}</span></td>
+            <td class="check-cell"><input type="checkbox" :checked="sel.has(r.jail)" :disabled="!r.available" :aria-label="r.jail" @change="toggle(r.jail)" /></td>
+            <td :data-label="s.updates.jail"><router-link class="mono" :to="`/jails/${r.jail}`">{{ r.jail }}</router-link></td>
+            <td :data-label="s.updates.mode"><span class="pill" :class="r.mode === 'managed' ? 'info' : ''">{{ s.updates.modes[r.mode ?? 'manual'] }}</span></td><td class="faint" :data-label="s.updates.lastCheck"><TimeStamp :ts="r.checked_at" /></td>
+            <td :data-label="s.updates.available"><template v-if="r.available"><span v-if="r.packages?.length" class="chip">{{ s.updates.pkgChip(r.packages.length) }}</span><span v-if="r.os" class="chip">{{ s.updates.osChip(r.os.from, r.os.to) }}</span></template><span v-else-if="r.error" class="pill warn" :title="r.error">{{ s.updates.checkFailed }}</span><span v-else class="faint">{{ s.updates.none }}</span></td>
           </tr></tbody></table></div></div>
     </LoadState>
 

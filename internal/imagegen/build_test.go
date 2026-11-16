@@ -34,7 +34,7 @@ func TestBuildFirstAndNext(t *testing.T) {
 			t.Fatalf("property %s missing", p)
 		}
 	}
-	if len(w.Files.Paths()) != 2 { // only the files staged in the root; work dir cleaned
+	if len(w.Files.Paths()) != 3 { // the files staged in the root (the rc.conf too); work dir cleaned
 		t.Fatal(w.Files.Paths())
 	}
 	w.repoVersion = "15.0p2"
@@ -45,6 +45,9 @@ func TestBuildFirstAndNext(t *testing.T) {
 	g2 := r2.Generation
 	if g2.Number != 2 || g2.Parent != 1 || g2.Manifest == g.Manifest {
 		t.Fatalf("%+v", g2)
+	}
+	if g.FreeBSDVersion != "15.0-RELEASE-p1" || g2.FreeBSDVersion != "15.0-RELEASE-p2" {
+		t.Fatalf("the FreeBSD versions of the generations: %q, %q", g.FreeBSDVersion, g2.FreeBSDVersion)
 	}
 	if o, _ := w.Z.Origin(bg, g2.Dataset); o != g.Dataset+"@ro" {
 		t.Fatal(o)
@@ -207,7 +210,7 @@ func TestBuildValidationFailures(t *testing.T) {
 		{"pkg check fails", func(w *world) {
 			orig := w.handle
 			w.Exec.Handler = func(a []string) ([]byte, error) {
-				if len(a) > 9 && a[9] == "check" {
+				if len(a) > 11 && a[11] == "check" {
 					return []byte("missing dependency"), errors.New("exit 1")
 				}
 				return orig(a)

@@ -46,6 +46,9 @@ type RestoreOptions struct {
 	// NoNetwork restores the jail without network interfaces and without creating the networks and policies of
 	// its bundle: a restore test boots it with a loopback only.
 	NoNetwork bool
+	// DropVolumes restores the jail without any of the volumes it attaches: a restore test must never touch the
+	// live data.
+	DropVolumes bool
 }
 
 // RestoreResult is what a restore did.
@@ -101,6 +104,16 @@ type restorePlan struct {
 	storage   string
 	placement Placement
 	existing  bool
+	// volumes are the volumes of the jail that this restore brings back first (from their newest backup), and
+	// dropped the attachments left out with NoVolumes.
+	volumes []volumeRestore
+	dropped map[string]bool
+}
+
+// volumeRestore is one volume a jail restore brings back.
+type volumeRestore struct {
+	name string
+	b    api.Backup
 }
 
 func (s *Service) preflight(ctx context.Context, req api.RestoreRequest) (api.RestorePreflight, *restorePlan, error) {
@@ -139,6 +152,10 @@ func (s *Service) preflight(ctx context.Context, req api.RestoreRequest) (api.Re
 	if st.Generations == nil {
 		st.Generations = map[string]string{}
 	}
+	if b.Spec.Kind == "volume" {
+		pf, err := s.preflightVolume(h, req, rp, st)
+		return pf, rp, err
+	}
 	bundle := b.Spec.Bundle
 	thick := bundle.Spec.Layout == api.LayoutThick
 	var genErr string
@@ -157,7 +174,17 @@ func (s *Service) preflight(ctx context.Context, req api.RestoreRequest) (api.Re
 	if k := s.currentKey(); k != nil {
 		st.KeyDomains[k.DomainID()] = true
 	}
+	var volNotes []string
+	var volErrs []string
+	if len(bundle.Volumes) > 0 {
+		volNotes, volErrs = s.planVolumes(ctx, req, rp, &st)
+	}
 	pf := backup.Preflight(b, req, st)
+	pf.Changes = append(pf.Changes, volNotes...)
+	if len(volErrs) > 0 {
+		pf.OK = false
+		pf.Errors = append(pf.Errors, volErrs...)
+	}
 	if genErr != "" {
 		pf.OK = false
 		pf.Errors = append(pf.Errors, genErr)
@@ -215,6 +242,9 @@ func (s *Service) RestoreWith(ctx context.Context, req api.RestoreRequest, opts 
 	if err != nil {
 		return nil, err
 	}
+	if rp.b.Spec.Kind == "volume" {
+		return nil, api.Errorf(api.CodeInvalid, "backup %s is a volume backup, not a jail backup", req.Backup).WithHint("restore it as a volume")
+	}
 	if !pf.OK {
 		code := api.CodeInvalid
 		for _, e := range pf.Errors {
@@ -259,6 +289,21 @@ func (s *Service) RestoreWith(ctx context.Context, req api.RestoreRequest, opts 
 			}
 		}
 	}()
+
+	// the volumes the jail attaches that the project lacks come back first, each from its newest backup; a restore
+	// test attaches none of them
+	if opts.DropVolumes {
+		rp.volumes, rp.dropped = nil, map[string]bool{}
+		for _, v := range bundle.Volumes {
+			rp.dropped[v] = true
+		}
+	}
+	for _, vr := range rp.volumes {
+		if _, err := s.restoreVolumeData(ctx, &rev, key, vr.b, rp.project, vr.name, ""); err != nil {
+			return nil, fmt.Errorf("restoring volume %s: %w", vr.name, err)
+		}
+		res.Notes = append(res.Notes, fmt.Sprintf("volume %s was restored from backup %s", vr.name, vr.b.Metadata.Name))
+	}
 
 	// replace: park the current datasets, never destroy them
 	if rp.existing {
@@ -409,7 +454,7 @@ func (s *Service) materialize(ctx context.Context, rev *reverter, m materialize)
 		if rel == "" {
 			rel = st.Name
 		}
-		if !safeRel(rel) {
+		if !safeRel(rel) || strings.Contains(rel, "/") {
 			return gen, api.Errorf(api.CodeInvalid, "backup %s has a dataset with an unsafe name %q", m.b.Spec.Snapshot, rel)
 		}
 		if mr := st.Props[propMountRel]; mr != "" && mr != "." && !safeRel(mr) {
@@ -452,6 +497,15 @@ func (s *Service) materialize(ctx context.Context, rev *reverter, m materialize)
 		}
 	}
 	cprops[pComplete] = "off"
+	// the disk limit is the quota of the container, not of the root clone
+	delete(cprops, "quota")
+	delete(cprops, "reservation")
+	if q := bundle.Spec.Resources.Disk; q != "" {
+		cprops["quota"] = q
+	}
+	if r := bundle.Spec.Resources.DiskReservation; r != "" {
+		cprops["reservation"] = r
+	}
 	if err := s.zfs.Create(ctx, zfs.CreateOpts{Name: pl.Container, Parents: true, Props: cprops}); err != nil {
 		return gen, fmt.Errorf("creating %s: %w", pl.Container, err)
 	}
@@ -473,9 +527,6 @@ func (s *Service) materialize(ctx context.Context, rev *reverter, m materialize)
 		rprops := baseProps(KindRoot)
 		rprops["mountpoint"], rprops["canmount"] = pl.rootMP(), "on"
 		rprops[pGen], rprops[pImage], rprops[pManifest] = fmt.Sprint(gen.Number), imageName, gen.Manifest
-		if q := bundle.Spec.Resources.Disk; q != "" {
-			rprops["quota"] = q
-		}
 		if err := s.zfs.Clone(ctx, gen.Dataset+"@"+roSnap, pl.root(), rprops, false); err != nil {
 			return gen, fmt.Errorf("cloning the root from %s: %w", gen.Name, err)
 		}
@@ -494,9 +545,6 @@ func (s *Service) materialize(ctx context.Context, rev *reverter, m materialize)
 			return gen, err
 		}
 		ds := path.Join(pl.Container, it.rel)
-		if err := s.ensureParents(ctx, pl.Container, ds, baseProps(KindVolumes)); err != nil {
-			return gen, err
-		}
 		props := datasetProps(it.props, pl, it.rel, it.mrel, baseProps(firstNonEmpty(it.kind, KindPersistent)))
 		if it.rel == "root" {
 			props["mountpoint"] = pl.rootMP()
@@ -535,33 +583,6 @@ func (s *Service) materialize(ctx context.Context, rev *reverter, m materialize)
 	return gen, nil
 }
 
-// ensureParents creates the intermediate datasets between the container and
-// ds (the parent of the volumes), without content and not mounted.
-func (s *Service) ensureParents(ctx context.Context, container, ds string, base map[string]string) error {
-	rel := strings.TrimPrefix(ds, container+"/")
-	parts := strings.Split(rel, "/")
-	cur := container
-	for _, p := range parts[:len(parts)-1] {
-		cur = cur + "/" + p
-		ok, err := s.zfs.Exists(ctx, cur)
-		if err != nil {
-			return err
-		}
-		if ok {
-			continue
-		}
-		props := map[string]string{}
-		for k, v := range base {
-			props[k] = v
-		}
-		props["canmount"], props["mountpoint"] = "off", "none"
-		if err := s.zfs.Create(ctx, zfs.CreateOpts{Name: cur, Props: props}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // park renames an existing jail's container out of the way after taking a
 // recursive safety snapshot and removing every mountpoint (so the name and the
 // mountpoints are free). The undo puts everything back.
@@ -572,14 +593,19 @@ func (s *Service) park(ctx context.Context, rev *reverter, container string) (st
 	}
 	type saved struct {
 		name, value, source string
+		refres              string // a reservation of its own ("" when it has none)
 	}
 	var olds []saved
 	for _, d := range list {
-		p, err := s.zfs.Get(ctx, d.Name, "mountpoint")
+		p, err := s.zfs.Get(ctx, d.Name, "mountpoint", "refreservation")
 		if err != nil {
 			return "", err
 		}
-		olds = append(olds, saved{d.Name, p["mountpoint"].Value, p["mountpoint"].Source})
+		o := saved{name: d.Name, value: p["mountpoint"].Value, source: p["mountpoint"].Source}
+		if r := p["refreservation"]; r.Source == "local" && r.Value != "none" && r.Value != "0" && r.Value != "" && r.Value != "-" {
+			o.refres = r.Value
+		}
+		olds = append(olds, o)
 	}
 	id := randHex(3)
 	snap := "jailops-prerestore-" + id
@@ -615,6 +641,11 @@ func (s *Service) park(ctx context.Context, rev *reverter, container string) (st
 				return err
 			}
 			errs = append(errs, restoreMPs(ctx, ""))
+			for _, o := range olds {
+				if o.refres != "" {
+					errs = append(errs, s.zfs.Set(ctx, o.name, map[string]string{"refreservation": o.refres}))
+				}
+			}
 		case 1:
 			errs = append(errs, restoreMPs(ctx, ""))
 		}
@@ -635,6 +666,15 @@ func (s *Service) park(ctx context.Context, rev *reverter, container string) (st
 		return "", err
 	}
 	state = 2
+	// a parked jail runs nowhere: its guarantee of space (refreservation) is given back to the pool, so that keeping
+	// the old data does not keep that space reserved
+	for _, o := range olds {
+		if o.refres != "" {
+			if err := s.zfs.Set(ctx, parked+strings.TrimPrefix(o.name, container), map[string]string{"refreservation": "none"}); err != nil {
+				return "", err
+			}
+		}
+	}
 	return parked, nil
 }
 
@@ -663,6 +703,15 @@ func restoredJail(b api.Backup, req api.RestoreRequest, rp *restorePlan, uuid st
 	}
 	if spec.Hostname == b.Spec.Jail && rp.target != b.Spec.Jail {
 		spec.Hostname = ""
+	}
+	if len(rp.dropped) > 0 {
+		var keep []api.VolumeAttach
+		for _, v := range spec.Volumes {
+			if !rp.dropped[v.Name] {
+				keep = append(keep, v)
+			}
+		}
+		spec.Volumes = keep
 	}
 	return api.Jail{
 		Metadata: api.ObjectMeta{Name: rp.target, UUID: uuid, Project: rp.project, Host: b.Spec.HostUUID, Scope: api.ScopeHost, Generation: 1,
@@ -764,7 +813,7 @@ func (s *Service) Reindex(ctx context.Context, target string) (int, error) {
 			b := api.Backup{
 				Metadata: api.ObjectMeta{Name: sm.ID, UUID: sm.ID, Project: m.Meta[metaProject], Host: m.Host, Scope: api.ScopeHost, Generation: 1,
 					CreatedAt: sm.Committed, UpdatedAt: sm.Committed},
-				Spec: api.BackupSpec{Jail: m.JailName, JailUUID: m.Jail, HostUUID: m.Host, Policy: m.Policy, Target: target, Snapshot: sm.ID,
+				Spec: api.BackupSpec{Kind: kindOfMeta(m.Meta), Volume: volumeOfMeta(m.Meta), Jail: m.JailName, JailUUID: m.Jail, HostUUID: m.Host, Policy: m.Policy, Target: target, Snapshot: sm.ID,
 					ZFSSnapshot: zs, KeyDomain: key.DomainID(), Full: full, Bundle: rb},
 				Status: api.BackupStatus{Bytes: int64(m.Stats.LogicalBytes), NewBytes: int64(m.Stats.UploadedBytes), Chunks: chunks,
 					Files: m.Stats.Files, Failed: sm.Failed},
@@ -787,4 +836,216 @@ func (s *Service) Reindex(ctx context.Context, target string) (int, error) {
 		}
 	}
 	return len(seen), nil
+}
+
+// kindOfMeta is the Kind of a backup object: "volume" for a volume backup, empty for a jail.
+func kindOfMeta(meta map[string]string) string {
+	if meta[metaKind] == "volume" {
+		return "volume"
+	}
+	return ""
+}
+
+// volumeOfMeta reads the volume spec recorded in the manifest of a volume backup.
+func volumeOfMeta(meta map[string]string) *api.VolumeSpec {
+	raw := meta[metaVolume]
+	if raw == "" || meta[metaKind] != "volume" {
+		return nil
+	}
+	var v api.VolumeSpec
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return nil
+	}
+	return &v
+}
+
+// planVolumes decides how this restore gets the volumes the backed-up jail attaches: with NoVolumes it leaves every
+// attachment out; otherwise, for each volume the target project lacks, it takes the newest backup of the volume. A volume it can
+// do neither for is left missing in the state, so the preflight says so. st is changed to say which volumes will be
+// there. It returns the notes for the report and the errors it found.
+func (s *Service) planVolumes(ctx context.Context, req api.RestoreRequest, rp *restorePlan, st *backup.HostState) (notes, errs []string) {
+	vols := map[string]bool{}
+	for k, v := range st.Volumes {
+		vols[k] = v
+	}
+	if req.NoVolumes {
+		// the jail is restored with no volume attachments at all, those the project has and those it lacks
+		rp.dropped = map[string]bool{}
+		for _, name := range rp.b.Spec.Bundle.Volumes {
+			rp.dropped[name] = true
+			vols[name] = true
+		}
+		st.Volumes = vols
+		return []string{fmt.Sprintf("jail %s is restored without its volumes (no_volumes): attach them with jailops volume attach", rp.target)}, nil
+	}
+	_, canRestore := s.deps.Host.(VolumeHost)
+	var all []api.Backup
+	for _, name := range rp.b.Spec.Bundle.Volumes {
+		if vols[name] {
+			continue
+		}
+		if !canRestore {
+			continue
+		}
+		if all == nil {
+			all, _ = s.deps.Catalog.Backups(ctx)
+		}
+		vb, ok := newestVolumeBackup(all, rp.project, name, rp.b.Spec.Bundle.VolumeIDs[name], s.currentKey())
+		if !ok {
+			continue // stays missing: the preflight reports it
+		}
+		if vb.Spec.Volume != nil && vb.Spec.Volume.Encrypted {
+			errs = append(errs, fmt.Sprintf("volume %s is encrypted: restore its backup %s first (it needs its passphrase), then restore the jail", name, vb.Metadata.Name))
+			vols[name] = true
+			continue
+		}
+		rp.volumes = append(rp.volumes, volumeRestore{name: name, b: vb})
+		vols[name] = true
+		notes = append(notes, fmt.Sprintf("restores volume %s from backup %s first", name, vb.Metadata.Name))
+	}
+	st.Volumes = vols
+	return notes, errs
+}
+
+// newestVolumeBackup finds the newest usable backup of a volume of the project that this host's key opens. The volume is
+// the one with this UUID: a volume deleted and made again under the same name is another volume, and its backups are not
+// the ones an older jail needs. Without a UUID (the bundle does not know the volume) nothing matches.
+func newestVolumeBackup(all []api.Backup, project, name, id string, key *keys.Key) (api.Backup, bool) {
+	var best api.Backup
+	found := false
+	if id == "" {
+		return best, false
+	}
+	for _, b := range all {
+		if b.Spec.Kind != "volume" || b.Spec.Jail != name || b.Spec.JailUUID != id || b.Metadata.Project != project || b.Status.Failed {
+			continue
+		}
+		if key == nil || key.DomainID() != b.Spec.KeyDomain {
+			continue
+		}
+		if !found || b.Metadata.CreatedAt.After(best.Metadata.CreatedAt) {
+			best, found = b, true
+		}
+	}
+	return best, found
+}
+
+// preflightVolume is the preflight of a volume backup: it is restored as a new volume of the project.
+func (s *Service) preflightVolume(h Host, req api.RestoreRequest, rp *restorePlan, st backup.HostState) (api.RestorePreflight, error) {
+	if _, ok := h.(VolumeHost); !ok {
+		return api.RestorePreflight{}, api.Errorf(api.CodeUnsupported, "this daemon wires no volume registry for restores")
+	}
+	pf := api.RestorePreflight{OK: true}
+	fail := func(f string, a ...any) {
+		pf.OK = false
+		pf.Errors = append(pf.Errors, fmt.Sprintf(f, a...))
+	}
+	b := rp.b
+	switch {
+	case b.Spec.Volume == nil:
+		fail("backup %s holds no volume spec; it cannot be restored as a volume", b.Spec.Snapshot)
+		return pf, nil
+	case st.Volumes[rp.target]:
+		fail("volume %q already exists in project %q; restore it under another name with as=NAME (a volume is never replaced)", rp.target, rp.project)
+	case b.Spec.Volume.Encrypted && req.Passphrase == "":
+		fail("the volume is encrypted: give its passphrase; it makes the volume again and is never stored")
+	case !b.Spec.Volume.Encrypted && req.Passphrase != "":
+		fail("a passphrase was given but the volume is not encrypted")
+	}
+	if k := s.currentKey(); k == nil || k.DomainID() != b.Spec.KeyDomain {
+		fail("backup needs key domain %s, which the target does not hold; unwrap it from the escrow with the recovery key", b.Spec.KeyDomain)
+	}
+	if b.Status.Failed {
+		fail("backup %s failed verification (a chunk is missing or corrupt) and cannot be restored", b.Spec.Snapshot)
+	}
+	pf.Changes = append(pf.Changes, fmt.Sprintf("creates volume %s in project %s from backup %s", rp.target, rp.project, b.Metadata.Name))
+	return pf, nil
+}
+
+// restoreVolumeData makes the volume of a volume backup in the project and extracts the backup into it. What it
+// creates is registered with rev before the step that creates it.
+func (s *Service) restoreVolumeData(ctx context.Context, rev *reverter, key *keys.Key, b api.Backup, project, name, pass string) (api.Volume, error) {
+	h, err := s.host()
+	if err != nil {
+		return api.Volume{}, err
+	}
+	vh, ok := h.(VolumeHost)
+	if !ok {
+		return api.Volume{}, api.Errorf(api.CodeUnsupported, "this daemon wires no volume registry for restores")
+	}
+	if b.Spec.Volume == nil {
+		return api.Volume{}, api.Errorf(api.CodeInvalid, "backup %s holds no volume spec", b.Spec.Snapshot)
+	}
+	remote, err := s.remoteFor(ctx, b.Spec.Target)
+	if err != nil {
+		return api.Volume{}, err
+	}
+	if err := remote.Refresh(ctx); err != nil {
+		return api.Volume{}, err
+	}
+	if err := s.fail("restore.volume"); err != nil {
+		return api.Volume{}, err
+	}
+	ds, undo, err := vh.RestoreVolume(ctx, project, name, *b.Spec.Volume, nil, pass)
+	if undo != nil {
+		rev.add(undo)
+	}
+	if err != nil {
+		return api.Volume{}, err
+	}
+	dir, err := s.deps.Mounter.MountDir(ctx, ds)
+	if err != nil {
+		return api.Volume{}, err
+	}
+	if err := s.fail("restore.volume.extract"); err != nil {
+		return api.Volume{}, err
+	}
+	ro := engine.RestoreOptions{Key: key, Repo: remote, Group: key.Keys.GroupID(b.Spec.HostUUID, b.Spec.JailUUID), Snapshot: b.Spec.Snapshot,
+		Dests: map[string]string{rootRel: dir}, NoChown: s.cfg.noChown(), Workers: s.cfg.EngineWorkers}
+	if s.deps.Agents != nil {
+		ro.NewSink = func(_, dest string) (catalog.Sink, func(), error) { return s.deps.Agents.WriteTree(ctx, dest) }
+	}
+	if _, err := engine.Restore(ctx, ro); err != nil {
+		return api.Volume{}, mapEngineErr(err)
+	}
+	if err := vh.CompleteVolume(ctx, project, name); err != nil {
+		return api.Volume{}, err
+	}
+	return api.Volume{Metadata: api.ObjectMeta{Name: name, Project: project}, Spec: *b.Spec.Volume}, nil
+}
+
+// RestoreVolumeBackup restores a volume backup as a new volume of the project (the daemon's Backups interface).
+// Any failure removes the volume again. It needs the key of the backup's key domain.
+func (s *Service) RestoreVolumeBackup(ctx context.Context, req api.RestoreRequest) (v api.Volume, err error) {
+	pf, rp, err := s.preflight(ctx, req)
+	if err != nil {
+		return v, err
+	}
+	if rp.b.Spec.Kind != "volume" {
+		return v, api.Errorf(api.CodeInvalid, "backup %s is a jail backup, not a volume backup", req.Backup)
+	}
+	if !pf.OK {
+		code := api.CodeInvalid
+		for _, e := range pf.Errors {
+			if strings.Contains(e, "key domain") {
+				code = api.CodeForbidden
+			}
+		}
+		return v, api.Errorf(code, "restore preflight failed").WithDetail("errors", strings.Join(pf.Errors, "; "))
+	}
+	key := s.currentKey()
+	var rev reverter
+	defer func() {
+		if err != nil {
+			if rerr := rev.revert(ctx); rerr != nil {
+				s.cfg.Log.Error("restore: cleanup failed", "volume", rp.target, "err", rerr)
+				err = errors.Join(err, fmt.Errorf("restore cleanup: %w", rerr))
+			}
+		}
+	}()
+	if v, err = s.restoreVolumeData(ctx, &rev, key, rp.b, rp.project, rp.target, req.Passphrase); err != nil {
+		return v, err
+	}
+	rev.disarm()
+	return v, nil
 }

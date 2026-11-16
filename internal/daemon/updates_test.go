@@ -15,6 +15,7 @@ import (
 	"jailops.net/jailops/internal/daemon/dtest"
 	"jailops.net/jailops/internal/sys/jailos"
 	"jailops.net/jailops/internal/sys/run"
+	"jailops.net/jailops/sdk"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -26,6 +27,7 @@ type scriptedJails struct {
 	failUp   bool   // pkg upgrade -y fails
 	failHC   bool   // the health check fails
 	upgraded bool
+	env      *dtest.Env // the host-side pkg -j commands of FreeBSD jails run on its command fake
 }
 
 func (s *scriptedJails) fn(name string, o jailos.ExecOpts) (run.Result, error) {
@@ -56,6 +58,16 @@ func (s *scriptedJails) ran(sub string) bool {
 	for _, c := range s.cmds {
 		if strings.Contains(c, sub) {
 			return true
+		}
+	}
+	// A FreeBSD jail has no pkg of its own: the host runs `pkg -j JAIL upgrade -y`, written here as `pkg upgrade -y`.
+	if s.env != nil {
+		for _, c := range s.env.Run.Calls() {
+			// an image build passes -o options (REPOS_DIR, PKG_CACHEDIR...): it is not a jail's pkg
+			if c.Cmd.Name == "pkg" && len(c.Cmd.Args) > 2 && c.Cmd.Args[0] == "-j" && c.Cmd.Args[2] != "-o" &&
+				strings.Contains("pkg "+strings.Join(c.Cmd.Args[2:], " "), sub) {
+				return true
+			}
 		}
 	}
 	return false
@@ -95,7 +107,8 @@ func runningWeb(t *testing.T, e *dtest.Env) {
 func TestPackageUpdatePipeline(t *testing.T) {
 	e := dtest.New(t, dtest.Options{})
 	e.Seed()
-	sj := &scriptedJails{pkgs: pkgDryRun}
+	sj := &scriptedJails{pkgs: pkgDryRun, env: e}
+	e.SetPkgUpgrades(pkgDryRun)
 	e.Jails.SetExecFn(sj.fn)
 	runningWeb(t, e)
 	ctx := context.Background()
@@ -155,6 +168,7 @@ func TestPackageUpdatePipeline(t *testing.T) {
 	sj.mu.Lock()
 	sj.upgraded, sj.failHC = false, true
 	sj.mu.Unlock()
+	e.SetPkgUpgrades(pkgDryRun)
 	var events []string
 	evctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -180,8 +194,10 @@ loop:
 	}
 	// A failing upgrade command fails the update too.
 	sj.mu.Lock()
-	sj.upgraded, sj.failHC, sj.failUp = false, false, true
+	sj.upgraded, sj.failHC = false, false
 	sj.mu.Unlock()
+	e.SetPkgUpgrades(pkgDryRun)
+	e.SetPkgUpgradeErr(errors.New("exit status 1"))
 	aop, _ = e.Admin.Updates().Apply(ctx, api.UpdateApplyRequest{Jails: []string{"web"}, Packages: true})
 	recs, _ = aop.Wait(ctx)
 	if len(recs) != 1 || recs[0].Result != api.UpdateFailed || !strings.Contains(recs[0].Error, "repository unreachable") {
@@ -250,7 +266,8 @@ func TestScheduledUpdatesAreOffByDefaultAndFollowTheMode(t *testing.T) {
 	clock := func() time.Time { now.Lock(); defer now.Unlock(); return now.t }
 	e := dtest.New(t, dtest.Options{Now: clock, Mutate: func(c *daemon.Config) { c.Updates.Tick = daemon.Duration(20 * time.Millisecond) }})
 	e.Seed()
-	sj := &scriptedJails{pkgs: pkgDryRun}
+	sj := &scriptedJails{pkgs: pkgDryRun, env: e}
+	e.SetPkgUpgrades(pkgDryRun)
 	e.Jails.SetExecFn(sj.fn)
 	runningWeb(t, e)
 	ctx := context.Background()
@@ -322,7 +339,7 @@ func waitFor(t *testing.T, cond func() bool) {
 func TestProvisioningRunsOnceAndAgainOnRequest(t *testing.T) {
 	e := dtest.New(t, dtest.Options{})
 	e.Seed()
-	sj := &scriptedJails{}
+	sj := &scriptedJails{env: e}
 	e.Jails.SetExecFn(sj.fn)
 	ctx := context.Background()
 	// The project's files directory holds the template.
@@ -446,5 +463,39 @@ func assertRealCommand(t *testing.T, note string) {
 	}
 	if err != nil {
 		t.Fatalf("%q is not a command the CLI accepts: %v", line, err)
+	}
+}
+
+// While the host runs pkg against the root of a FreeBSD jail, no exec, shell or console session may enter the jail
+// (the tree belongs to the tenant, pkg runs as root on the host); another jail is not affected and the jail is open
+// again afterwards.
+func TestPackageUpdateHoldsTheJailAgainstSessions(t *testing.T) {
+	e := dtest.New(t, dtest.Options{})
+	e.Seed()
+	sj := &scriptedJails{pkgs: pkgDryRun, env: e}
+	e.SetPkgUpgrades(pkgDryRun)
+	ctx := context.Background()
+	var during error
+	e.Jails.SetExecFn(func(jail string, o jailos.ExecOpts) (run.Result, error) {
+		// the library cache is refreshed right after the upgrade, while the update still holds the jail
+		if o.Argv[0] == "/sbin/ldconfig" && during == nil {
+			_, during = e.Admin.Jails().Exec(ctx, "web", []string{"echo", "x"}, sdk.ExecOptions{})
+		}
+		return sj.fn(jail, o)
+	})
+	runningWeb(t, e)
+	aop, err := e.Admin.Updates().Apply(ctx, api.UpdateApplyRequest{Jails: []string{"web"}, Packages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recs, err := aop.Wait(ctx); err != nil || len(recs) != 1 || recs[0].Result != api.UpdateOK {
+		t.Fatalf("%+v %v", recs, err)
+	}
+	var ae *api.Error
+	if !errors.As(during, &ae) || ae.Code != api.CodeBusy || !strings.Contains(ae.Message, "packages are being installed or updated") {
+		t.Fatalf("exec during the update: %v", during)
+	}
+	if _, err := e.Admin.Jails().Exec(ctx, "web", []string{"echo", "y"}, sdk.ExecOptions{}); err != nil {
+		t.Fatalf("exec after the update: %v", err)
 	}
 }

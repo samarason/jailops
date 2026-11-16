@@ -3,7 +3,7 @@ kind: Rollout
 metadata:
   name: web-upgrade
 spec:
-  description: Move the site's web jails to the newest image generation, one host at a time.
+  comment: Move the site's web jails to the newest image generation, one host at a time.
   project: site
   selector: {tier: web}
   canary: 1

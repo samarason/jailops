@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,15 +25,15 @@ spec:
     range: %s
 `
 
-// projectFleet is two hosts, a shared bridge and a dedicated one, storage
+// projectFleet is two hosts, a shared network and a dedicated one, storage
 // "fast" on each host, a project "web" spanning both with a mandatory
 // firewall policy, a shared profile and one jail on web1.
 func projectFleet(t *testing.T) *fleettest.Env {
 	t.Helper()
 	e := fleettest.New(t, "testfleet", "web1", "web2")
 	e.Write("shared/images/freebsd-15.yaml", "apiVersion: jailops/v1\nkind: Image\nmetadata:\n  name: freebsd-15\nspec:\n  os: freebsd\n  release: 15.0-RELEASE\n  arch: amd64\n  source: {type: pkgbase}\n  aliases: [stable]\n")
-	e.Write("shared/networks/br-web.yaml", fmt.Sprintf(netYAML, "br-web", "10.50.0.0/24", "10.50.0.1", "10.50.0.10-10.50.0.200"))
-	e.Write("shared/networks/br-db.yaml", fmt.Sprintf(netYAML, "br-db", "10.60.0.0/24", "10.60.0.1", "10.60.0.10-10.60.0.200"))
+	e.Write("shared/networks/web.yaml", fmt.Sprintf(netYAML, "web", "10.50.0.0/24", "10.50.0.1", "10.50.0.10-10.50.0.200"))
+	e.Write("shared/networks/db.yaml", fmt.Sprintf(netYAML, "db", "10.60.0.0/24", "10.60.0.1", "10.60.0.10-10.60.0.200"))
 	for _, h := range []string{"web1", "web2"} {
 		e.Write("hosts/"+h+"/storage/fast.yaml", "apiVersion: jailops/v1\nkind: Storage\nmetadata:\n  name: fast\nspec:\n  dataset: tank/jailops-fast\n")
 	}
@@ -43,11 +44,11 @@ metadata:
 spec:
   hosts: [web1, web2]
   networks:
-    - {network: br-web}
+    - {network: web}
   storage:
     - {storage: fast, quota: 50G}
   quotas: {jails: 5}
-  firewall: base
+  firewall_policies: [base]
   images: [freebsd-15]
 `)
 	e.Write("projects/web/firewall-policies/base.yaml", "apiVersion: jailops/v1\nkind: FirewallPolicy\nmetadata:\n  name: base\nspec:\n  default_in: deny\n  default_out: allow\n")
@@ -58,7 +59,7 @@ metadata:
 spec:
   resources: {memory: 1G, cpu: 1}
   network:
-    - {name: eth0, network: br-web, ipv4: auto}
+    - {name: eth0, network: web, ipv4: auto}
   boot: {autostart: true}
 `)
 	e.Write("projects/web/jails/blog.yaml", `apiVersion: jailops/v1
@@ -74,7 +75,6 @@ spec:
   resources: {memory: 2G}
   network:
     - {name: eth0, mtu: 1400}
-  firewall: {policy: base}
 `)
 	return e
 }
@@ -96,7 +96,7 @@ func TestProjectSpansHostsAndConverges(t *testing.T) {
 		if p.Metadata.ManagedBy != "sync:testfleet" {
 			t.Fatalf("%s: managed_by %q", h, p.Metadata.ManagedBy)
 		}
-		if p.Spec.Firewall != "base" {
+		if !slices.Equal(p.Spec.FirewallPolicies, []string{"base"}) {
 			t.Fatalf("%s: the mandatory policy was not set after its policy existed", h)
 		}
 		if len(p.Spec.Hosts) != 0 {
@@ -115,7 +115,7 @@ func TestProjectSpansHostsAndConverges(t *testing.T) {
 	if j.Spec.Resources.Memory != "2G" || j.Spec.Resources.CPU != 1 || !j.Spec.Boot.Autostart || len(j.Spec.Profiles) != 0 {
 		t.Fatalf("profile expansion: %+v", j.Spec)
 	}
-	if len(j.Spec.Network) != 1 || j.Spec.Network[0].MTU != 1400 || j.Spec.Network[0].Network != "br-web" {
+	if len(j.Spec.Network) != 1 || j.Spec.Network[0].MTU != 1400 || j.Spec.Network[0].Network != "web" {
 		t.Fatalf("devices merge by name: %+v", j.Spec.Network)
 	}
 	if _, err := client(t, e.Hosts["web2"]).Project("web").Jails().Get(context.Background(), "blog"); err == nil {
@@ -134,7 +134,7 @@ func TestMissingNetworkOrStorageIsAPlanErrorBeforeAnythingIsApplied(t *testing.T
 	r := mustFail(t, run(t, e, "sync", "--apply"), `host web2 lacks storage "fast"`)
 	contains(t, r.out, "web2")
 	for _, h := range []string{"web1", "web2"} {
-		if _, ok := e.Hosts[h].Server.Network("br-web"); ok {
+		if _, ok := e.Hosts[h].Server.Network("web"); ok {
 			t.Fatalf("%s: something was applied despite the plan error", h)
 		}
 	}

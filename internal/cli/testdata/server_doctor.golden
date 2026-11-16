@@ -7,7 +7,7 @@ Role:          host
 Hub:           no
 Clustered:     no
 Seen as:       trusted
-OS:            FreeBSD  (amd64)
+OS:            FreeBSD 15.1-RELEASE (amd64)
 ZFS:           -, pool tank
 PF:            no
 Linuxulator:   no
@@ -30,7 +30,7 @@ $ jailops server info -o json
   "auth": "trusted",
   "environment": {
     "os": "FreeBSD",
-    "kernel_version": "",
+    "kernel_version": "15.1-RELEASE",
     "arch": "amd64",
     "pool": "tank"
   }
@@ -56,18 +56,18 @@ $ jailops version -o json
 }
 
 $ jailops doctor
-CHECK                             STATUS   DETAIL
-configuration                     PASS     remote t -> http://<addr> (entry: user config; project: user config; remote: user config)
-connection                        PASS     alpha, server fake, API 1.0
-authentication                    PASS     the server trusts this client
-api version                       PASS     1.0
-extensions                        WARN     the server lacks: etag, jail_snapshots, jail_rollback_scopes, images_pkgbase, image_generations, networks_vnet, network_ipam_range, firewall_anchors, backup_policies, backup_pull, backup_push, restore_preflight, resources, jail_copy, projects, project_quotas, storage, trust_tokens, sessions, fleet_projects, config_keys, jail_config, profiles, jail_devices, jail_exec, jail_console, backup_key, backup_run, backup_verify, updates, jail_shell, provisioning, sealed_secrets, image_aliases, image_upgrade, jail_usage, apps, jail_logs, app_install, app_draft, host_identity, host_firewall, host_pending, wireguard, interface_descriptions, app_access, logs_unified, log_forward, volume_unlock, setup, host_certificate
-zfs                               PASS     pool tank
-pf                                WARN     the server reports no packet filter: firewall policies cannot be applied
-permissions                       PASS     can read operations
-server: zfs.pool                  PASS     pool tank is online
-server: kernel.module.if_bridge   WARN     not loaded (kldload if_bridge)
-server: pf.enabled                WARN     cannot tell without FreeBSD
+CHECK                            STATUS   DETAIL
+configuration                    PASS     remote t -> http://<addr> (entry: user config; project: user config; remote: user config)
+connection                       PASS     alpha, server fake, API 1.0
+authentication                   PASS     the server trusts this client
+api version                      PASS     1.0
+extensions                       WARN     the server lacks: etag, jail_snapshots, jail_rollback_scopes, images_pkgbase, image_generations, networks_vnet, network_ipam_range, firewall_anchors, backup_policies, resources, jail_copy, projects, project_quotas, storage, trust_tokens, sessions, fleet_projects, config_keys, jail_config, profiles, jail_devices, jail_exec, jail_console, updates, jail_shell, provisioning, image_aliases, image_upgrade, jail_usage, apps, jail_logs, app_install, app_draft, wireguard, interface_descriptions, app_access, logs_unified, log_forward, volumes, setup, jail_shell_setup, rename, boot_plan, firewall_test
+zfs                              PASS     pool tank
+pf                               WARN     the server reports no packet filter: firewall policies cannot be applied
+permissions                      PASS     can read operations
+server: zfs.pool                 PASS     pool tank is online
+server: kernel.module.if_epair   WARN     not loaded (kldload if_epair)
+server: pf.enabled               WARN     cannot tell without FreeBSD
 
 $ jailops audit
 TIME                  REQUESTOR   ACTION               RESOURCE   RESULT

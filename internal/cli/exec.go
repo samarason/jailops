@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -63,6 +66,18 @@ func defaultResizeSignal() (<-chan struct{}, func()) {
 	return out, func() { signal.Stop(sig); close(done) }
 }
 
+// termRE is a TERM value that is forwarded to a session with a terminal.
+var termRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+
+func envHas(env []string, name string) bool {
+	for _, e := range env {
+		if strings.HasPrefix(e, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 type execOpts struct {
 	// noTTY runs without a pseudo-terminal even when stdin and stdout are
 	// terminals, which is when one is allocated otherwise.
@@ -91,6 +106,11 @@ func (a *app) runExec(ctx context.Context, jail string, argv []string, o execOpt
 	}
 	useTTY := !o.noTTY && a.env.IsTTY(a.env.Stdin) && a.env.IsTTY(a.env.Stdout)
 	so := sdk.ExecOptions{TTY: useTTY, Shell: o.shell, ShellPath: o.shellPath, Env: o.env, User: o.user}
+	if t := a.env.Getenv("TERM"); useTTY && termRE.MatchString(t) && !envHas(o.env, "TERM") {
+		// the terminal on the other end is this one: without TERM, bash and other programs fall back to a dumb
+		// terminal (no line editing)
+		so.Env = append(append([]string(nil), o.env...), "TERM="+t)
+	}
 	if useTTY {
 		if r, cl, ok := a.env.TermSize(a.env.Stdout); ok {
 			so.Rows, so.Cols = r, cl
@@ -101,6 +121,8 @@ func (a *app) runExec(ctx context.Context, jail string, argv []string, o execOpt
 		return err
 	}
 	defer sess.Close()
+	// SIGINT, SIGTERM and SIGHUP end the context: the session ends, and the deferred restore puts the terminal back
+	defer context.AfterFunc(ctx, func() { _ = sess.Close() })()
 	if useTTY {
 		restore, err := a.env.RawTerminal(a.env.Stdin)
 		if err != nil {
@@ -124,6 +146,9 @@ func (a *app) runExec(ctx context.Context, jail string, argv []string, o execOpt
 	}
 	var in io.Reader = a.env.Stdin
 	code, err := sess.Run(in, a.env.Stdout, a.env.Stderr)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return err
 	}
@@ -158,6 +183,7 @@ func (a *app) runConsole(ctx context.Context, jail string, o execOpts) error {
 		return err
 	}
 	defer sess.Close()
+	defer context.AfterFunc(ctx, func() { _ = sess.Close() })()
 	if useTTY {
 		restore, err := a.env.RawTerminal(a.env.Stdin)
 		if err != nil {
@@ -181,6 +207,9 @@ func (a *app) runConsole(ctx context.Context, jail string, o execOpts) error {
 	}
 	var in io.Reader = a.env.Stdin
 	code, err := sess.Run(in, a.env.Stdout)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return err
 	}
@@ -190,10 +219,24 @@ func (a *app) runConsole(ctx context.Context, jail string, o execOpts) error {
 	return nil
 }
 
+// execAnnotation marks the exec command, whose flags are read up to "--" (execFlags).
+const execAnnotation = "jailops/exec"
+
+// execFlags decides how exec reads its flags, before the command line is parsed: with a "--" the flags are read
+// anywhere before it (jailops exec web --project shop -- ls), and everything after it is the command; without one
+// the first word after the jail name starts the command, so its own options (ls -l) stay its own.
+func execFlags(root *cobra.Command, args []string) {
+	c, _, err := root.Find(args)
+	if err != nil || c.Annotations[execAnnotation] == "" {
+		return
+	}
+	c.Flags().SetInterspersed(slices.Contains(args, "--"))
+}
+
 func (a *app) jailExec(d *kindDesc[api.Jail]) *cobra.Command {
 	var o execOpts
 	cmd := &cobra.Command{
-		Use:   "exec NAME -- COMMAND [ARG...]",
+		Use:   "exec NAME [flags] -- COMMAND [ARG...]",
 		Short: "Run a command in a jail",
 		Long: `Run a command inside a running jail and stream its input and output over one
 connection. The command is run as given (never through a shell), and the exit
@@ -201,20 +244,34 @@ status of jailops is the exit status of the command. It works locally and
 through a hub (--host) under the same trust and project rules, needs no SSH
 server in the jail, and is audited.
 
+Flags go anywhere before "--" (jailops exec web --project shop -- ls); what
+follows "--" is the command and its arguments. Without "--" the first word after
+the jail name starts the command; a command never starts with "-", so a flag
+there is refused: put it before the name, or end the flags with "--".
+
 With a terminal on both ends the command gets a pseudo-terminal: the local
 terminal is switched to raw mode for the session and window size changes are
 forwarded. -T runs without one (what a pipe gets anyway); -t names the default.`,
 		Example: `jailops exec nginx -- ls -l /var/log
 jailops exec nginx -- top
+jailops exec nginx --project shop -- id
 jailops exec -T nginx -- cat /var/log/messages > messages
 jailops exec --user www nginx -- id
 jailops --host host-b exec nginx -- service nginx status`,
 		Args:              cobra.MinimumNArgs(2),
-		ValidArgsFunction: completeArgs(completeKind(a, d), completeFiles),
+		ValidArgsFunction: completeArgs(completeKind(a, d), completeNone), // after -- the command is one of the jail, not a file here
+		Annotations:       map[string]string{execAnnotation: "1"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			argv := args[1:]
-			if len(argv) > 0 && argv[0] == "--" { // kept by cobra after the name
+			if dash := cmd.Flags().ArgsLenAtDash(); dash > 1 {
+				return usagef("only the jail name goes before --, not %q", strings.Join(args[1:dash], " ")).
+					withHint("jailops exec " + args[0] + " [flags] -- COMMAND [ARG...]")
+			}
+			if len(argv) > 0 && argv[0] == "--" { // kept by cobra after the name when no flag follows the name
 				argv = argv[1:]
+			} else if len(argv) > 0 && strings.HasPrefix(argv[0], "-") && cmd.Flags().ArgsLenAtDash() < 0 {
+				return usagef("%q after the jail name would be the command: a command does not start with \"-\"", argv[0]).
+					withHint(fmt.Sprintf("put flags before the jail name, or end them with --: jailops exec %s %s ... -- COMMAND", args[0], argv[0]))
 			}
 			if len(argv) == 0 {
 				return usagef("name the command to run after --")
@@ -242,9 +299,11 @@ in the jail.
 
 The shell is chosen in this order: --shell, then the jail's configured "shell"
 key (a path inside the jail, not necessarily the login shell of /etc/passwd;
-set it with 'jailops set NAME shell /usr/local/bin/bash'), then /bin/sh. If the
-chosen shell does not exist in the jail the command fails with a clear error;
-it never falls back to another shell.
+new FreeBSD jails get bash, and 'jailops set NAME shell sh' goes back to
+the system's own sh), then /bin/sh. If the chosen shell does not exist in the jail
+the command fails with a clear error; it never falls back to another shell
+('jailops jail shell-setup NAME' installs bash). The shell starts in / as root
+with the PATH of a login and HOME=/root; from a terminal TERM is passed on.
 
 Without a terminal on stdin and stdout the shell runs without a pseudo-terminal,
 which is what a pipe such as 'echo id | jailops shell web' needs.`,

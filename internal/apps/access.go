@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 
-	"jailops.net/jailops/internal/validate"
 	"jailops.net/jailops/sdk/api"
 )
 
@@ -50,37 +49,36 @@ func validateAccess(app *api.App) error {
 
 // Source is a parsed source of an allow.
 type Source struct {
-	// Kind is api.AccessSourceJail, AccessSourceSet, AccessSourceCIDR or AccessSourceHost. A bare @name is
-	// a jail or an address set: Kind is "" until the caller looked it up (Name holds it).
-	Kind string
-	// Project is set for @project/jail.
-	Project string
-	Name    string
-	Prefix  netip.Prefix
+	// Kind is api.AccessSourceJail, AccessSourceSet, AccessSourceCIDR or AccessSourceHost; Name is the jail or the
+	// address set.
+	Kind   string
+	Name   string
+	Prefix netip.Prefix
 }
 
-var setOrJailRE = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
+var ()
 
-// ParseSource reads the source of an allow or a deny: @name (a jail or an
-// address set of the project), @project/jail, an address or a prefix, or host.
+// ParseSource reads the source of an allow or a deny: jail:NAME (a jail of the project), set:NAME (an address set of
+// the project), an address or a prefix, or host.
 func ParseSource(s string) (Source, error) {
 	switch {
 	case s == "host":
 		return Source{Kind: api.AccessSourceHost}, nil
 	case strings.HasPrefix(s, "@"):
-		rest := s[1:]
-		if p, j, ok := strings.Cut(rest, "/"); ok {
-			if validate.Name("project", p) != nil || validate.JailName(j) != nil {
-				return Source{}, fmt.Errorf("source %q: @project/jail needs a project name and a jail name", s)
-			}
-			return Source{Kind: api.AccessSourceJail, Project: p, Name: j}, nil
+		n := s[1:]
+		return Source{}, fmt.Errorf("source %q: @ is not used: write jail:%s or set:%s", s, n, n)
+	case strings.HasPrefix(s, "jail:"):
+		if !api.IsName(s[5:], 29) {
+			return Source{}, fmt.Errorf("source %q: jail: is followed by the name of a jail of the project", s)
 		}
-		if !setOrJailRE.MatchString(rest) {
-			return Source{}, fmt.Errorf("source %q: @ is followed by the name of a jail or of an address set", s)
+		return Source{Kind: api.AccessSourceJail, Name: s[5:]}, nil
+	case strings.HasPrefix(s, "set:"):
+		if !api.IsName(s[4:], 29) {
+			return Source{}, fmt.Errorf("source %q: set: is followed by the name of an address set of the project", s)
 		}
-		return Source{Name: rest}, nil
-	case s == "" || s == "any":
-		return Source{}, fmt.Errorf("source %q: name a jail (@web), an address set (@office), an address or a prefix, or host", s)
+		return Source{Kind: api.AccessSourceSet, Name: s[4:]}, nil
+	case s == "" || s == "any" || strings.HasPrefix(s, "tag:"):
+		return Source{}, fmt.Errorf("source %q: name a jail (jail:web), an address set (set:office), an address or a prefix, or host", s)
 	}
 	var pf netip.Prefix
 	if strings.Contains(s, "/") {
@@ -92,7 +90,7 @@ func ParseSource(s string) (Source, error) {
 	} else {
 		a, err := netip.ParseAddr(s)
 		if err != nil {
-			return Source{}, fmt.Errorf("source %q is not an address, a prefix, @jail, @address-set or host", s)
+			return Source{}, fmt.Errorf("source %q is not an address, a prefix, jail:NAME, set:NAME or host", s)
 		}
 		if a.Zone() != "" {
 			return Source{}, fmt.Errorf("source %q: zones are not allowed", s)
@@ -105,9 +103,8 @@ func ParseSource(s string) (Source, error) {
 	return Source{Kind: api.AccessSourceCIDR, Prefix: pf}, nil
 }
 
-// Canonical is the form a grant is stored and found under. A jail of the app's
-// own project is @jail even when it was written @project/jail.
-func (s Source) Canonical(project string) string {
+// Canonical is the form a grant is stored and found under.
+func (s Source) Canonical() string {
 	switch s.Kind {
 	case api.AccessSourceHost:
 		return "host"
@@ -116,12 +113,11 @@ func (s Source) Canonical(project string) string {
 			return s.Prefix.Addr().String()
 		}
 		return s.Prefix.String()
-	case api.AccessSourceJail:
-		if s.Project != "" && s.Project != project {
-			return "@" + s.Project + "/" + s.Name
-		}
 	}
-	return "@" + s.Name
+	if s.Kind == api.AccessSourceSet {
+		return "set:" + s.Name
+	}
+	return "jail:" + s.Name
 }
 
 // HostPrefix is the prefix of one address: /32 or /128.
@@ -178,7 +174,7 @@ func AccessPolicyName(jail string) string { return "app-" + jail }
 // AccessRuleName is the name of the firewall rule of a grant for one protocol.
 // Rule names allow letters, digits, space, dot, underscore and dash, at most 64.
 func AccessRuleName(canonical, proto string) string {
-	r := strings.NewReplacer("@", "", "/", ".", ":", ".")
+	r := strings.NewReplacer("/", ".", ":", " ")
 	name := "access " + r.Replace(canonical)
 	if canonical == "host" {
 		name = "access host"
@@ -188,20 +184,6 @@ func AccessRuleName(canonical, proto string) string {
 	}
 	if len(name) > 64 {
 		h := sha256.Sum256([]byte(canonical + " " + proto))
-		name = name[:64-9] + " " + hex.EncodeToString(h[:4])
-	}
-	return name
-}
-
-// AccessOutRuleName names the rule a cross-project grant puts into the source
-// jail's own managed policy: traffic out of it to the app.
-func AccessOutRuleName(project, jail, proto string) string {
-	name := "access to " + project + "." + jail
-	if proto != "tcp" {
-		name += " " + proto
-	}
-	if len(name) > 64 {
-		h := sha256.Sum256([]byte(project + "/" + jail + " " + proto))
 		name = name[:64-9] + " " + hex.EncodeToString(h[:4])
 	}
 	return name
